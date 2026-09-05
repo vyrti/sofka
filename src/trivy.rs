@@ -94,6 +94,7 @@ fn configure_command(command: &mut tokio::process::Command, context: &str, names
         command.arg("--include-namespaces").arg(namespace);
     }
     if !context.is_empty() {
+        // Trivy defines CONTEXT as the command's sole positional argument.
         command.arg(context);
     }
 }
@@ -848,11 +849,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn command_is_scoped_and_resource_conservative() {
+    fn command_uses_positional_context_and_namespace_flag() {
         let mut command = tokio::process::Command::new("trivy");
         configure_command(&mut command, "prod", "apps");
+        let args = command.as_std().get_args().collect::<Vec<_>>();
         assert_eq!(
-            command.as_std().get_args().collect::<Vec<_>>(),
+            args,
             [
                 "kubernetes",
                 "--format",
@@ -874,6 +876,8 @@ mod tests {
                 "prod",
             ]
         );
+        assert_eq!(args.last(), Some(&std::ffi::OsStr::new("prod")));
+        assert!(!args.contains(&std::ffi::OsStr::new("--context")));
 
         let mut command = tokio::process::Command::new("trivy");
         configure_command(&mut command, "", "");
