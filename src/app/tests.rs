@@ -1090,15 +1090,20 @@ async fn popeye_command_is_visible_only_when_detected() {
 }
 
 #[cfg(unix)]
-fn write_fake_popeye(path: &std::path::Path) {
+fn write_fake_popeye_response(path: &std::path::Path, report: &str) {
     use std::os::unix::fs::PermissionsExt;
 
-    let report = r#"{"popeye":{"report_time":"2026-09-06T12:00:00Z","score":91,"grade":"A","sections":[{"linter":"pods","gvr":"v1/pods","tally":{"ok":1,"info":0,"warning":1,"error":0,"score":80},"issues":{"default/web":[{"level":2,"message":"[POP-107] No probes"}]}}]},"ClusterName":"test-cluster","ContextName":"test"}"#;
     let script = format!(
         "#!/bin/sh\ncase \" $* \" in\n  *\" --context test --namespace default \"*) printf '%s\\n' '{report}' ;;\n  *) echo 'wrong scan scope' >&2; exit 9 ;;\nesac\n"
     );
     std::fs::write(path, script).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+fn write_fake_popeye(path: &std::path::Path) {
+    let report = r#"{"popeye":{"report_time":"2026-09-06T12:00:00Z","score":91,"grade":"A","sections":[{"linter":"pods","gvr":"v1/pods","tally":{"ok":1,"info":0,"warning":1,"error":0,"score":80},"issues":{"default/web":[{"level":2,"message":"[POP-107] No probes"}]}}]},"ClusterName":"test-cluster","ContextName":"test"}"#;
+    write_fake_popeye_response(path, report);
 }
 
 #[cfg(unix)]
@@ -1143,6 +1148,89 @@ async fn popeye_command_runs_and_opens_parsed_report() {
     );
     assert_eq!(app.flash, "Popeye score: 91% (A)");
 
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn popeye_command_marks_an_oversized_report_as_truncated() {
+    let dir = std::env::temp_dir().join(format!(
+        "sofka-app-popeye-limit-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let executable = dir.join("popeye");
+    let issues = (0..300)
+        .map(|index| json!({"level": 2, "message": format!("issue {index}")}))
+        .collect::<Vec<_>>();
+    let report = json!({
+        "popeye": {
+            "score": 50,
+            "grade": "F",
+            "sections": [{
+                "linter": "pods",
+                "tally": {"warning": issues.len(), "score": 50},
+                "issues": {"default/web": issues}
+            }]
+        },
+        "ContextName": "test"
+    })
+    .to_string();
+    write_fake_popeye_response(&executable, &report);
+    let (mut app, mut rx) = test_app();
+    app.popeye_path = Some(executable);
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "popeye".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+        .await
+        .expect("Popeye result timed out")
+        .expect("message channel closed");
+    app.handle_msg(msg);
+
+    assert_eq!(app.mode, Mode::Detail);
+    assert_eq!(
+        app.detail.lines.back().map(String::as_str),
+        Some("… report truncated to protect memory")
+    );
+    assert!(app.detail.lines.len() <= 256);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn popeye_command_times_out_a_hung_scan() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!(
+        "sofka-app-popeye-hung-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let executable = dir.join("popeye");
+    std::fs::write(&executable, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (mut app, mut rx) = test_app();
+    app.popeye_path = Some(executable);
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "popeye".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+        .await
+        .expect("Popeye timeout result was not delivered")
+        .expect("message channel closed");
+    app.handle_msg(msg);
+
+    assert!(app.flash_err);
+    assert!(app.flash.contains("Popeye scan timed out"), "{}", app.flash);
     std::fs::remove_dir_all(dir).unwrap();
 }
 

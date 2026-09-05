@@ -15,12 +15,11 @@ impl App {
         let generation = self.generation;
         let context = self.cluster.context.clone();
         let namespace = self.namespace.clone();
-        let scope = if namespace.is_empty() {
-            "all namespaces".to_string()
+        let claim = if namespace.is_empty() {
+            self.claim_status("Popeye: scanning all namespaces…")
         } else {
-            namespace.clone()
+            self.claim_status(format!("Popeye: scanning {namespace}…"))
         };
-        let claim = self.claim_status(format!("Popeye: scanning {scope}…"));
         let tx = self.tx.clone();
         self.popeye_task = Some(tokio::spawn(async move {
             let result = crate::popeye::scan(executable, context, namespace).await;

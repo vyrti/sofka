@@ -5,18 +5,32 @@ use std::fmt::Write as _;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
-use serde::de::{IgnoredAny, MapAccess, Visitor};
+use serde::de::{DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use tokio::io::AsyncReadExt;
-use tokio::sync::mpsc;
+use tokio_util::io::SyncIoBridge;
 
 const EXECUTABLES: &[&str] = &["popeye", "kubectl-popeye"];
-const PIPE_CHUNK_BYTES: usize = 16 * 1024;
-const PIPE_CHUNKS: usize = 2;
-const STDERR_MAX_BYTES: u64 = 64 * 1024;
+#[cfg(not(test))]
+const SCAN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+#[cfg(test)]
+const SCAN_TIMEOUT: Duration = Duration::from_secs(1);
+const STDERR_MAX_BYTES: usize = 64 * 1024;
+const STDERR_CHUNK_BYTES: usize = 8 * 1024;
+#[cfg(not(test))]
+const REPORT_MAX_LINES: usize = 10_000;
+#[cfg(test)]
+const REPORT_MAX_LINES: usize = 256;
+#[cfg(not(test))]
+const REPORT_MAX_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(test)]
+const REPORT_MAX_BYTES: usize = 64 * 1024;
+const TRUNCATION_LINE: &str = "… report truncated to protect memory";
 
 /// A report already reduced to what the document view needs.
+#[derive(Debug)]
 pub struct ReportView {
     pub title: String,
     pub lines: Vec<String>,
@@ -65,40 +79,56 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-/// Arguments for one scan, scoped exactly like the active Sofka view.
-pub fn args(context: &str, namespace: &str) -> Vec<String> {
-    let mut args = vec![
-        "--out".into(),
-        "json".into(),
-        "--force-exit-zero".into(),
-        "--log-level".into(),
-        "0".into(),
-        "--logs".into(),
-        "none".into(),
-    ];
+fn configure_command(command: &mut tokio::process::Command, context: &str, namespace: &str) {
+    command.args([
+        "--out",
+        "json",
+        "--force-exit-zero",
+        "--log-level",
+        "0",
+        "--logs",
+        "none",
+    ]);
     if !context.is_empty() {
-        args.extend(["--context".into(), context.into()]);
+        command.arg("--context").arg(context);
     }
     if namespace.is_empty() {
-        args.push("--all-namespaces".into());
+        command.arg("--all-namespaces");
     } else {
-        args.extend(["--namespace".into(), namespace.into()]);
+        command.arg("--namespace").arg(namespace);
     }
-    args
 }
 
-/// Run Popeye without buffering its JSON document in memory. Async stdout is
-/// bridged to serde's synchronous streaming reader with two bounded chunks;
-/// parsing and report formatting stay off the UI runtime thread.
+/// Run Popeye with bounded output memory and a hard deadline. JSON is parsed
+/// directly from the child pipe on one blocking worker so no full document or
+/// intermediate chunk queue is allocated.
 pub async fn scan(
     executable: PathBuf,
     context: String,
     namespace: String,
 ) -> Result<ReportView, String> {
-    let argv = args(&context, &namespace);
+    scan_with_timeout(executable, context, namespace, SCAN_TIMEOUT).await
+}
+
+async fn scan_with_timeout(
+    executable: PathBuf,
+    context: String,
+    namespace: String,
+    timeout: Duration,
+) -> Result<ReportView, String> {
+    tokio::time::timeout(timeout, scan_inner(executable, context, namespace))
+        .await
+        .map_err(|_| format!("Popeye scan timed out after {} seconds", timeout.as_secs()))?
+}
+
+async fn scan_inner(
+    executable: PathBuf,
+    context: String,
+    namespace: String,
+) -> Result<ReportView, String> {
     let mut command = tokio::process::Command::new(&executable);
+    configure_command(&mut command, &context, &namespace);
     command
-        .args(&argv)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -115,13 +145,8 @@ pub async fn scan(
         .take()
         .ok_or_else(|| "failed to capture Popeye stderr".to_string())?;
 
-    let (chunk_tx, chunk_rx) = mpsc::channel(PIPE_CHUNKS);
-    let stdout_task = tokio::spawn(pump_stdout(stdout, chunk_tx));
-    let parse_context = context.clone();
-    let parse_namespace = namespace.clone();
     let parse_task = tokio::task::spawn_blocking(move || {
-        let reader = ChunkReader::new(chunk_rx);
-        parse_reader(reader, &parse_context, &parse_namespace)
+        parse_reader(SyncIoBridge::new(stdout), &context, &namespace)
     });
     let stderr_task = tokio::spawn(read_stderr(stderr));
 
@@ -129,9 +154,6 @@ pub async fn scan(
         .wait()
         .await
         .map_err(|e| format!("failed while waiting for Popeye: {e}"))?;
-    let pump_result = stdout_task
-        .await
-        .map_err(|e| format!("Popeye output reader failed: {e}"))?;
     let stderr = stderr_task
         .await
         .map_err(|e| format!("Popeye error reader failed: {e}"))?
@@ -144,34 +166,20 @@ pub async fn scan(
         let detail = first_line(&stderr).unwrap_or("no error output");
         return Err(format!("Popeye exited {status}: {detail}"));
     }
-    pump_result.map_err(|e| format!("failed reading Popeye output: {e}"))?;
     parsed
 }
 
-async fn pump_stdout(
-    mut stdout: tokio::process::ChildStdout,
-    tx: mpsc::Sender<Vec<u8>>,
-) -> io::Result<()> {
-    loop {
-        let mut chunk = vec![0; PIPE_CHUNK_BYTES];
-        let n = stdout.read(&mut chunk).await?;
-        if n == 0 {
-            return Ok(());
-        }
-        chunk.truncate(n);
-        if tx.send(chunk).await.is_err() {
-            return Ok(());
-        }
-    }
-}
-
-async fn read_stderr(stderr: tokio::process::ChildStderr) -> io::Result<Vec<u8>> {
+async fn read_stderr(mut stderr: tokio::process::ChildStderr) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    stderr
-        .take(STDERR_MAX_BYTES)
-        .read_to_end(&mut bytes)
-        .await?;
-    Ok(bytes)
+    let mut chunk = [0; STDERR_CHUNK_BYTES];
+    loop {
+        let read = stderr.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        let keep = read.min(STDERR_MAX_BYTES.saturating_sub(bytes.len()));
+        bytes.extend_from_slice(&chunk[..keep]);
+    }
 }
 
 fn first_line(bytes: &[u8]) -> Option<&str> {
@@ -182,39 +190,101 @@ fn first_line(bytes: &[u8]) -> Option<&str> {
         .find(|line| !line.is_empty())
 }
 
-struct ChunkReader {
-    rx: mpsc::Receiver<Vec<u8>>,
-    chunk: Vec<u8>,
-    offset: usize,
+struct BoundedLines {
+    lines: Vec<String>,
+    bytes: usize,
+    max_lines: usize,
+    max_bytes: usize,
+    truncated: bool,
 }
 
-impl ChunkReader {
-    fn new(rx: mpsc::Receiver<Vec<u8>>) -> Self {
-        Self {
-            rx,
-            chunk: Vec::new(),
-            offset: 0,
-        }
+impl Default for BoundedLines {
+    fn default() -> Self {
+        Self::with_limits(REPORT_MAX_LINES, REPORT_MAX_BYTES)
     }
 }
 
-impl Read for ChunkReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        loop {
-            if self.offset < self.chunk.len() {
-                let n = buf.len().min(self.chunk.len() - self.offset);
-                buf[..n].copy_from_slice(&self.chunk[self.offset..self.offset + n]);
-                self.offset += n;
-                return Ok(n);
-            }
-            match self.rx.blocking_recv() {
-                Some(chunk) => {
-                    self.chunk = chunk;
-                    self.offset = 0;
-                }
-                None => return Ok(0),
+impl BoundedLines {
+    fn with_limits(max_lines: usize, max_bytes: usize) -> Self {
+        Self {
+            lines: Vec::new(),
+            bytes: 0,
+            max_lines,
+            max_bytes,
+            truncated: false,
+        }
+    }
+
+    fn accepting(&self) -> bool {
+        !self.truncated && self.can_push(0)
+    }
+
+    fn can_push(&self, len: usize) -> bool {
+        self.lines.len() < self.max_lines.saturating_sub(1)
+            && self
+                .bytes
+                .checked_add(len)
+                .is_some_and(|bytes| bytes <= self.max_bytes.saturating_sub(TRUNCATION_LINE.len()))
+    }
+
+    fn push(&mut self, line: String) -> bool {
+        if self.truncated || !self.can_push(line.len()) {
+            self.truncated = true;
+            return false;
+        }
+        self.bytes += line.len();
+        self.lines.push(line);
+        true
+    }
+
+    fn push_static(&mut self, line: &str) -> bool {
+        if self.truncated || !self.can_push(line.len()) {
+            self.truncated = true;
+            return false;
+        }
+        self.bytes += line.len();
+        self.lines.push(line.into());
+        true
+    }
+
+    fn push_prefixed(&mut self, prefix: &str, mut value: String) -> bool {
+        let Some(len) = prefix.len().checked_add(value.len()) else {
+            self.truncated = true;
+            return false;
+        };
+        if self.truncated || !self.can_push(len) {
+            self.truncated = true;
+            return false;
+        }
+        value.reserve(prefix.len());
+        value.insert_str(0, prefix);
+        self.bytes += value.len();
+        self.lines.push(value);
+        true
+    }
+
+    fn append(&mut self, other: Self) {
+        let other_truncated = other.truncated;
+        for line in other.lines {
+            if !self.push(line) {
+                break;
             }
         }
+        self.truncated |= other_truncated;
+    }
+
+    fn truncate(&mut self) {
+        self.truncated = true;
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        if self.truncated
+            && self.lines.len() < self.max_lines
+            && self.bytes + TRUNCATION_LINE.len() <= self.max_bytes
+        {
+            self.lines.push(TRUNCATION_LINE.into());
+        }
+        self.lines
     }
 }
 
@@ -227,28 +297,93 @@ struct Envelope {
     context_name: String,
 }
 
-#[derive(Deserialize)]
 struct Report {
-    #[serde(default)]
     report_time: String,
     score: i64,
-    #[serde(default)]
     grade: String,
-    #[serde(default)]
-    sections: Vec<Section>,
-    #[serde(default)]
-    errors: ReportErrors,
+    body: BoundedLines,
+    sections: usize,
+    errors: usize,
 }
 
 #[derive(Deserialize)]
-struct Section {
-    linter: String,
-    #[serde(default)]
-    gvr: String,
-    #[serde(default)]
-    tally: Tally,
-    #[serde(default)]
-    issues: IssueGroups,
+#[serde(field_identifier)]
+enum ReportField {
+    #[serde(rename = "report_time")]
+    ReportTime,
+    #[serde(rename = "score")]
+    Score,
+    #[serde(rename = "grade")]
+    Grade,
+    #[serde(rename = "sections")]
+    Sections,
+    #[serde(rename = "errors")]
+    Errors,
+    #[serde(other)]
+    Other,
+}
+
+impl<'de> Deserialize<'de> for Report {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ReportVisitor;
+
+        impl<'de> Visitor<'de> for ReportVisitor {
+            type Value = Report;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a Popeye report object")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut report_time = None;
+                let mut score = None;
+                let mut grade = None;
+                let mut body = BoundedLines::default();
+                let mut sections = 0;
+                let mut errors = 0;
+
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        ReportField::ReportTime => report_time = Some(map.next_value()?),
+                        ReportField::Score => score = Some(map.next_value()?),
+                        ReportField::Grade => grade = Some(map.next_value()?),
+                        ReportField::Sections => {
+                            map.next_value_seed(SectionsSeed {
+                                body: &mut body,
+                                count: &mut sections,
+                            })?;
+                        }
+                        ReportField::Errors => {
+                            map.next_value_seed(ErrorsSeed {
+                                body: &mut body,
+                                count: &mut errors,
+                            })?;
+                        }
+                        ReportField::Other => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                Ok(Report {
+                    report_time: report_time.unwrap_or_default(),
+                    score: score.ok_or_else(|| M::Error::missing_field("score"))?,
+                    grade: grade.unwrap_or_default(),
+                    body,
+                    sections,
+                    errors,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(ReportVisitor)
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -273,18 +408,79 @@ struct Issue {
     message: String,
 }
 
-#[derive(Default)]
-struct IssueGroups(Vec<(String, Vec<Issue>)>);
+struct SectionsSeed<'a> {
+    body: &'a mut BoundedLines,
+    count: &'a mut usize,
+}
 
-impl<'de> Deserialize<'de> for IssueGroups {
+impl<'de> DeserializeSeed<'de> for SectionsSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SectionsVisitor<'a> {
+            body: &'a mut BoundedLines,
+            count: &'a mut usize,
+        }
+
+        impl<'de> Visitor<'de> for SectionsVisitor<'_> {
+            type Value = ();
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a Popeye sections array")
+            }
+
+            fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+            where
+                S: SeqAccess<'de>,
+            {
+                while self.body.accepting() {
+                    let Some(section) = seq.next_element::<Section>()? else {
+                        return Ok(());
+                    };
+                    *self.count += 1;
+                    render_section(self.body, section);
+                }
+                if seq.next_element::<IgnoredAny>()?.is_some() {
+                    self.body.truncate();
+                    while seq.next_element::<IgnoredAny>()?.is_some() {}
+                }
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_seq(SectionsVisitor {
+            body: self.body,
+            count: self.count,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct Section {
+    linter: String,
+    #[serde(default)]
+    gvr: String,
+    #[serde(default)]
+    tally: Tally,
+    #[serde(default)]
+    issues: RenderedIssues,
+}
+
+#[derive(Default)]
+struct RenderedIssues(BoundedLines);
+
+impl<'de> Deserialize<'de> for RenderedIssues {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        struct GroupsVisitor;
+        struct IssuesVisitor;
 
-        impl<'de> Visitor<'de> for GroupsVisitor {
-            type Value = IssueGroups;
+        impl<'de> Visitor<'de> for IssuesVisitor {
+            type Value = RenderedIssues;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("a Popeye resource-to-issues object")
@@ -294,30 +490,95 @@ impl<'de> Deserialize<'de> for IssueGroups {
             where
                 M: MapAccess<'de>,
             {
-                let mut groups = Vec::with_capacity(map.size_hint().unwrap_or(0));
-                while let Some(entry) = map.next_entry()? {
-                    groups.push(entry);
+                let mut lines = BoundedLines::default();
+                while lines.accepting() {
+                    let Some(resource) = map.next_key::<String>()? else {
+                        return Ok(RenderedIssues(lines));
+                    };
+                    lines.push_prefixed("  ", resource);
+                    map.next_value_seed(IssueListSeed { lines: &mut lines })?;
                 }
-                Ok(IssueGroups(groups))
+                if map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {
+                    lines.truncate();
+                    while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                }
+                Ok(RenderedIssues(lines))
             }
         }
 
-        deserializer.deserialize_map(GroupsVisitor)
+        deserializer.deserialize_map(IssuesVisitor)
     }
 }
 
-#[derive(Default)]
-struct ReportErrors(Vec<String>);
+struct IssueListSeed<'a> {
+    lines: &'a mut BoundedLines,
+}
 
-impl<'de> Deserialize<'de> for ReportErrors {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+impl<'de> DeserializeSeed<'de> for IssueListSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
         D: Deserializer<'de>,
     {
-        struct ErrorsVisitor;
+        struct IssueListVisitor<'a> {
+            lines: &'a mut BoundedLines,
+        }
 
-        impl<'de> Visitor<'de> for ErrorsVisitor {
-            type Value = ReportErrors;
+        impl<'de> Visitor<'de> for IssueListVisitor<'_> {
+            type Value = ();
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a Popeye issue array")
+            }
+
+            fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+            where
+                S: SeqAccess<'de>,
+            {
+                while self.lines.accepting() {
+                    let Some(issue) = seq.next_element::<Issue>()? else {
+                        return Ok(());
+                    };
+                    let prefix = match issue.level {
+                        3 => "    ERROR ",
+                        2 => "    WARNING ",
+                        1 => "    INFO ",
+                        _ => "    OK ",
+                    };
+                    self.lines.push_prefixed(prefix, issue.message);
+                }
+                if seq.next_element::<IgnoredAny>()?.is_some() {
+                    self.lines.truncate();
+                    while seq.next_element::<IgnoredAny>()?.is_some() {}
+                }
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_seq(IssueListVisitor { lines: self.lines })
+    }
+}
+
+struct ErrorsSeed<'a> {
+    body: &'a mut BoundedLines,
+    count: &'a mut usize,
+}
+
+impl<'de> DeserializeSeed<'de> for ErrorsSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ErrorsVisitor<'a> {
+            body: &'a mut BoundedLines,
+            count: &'a mut usize,
+        }
+
+        impl<'de> Visitor<'de> for ErrorsVisitor<'_> {
+            type Value = ();
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("a Popeye errors object")
@@ -327,16 +588,51 @@ impl<'de> Deserialize<'de> for ReportErrors {
             where
                 M: MapAccess<'de>,
             {
-                let mut errors = Vec::with_capacity(map.size_hint().unwrap_or(0));
-                while let Some((_key, error)) = map.next_entry::<IgnoredAny, String>()? {
-                    errors.push(error);
+                while self.body.accepting() {
+                    let Some((_key, error)) = map.next_entry::<IgnoredAny, String>()? else {
+                        return Ok(());
+                    };
+                    if *self.count == 0 {
+                        self.body.push_static("");
+                        self.body.push_static("Report errors");
+                    }
+                    *self.count += 1;
+                    self.body.push_prefixed("  ERROR ", error);
                 }
-                Ok(ReportErrors(errors))
+                if map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {
+                    self.body.truncate();
+                    while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                }
+                Ok(())
             }
         }
 
-        deserializer.deserialize_map(ErrorsVisitor)
+        deserializer.deserialize_map(ErrorsVisitor {
+            body: self.body,
+            count: self.count,
+        })
     }
+}
+
+fn render_section(lines: &mut BoundedLines, section: Section) {
+    if !lines.push_static("") {
+        return;
+    }
+    let mut heading = section.linter;
+    let _ = write!(heading, " — {}%", section.tally.score);
+    if !section.gvr.is_empty() {
+        let _ = write!(heading, " ({})", section.gvr);
+    }
+    if !lines.push(heading) {
+        return;
+    }
+    if !lines.push(format!(
+        "  ok {} · info {} · warning {} · error {}",
+        section.tally.ok, section.tally.info, section.tally.warnings, section.tally.error
+    )) {
+        return;
+    }
+    lines.append(section.issues.0);
 }
 
 fn parse_reader(
@@ -362,17 +658,12 @@ fn format_report(
         report_time,
         score,
         grade,
+        body,
         sections,
         errors,
     } = envelope.popeye;
-    let issue_count = sections
-        .iter()
-        .flat_map(|section| &section.issues.0)
-        .map(|(_, issues)| issues.len())
-        .sum::<usize>();
-    let empty_report = sections.is_empty() && errors.0.is_empty();
-    let mut lines = Vec::with_capacity(12 + sections.len() * 2 + issue_count * 2);
-    lines.push("Summary".into());
+    let mut lines = BoundedLines::default();
+    lines.push_static("Summary");
     lines.push(format!("  score:      {score}% ({grade})"));
     let context = if envelope.context_name.is_empty() {
         requested_context
@@ -383,7 +674,7 @@ fn format_report(
         lines.push(format!("  context:    {context}"));
     }
     if !envelope.cluster_name.is_empty() {
-        lines.push(format!("  cluster:    {}", envelope.cluster_name));
+        lines.push_prefixed("  cluster:    ", envelope.cluster_name);
     }
     lines.push(format!(
         "  namespace:  {}",
@@ -394,49 +685,17 @@ fn format_report(
         }
     ));
     if !report_time.is_empty() {
-        lines.push(format!("  scanned:    {report_time}"));
+        lines.push_prefixed("  scanned:    ", report_time);
     }
-
-    for section in sections {
-        lines.push(String::new());
-        let mut heading = format!("{} — {}%", section.linter, section.tally.score);
-        if !section.gvr.is_empty() {
-            let _ = write!(heading, " ({})", section.gvr);
-        }
-        lines.push(heading);
-        lines.push(format!(
-            "  ok {} · info {} · warning {} · error {}",
-            section.tally.ok, section.tally.info, section.tally.warnings, section.tally.error
-        ));
-        for (resource, issues) in section.issues.0 {
-            lines.push(format!("  {resource}"));
-            for issue in issues {
-                let level = match issue.level {
-                    3 => "ERROR",
-                    2 => "WARNING",
-                    1 => "INFO",
-                    _ => "OK",
-                };
-                lines.push(format!("    {level} {}", issue.message));
-            }
-        }
-    }
-
-    if !errors.0.is_empty() {
-        lines.push(String::new());
-        lines.push("Report errors".into());
-        for error in errors.0 {
-            lines.push(format!("  ERROR {error}"));
-        }
-    }
-    if empty_report {
-        lines.push(String::new());
-        lines.push("No linter sections were returned.".into());
+    lines.append(body);
+    if sections == 0 && errors == 0 {
+        lines.push_static("");
+        lines.push_static("No linter sections were returned.");
     }
 
     ReportView {
         title: format!("popeye — {score}% ({grade})"),
-        lines,
+        lines: lines.finish(),
         score,
         grade,
     }
@@ -447,24 +706,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn command_is_scoped_to_context_and_namespace() {
+    fn command_is_scoped_to_context_and_namespace_without_an_argument_copy() {
+        let mut command = tokio::process::Command::new("popeye");
+        configure_command(&mut command, "prod", "apps");
         assert_eq!(
-            args("prod", "apps"),
-            vec![
-                "--out".to_string(),
-                "json".to_string(),
-                "--force-exit-zero".to_string(),
-                "--log-level".to_string(),
-                "0".to_string(),
-                "--logs".to_string(),
-                "none".to_string(),
-                "--context".to_string(),
-                "prod".to_string(),
-                "--namespace".to_string(),
-                "apps".to_string(),
+            command.as_std().get_args().collect::<Vec<_>>(),
+            [
+                "--out",
+                "json",
+                "--force-exit-zero",
+                "--log-level",
+                "0",
+                "--logs",
+                "none",
+                "--context",
+                "prod",
+                "--namespace",
+                "apps",
             ]
         );
-        assert!(args("", "").ends_with(&["--all-namespaces".into()]));
+
+        let mut command = tokio::process::Command::new("popeye");
+        configure_command(&mut command, "", "");
+        assert!(
+            command
+                .as_std()
+                .get_args()
+                .last()
+                .is_some_and(|arg| arg == "--all-namespaces")
+        );
     }
 
     #[test]
@@ -507,9 +777,54 @@ mod tests {
     }
 
     #[test]
+    fn rendered_output_has_strict_line_and_byte_limits() {
+        let mut lines = BoundedLines::with_limits(3, 64);
+        assert!(lines.push_static("first"));
+        assert!(lines.push_static("second"));
+        assert!(!lines.push_static("third"));
+        let lines = lines.finish();
+        assert_eq!(lines, ["first", "second", TRUNCATION_LINE]);
+        assert!(lines.len() <= 3);
+        assert!(lines.iter().map(String::len).sum::<usize>() <= 64);
+
+        let mut lines = BoundedLines::with_limits(10, TRUNCATION_LINE.len() + 4);
+        assert!(!lines.push_static("12345"));
+        let lines = lines.finish();
+        assert_eq!(lines, [TRUNCATION_LINE]);
+        assert!(lines.iter().map(String::len).sum::<usize>() <= TRUNCATION_LINE.len() + 4);
+    }
+
+    #[test]
     fn malformed_json_is_actionable() {
         let error = parse_reader("not json".as_bytes(), "", "").err().unwrap();
         assert!(error.starts_with("invalid JSON from Popeye:"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scan_timeout_stops_a_hung_process() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "sofka-popeye-timeout-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("popeye");
+        std::fs::write(&executable, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = scan_with_timeout(
+            executable,
+            String::new(),
+            String::new(),
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.starts_with("Popeye scan timed out"), "{error}");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

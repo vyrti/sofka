@@ -71,7 +71,8 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   `kubectl-popeye` is executable on `PATH`, scan the active context and current
   namespace (or all namespaces in all-namespace mode) and show its parsed JSON
   report in a searchable document view. Availability is checked at startup and
-  rescanned by `:reload`.
+  rescanned by `:reload`. Scans time out after five minutes, and rendered reports
+  are capped with a visible truncation marker to keep CPU and memory bounded.
 - **Live CPU and MEM columns** for pods and nodes from the metrics API, colored
   on unusual values. Nodes also get **%CPU and %MEM of allocatable**
   (`status.allocatable` - the pool the scheduler hands out), colored by the

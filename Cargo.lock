@@ -2883,6 +2883,7 @@ dependencies = [
  "similar",
  "terminal-colorsaurus",
  "tokio",
+ "tokio-util",
  "toml",
  "unicode-width",
 ]
