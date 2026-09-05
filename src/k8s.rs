@@ -572,6 +572,13 @@ pub const ALIASES: &[(&str, &str)] = &[
 
 #[cfg(any(test, feature = "bench"))]
 impl Cluster {
+    /// Model a connection with no named kubeconfig context (in-cluster, or a
+    /// kubeconfig without a current-context): the display context stays
+    /// synthetic while shell-outs have no name to pin.
+    pub fn forget_cli_context(&mut self) {
+        self.cli_context = None;
+    }
+
     /// A connectionless cluster for unit tests: the client points at a dummy
     /// URL (no I/O happens until a request is actually made) and the registry
     /// is a small hand-built set of common kinds.

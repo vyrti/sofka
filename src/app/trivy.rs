@@ -13,7 +13,14 @@ impl App {
         self.trivy_run = self.trivy_run.wrapping_add(1);
         let run = self.trivy_run;
         let generation = self.generation;
-        let context = self.cluster.context.clone();
+        // The display context can be the synthetic "default" sofka shows when
+        // the kubeconfig names no current context. Only a real context name is
+        // resolvable by Trivy; without one it must infer the config itself.
+        let context = self
+            .cluster
+            .kubectl_context()
+            .unwrap_or_default()
+            .to_string();
         let namespace = self.namespace.clone();
         let claim = if namespace.is_empty() {
             self.claim_status("Trivy: scanning all namespaces…")

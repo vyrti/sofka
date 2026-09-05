@@ -1088,15 +1088,31 @@ async fn trivy_command_is_visible_only_when_detected() {
     );
 }
 
+/// Everything `:trivy` passes before the namespace and context arguments.
 #[cfg(unix)]
-fn write_fake_trivy_response(path: &std::path::Path, report: &str) {
+const TRIVY_SCAN_ARGS: &str = "kubernetes --format json --report summary --quiet --disable-telemetry --skip-version-check --no-progress --parallel 1 --list-all-pkgs=false --disable-node-collector --timeout 5m";
+
+/// A fake Trivy that answers with `report` only for the exact argv the test
+/// expects. The match is anchored on both ends so a missing or extra trailing
+/// argument — the context among them — fails the scan instead of passing.
+#[cfg(unix)]
+fn write_fake_trivy_matching(path: &std::path::Path, expected_args: &str, report: &str) {
     use std::os::unix::fs::PermissionsExt;
 
     let script = format!(
-        "#!/bin/sh\ncase \" $* \" in\n  *\" kubernetes --format json --report summary --quiet --disable-telemetry --skip-version-check --no-progress --parallel 1 --list-all-pkgs=false --disable-node-collector --timeout 5m --include-namespaces default test \"*) printf '%s\\n' '{report}' ;;\n  *) echo 'wrong scan arguments' >&2; exit 9 ;;\nesac\n"
+        "#!/bin/sh\ncase \" $* \" in\n  \" {expected_args} \") printf '%s\\n' '{report}' ;;\n  *) echo \"wrong scan arguments: $*\" >&2; exit 9 ;;\nesac\n"
     );
     std::fs::write(path, script).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+fn write_fake_trivy_response(path: &std::path::Path, report: &str) {
+    write_fake_trivy_matching(
+        path,
+        &format!("{TRIVY_SCAN_ARGS} --include-namespaces default test"),
+        report,
+    );
 }
 
 #[cfg(unix)]
@@ -1146,6 +1162,60 @@ async fn trivy_command_runs_and_opens_parsed_report() {
             .any(|line| line.contains("CRITICAL CVE-2026-1234"))
     );
     assert_eq!(app.flash, "Trivy: 2 findings (1 critical, 1 high)");
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn trivy_command_omits_the_context_when_none_is_named() {
+    let dir = std::env::temp_dir().join(format!(
+        "sofka-app-trivy-nocontext-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let executable = dir.join("trivy");
+    let report = r#"{"SchemaVersion":2,"ClusterName":"test-cluster","Findings":[{"Namespace":"default","Kind":"Deployment","Name":"web","Results":[{"Misconfigurations":[{"ID":"AVD-KSV-0001","Title":"Runs as root","Severity":"HIGH","Status":"FAIL"}]}]}]}"#;
+    write_fake_trivy_matching(
+        &executable,
+        &format!("{TRIVY_SCAN_ARGS} --include-namespaces default"),
+        report,
+    );
+    let (mut app, mut rx) = test_app();
+    // In-cluster and current-context-less kubeconfigs both display as the
+    // synthetic "default"; Trivy cannot resolve that as a context name.
+    app.cluster.forget_cli_context();
+    app.cluster.context = "default".into();
+    app.trivy_path = Some(executable);
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "trivy".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+
+    loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("Trivy result timed out")
+            .expect("message channel closed");
+        let finished = matches!(&msg, Msg::Trivy { .. });
+        app.handle_msg(msg);
+        if finished {
+            break;
+        }
+    }
+    assert_eq!(app.mode, Mode::Detail);
+    assert_eq!(app.detail.title, "trivy — 1 findings");
+    assert!(
+        !app.detail
+            .lines
+            .iter()
+            .any(|line| line.contains("context:")),
+        "{:?}",
+        app.detail.lines
+    );
 
     std::fs::remove_dir_all(dir).unwrap();
 }
