@@ -1217,6 +1217,7 @@ async fn popeye_command_times_out_a_hung_scan() {
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
     let (mut app, mut rx) = test_app();
     app.popeye_path = Some(executable);
+    app.popeye_test_timeout = Some(std::time::Duration::from_millis(25));
 
     app.handle_key(press(KeyCode::Char(':'))).unwrap();
     for c in "popeye".chars() {

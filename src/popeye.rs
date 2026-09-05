@@ -9,14 +9,10 @@ use std::time::Duration;
 
 use serde::de::{DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
-use tokio::io::AsyncReadExt;
-use tokio_util::io::SyncIoBridge;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 const EXECUTABLES: &[&str] = &["popeye", "kubectl-popeye"];
-#[cfg(not(test))]
 const SCAN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-#[cfg(test)]
-const SCAN_TIMEOUT: Duration = Duration::from_secs(1);
 const STDERR_MAX_BYTES: usize = 64 * 1024;
 const STDERR_CHUNK_BYTES: usize = 8 * 1024;
 #[cfg(not(test))]
@@ -110,7 +106,7 @@ pub async fn scan(
     scan_with_timeout(executable, context, namespace, SCAN_TIMEOUT).await
 }
 
-async fn scan_with_timeout(
+pub(crate) async fn scan_with_timeout(
     executable: PathBuf,
     context: String,
     namespace: String,
@@ -145,8 +141,9 @@ async fn scan_inner(
         .take()
         .ok_or_else(|| "failed to capture Popeye stderr".to_string())?;
 
+    let runtime = tokio::runtime::Handle::current();
     let parse_task = tokio::task::spawn_blocking(move || {
-        parse_reader(SyncIoBridge::new(stdout), &context, &namespace)
+        parse_reader(BlockingReader::new(stdout, runtime), &context, &namespace)
     });
     let stderr_task = tokio::spawn(read_stderr(stderr));
 
@@ -188,6 +185,23 @@ fn first_line(bytes: &[u8]) -> Option<&str> {
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
+}
+
+struct BlockingReader<R> {
+    inner: R,
+    runtime: tokio::runtime::Handle,
+}
+
+impl<R> BlockingReader<R> {
+    fn new(inner: R, runtime: tokio::runtime::Handle) -> Self {
+        Self { inner, runtime }
+    }
+}
+
+impl<R: AsyncRead + Unpin> Read for BlockingReader<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.runtime.block_on(self.inner.read(bytes))
+    }
 }
 
 struct BoundedLines {

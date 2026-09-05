@@ -21,8 +21,17 @@ impl App {
             self.claim_status(format!("Popeye: scanning {namespace}…"))
         };
         let tx = self.tx.clone();
+        #[cfg(test)]
+        let test_timeout = self.popeye_test_timeout;
         self.popeye_task = Some(tokio::spawn(async move {
+            #[cfg(not(test))]
             let result = crate::popeye::scan(executable, context, namespace).await;
+            #[cfg(test)]
+            let result = if let Some(timeout) = test_timeout {
+                crate::popeye::scan_with_timeout(executable, context, namespace, timeout).await
+            } else {
+                crate::popeye::scan(executable, context, namespace).await
+            };
             let _ = tx
                 .send(Msg::Popeye {
                     generation,

@@ -1599,6 +1599,8 @@ pub struct App {
     popeye_run: u64,
     #[cfg(test)]
     popeye_test_path: Option<std::ffi::OsString>,
+    #[cfg(test)]
+    popeye_test_timeout: Option<Duration>,
     /// Compiled `[keys]` palette-completion bindings.
     pub palette_keys: crate::config::PaletteKeys,
 
@@ -1858,6 +1860,8 @@ impl App {
             popeye_run: 0,
             #[cfg(test)]
             popeye_test_path: None,
+            #[cfg(test)]
+            popeye_test_timeout: None,
             palette_keys: crate::config::PaletteKeys::default(),
             pf_state: ListState::default(),
             skin_list: crate::theme::BUILTIN_NAMES

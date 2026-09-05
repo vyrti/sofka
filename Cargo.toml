@@ -33,7 +33,6 @@ serde_yaml = "0.9.34"
 similar = "3.1.1"
 terminal-colorsaurus = "1.0.3"
 tokio = { version = "1.52.3", features = ["full"] }
-tokio-util = { version = "0.7.19", features = ["io-util"] }
 toml = "1.1.2"
 unicode-width = "0.2.2"
 
