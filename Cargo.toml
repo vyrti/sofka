@@ -67,9 +67,6 @@ name = "hot_paths"
 harness = false
 required-features = ["bench"]
 
-# Memory counterpart to the benches: criterion measures time, and the Tier 1
-# items are justified by heap. Needs `bench` for the fixtures and `dhat-heap`
-# for the allocator that can report live bytes.
 [[example]]
 name = "memprobe"
 required-features = ["bench", "dhat-heap"]
@@ -79,4 +76,8 @@ required-features = ["bench", "dhat-heap"]
 # backlog faster than the filesystem worker can drain it.
 [[example]]
 name = "state_write_probe"
+required-features = ["bench"]
+
+[[example]]
+name = "allocprobe"
 required-features = ["bench"]
