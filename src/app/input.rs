@@ -636,7 +636,7 @@ impl App {
                 let best = c
                     .names
                     .iter()
-                    .filter_map(|n| self.matcher.fuzzy_match(n, q))
+                    .filter_map(|n| self.matcher.score(n, q))
                     .max();
                 if let Some(score) = best {
                     scored.push((
@@ -663,7 +663,7 @@ impl App {
                 {
                     continue;
                 }
-                if let Some(score) = self.matcher.fuzzy_match(name, q) {
+                if let Some(score) = self.matcher.score(name, q) {
                     scored.push((
                         score,
                         Suggestion {
@@ -682,7 +682,7 @@ impl App {
             let score = if q.is_empty() {
                 Some(i64::MAX)
             } else {
-                self.matcher.fuzzy_match(&b.name, q).map(|s| s + 1_000)
+                self.matcher.score(&b.name, q).map(|s| s + 1_000)
             };
             if let Some(score) = score {
                 scored.push((
@@ -700,7 +700,7 @@ impl App {
             let score = if q.is_empty() {
                 Some(i64::MAX)
             } else {
-                self.matcher.fuzzy_match(&w.name, q).map(|s| s + 1_000)
+                self.matcher.score(&w.name, q).map(|s| s + 1_000)
             };
             if let Some(score) = score {
                 scored.push((
@@ -737,7 +737,7 @@ impl App {
                 continue;
             }
             if let Some(group) = group {
-                let bare_matches = q.is_empty() || self.matcher.fuzzy_match(plural, q).is_some();
+                let bare_matches = q.is_empty() || self.matcher.score(plural, q).is_some();
                 let same_kind = self
                     .cluster
                     .resolve(plural)
@@ -753,7 +753,7 @@ impl App {
             {
                 Some(i64::MAX)
             } else {
-                self.matcher.fuzzy_match(c, q)
+                self.matcher.score(c, q)
             };
             if let Some(score) = score {
                 scored.push((
@@ -788,7 +788,7 @@ impl App {
         for n in names {
             let score = if arg.is_empty() {
                 0
-            } else if let Some(s) = self.matcher.fuzzy_match(&n, arg) {
+            } else if let Some(s) = self.matcher.score(&n, arg) {
                 s
             } else {
                 continue;
@@ -814,7 +814,7 @@ impl App {
         for c in &self.all_contexts {
             let score = if arg.is_empty() {
                 0
-            } else if let Some(s) = self.matcher.fuzzy_match(c, arg) {
+            } else if let Some(s) = self.matcher.score(c, arg) {
                 s
             } else {
                 continue;

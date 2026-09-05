@@ -20,6 +20,7 @@ pub mod diagnostics;
 pub mod explain;
 pub mod filter;
 pub mod fleet;
+pub mod fuzzy;
 pub mod gitops;
 pub mod helm;
 pub mod journal;

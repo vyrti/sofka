@@ -40,17 +40,22 @@ struct CellContext<'a> {
     obj: &'a DynamicObject,
     data: &'a Value,
     name: &'a str,
+    /// Wall clock for the frame this row belongs to, epoch seconds. Read by
+    /// every elapsed-time cell so one row cannot straddle a second boundary
+    /// mid-render and show AGE `59s` above DURATION measured a tick later.
+    now: i64,
     age: OnceCell<String>,
     pod: OnceCell<(String, String, String)>,
     helm: OnceCell<Option<crate::helm::Summary>>,
 }
 
 impl<'a> CellContext<'a> {
-    fn new(obj: &'a DynamicObject) -> Self {
+    fn new(obj: &'a DynamicObject, now: i64) -> Self {
         CellContext {
             obj,
             data: &obj.data,
             name: obj.metadata.name.as_deref().unwrap_or_default(),
+            now,
             age: OnceCell::new(),
             pod: OnceCell::new(),
             helm: OnceCell::new(),
@@ -58,7 +63,7 @@ impl<'a> CellContext<'a> {
     }
 
     fn age(&self) -> &str {
-        self.age.get_or_init(|| age(self.obj))
+        self.age.get_or_init(|| age(self.obj, self.now))
     }
 
     /// `(READY, STATUS, RESTARTS)` — one walk of `containerStatuses` for all
@@ -359,8 +364,8 @@ pub fn headers(plural: &str) -> Vec<&'static str> {
 /// Cells for one object, aligned with [`headers`]. The 2nd return value is the
 /// index of the column that should be colorized as a status (or None).
 #[cfg(test)]
-pub fn cells(obj: &DynamicObject, plural: &str) -> (Vec<String>, Option<usize>) {
-    let ctx = CellContext::new(obj);
+pub fn cells(obj: &DynamicObject, plural: &str, now: i64) -> (Vec<String>, Option<usize>) {
+    let ctx = CellContext::new(obj, now);
     let columns = columns_for(plural);
     let values = columns
         .iter()
@@ -474,14 +479,14 @@ impl ViewSpec {
 
     /// Cells for one object, aligned with [`Self::headers`], plus the index
     /// of the status column (if any).
-    pub fn cells(&self, obj: &DynamicObject) -> (Vec<String>, Option<usize>) {
-        let ctx = CellContext::new(obj);
+    pub fn cells(&self, obj: &DynamicObject, now: i64) -> (Vec<String>, Option<usize>) {
+        let ctx = CellContext::new(obj, now);
         let values = self
             .columns
             .iter()
             .map(|c| match &c.source {
                 SpecSource::Curated(extract) => extract(&ctx).into_owned(),
-                SpecSource::User(uc) => crate::views::render_cell(obj, uc),
+                SpecSource::User(uc) => crate::views::render_cell(obj, uc, now),
             })
             .collect();
         (values, self.status_idx)
@@ -489,14 +494,20 @@ impl ViewSpec {
 
     /// See [`volatile_cell`]. User `time` columns re-render every frame too:
     /// their humanized elapsed value drifts with wall time.
-    pub fn volatile(&self, obj: &DynamicObject, plural: &str, idx: usize) -> Option<String> {
+    pub fn volatile(
+        &self,
+        obj: &DynamicObject,
+        plural: &str,
+        idx: usize,
+        now: i64,
+    ) -> Option<String> {
         let col = self.columns.get(idx)?;
         match &col.source {
             SpecSource::User(uc) if uc.kind == crate::views::ColumnKind::Time => {
-                Some(crate::views::render_cell(obj, uc))
+                Some(crate::views::render_cell(obj, uc, now))
             }
             SpecSource::User(_) => None,
-            SpecSource::Curated(_) => volatile_cell(obj, plural, &col.header),
+            SpecSource::Curated(_) => volatile_cell(obj, plural, &col.header, now),
         }
     }
 
@@ -512,12 +523,17 @@ impl ViewSpec {
     /// column of every object — extracting the full row per object per
     /// rebuild is what this avoids. Curated JSON/name cells borrow from
     /// `obj`; user columns and computed curated cells remain owned.
-    pub fn cell_at<'a>(&self, obj: &'a DynamicObject, idx: usize) -> Option<Cow<'a, str>> {
+    pub fn cell_at<'a>(
+        &self,
+        obj: &'a DynamicObject,
+        idx: usize,
+        now: i64,
+    ) -> Option<Cow<'a, str>> {
         let col = self.columns.get(idx)?;
         Some(match &col.source {
-            SpecSource::User(uc) => Cow::Owned(crate::views::render_cell(obj, uc)),
+            SpecSource::User(uc) => Cow::Owned(crate::views::render_cell(obj, uc, now)),
             SpecSource::Curated(extract) => {
-                let ctx = CellContext::new(obj);
+                let ctx = CellContext::new(obj, now);
                 extract(&ctx)
             }
         })
@@ -533,17 +549,22 @@ impl ViewSpec {
 
     /// Comparable value of `header`'s cell for `obj`, or `None` when the
     /// header isn't in this spec.
-    pub fn sort_value(&self, obj: &DynamicObject, header: &str) -> Option<crate::views::SortValue> {
+    pub fn sort_value(
+        &self,
+        obj: &DynamicObject,
+        header: &str,
+        now: i64,
+    ) -> Option<crate::views::SortValue> {
         let col = self.columns.iter().find(|c| c.header == header)?;
         Some(match &col.source {
-            SpecSource::User(uc) => crate::views::sort_value(obj, uc),
+            SpecSource::User(uc) => crate::views::sort_value(obj, uc, now),
             SpecSource::Curated(extract) => {
-                let ctx = CellContext::new(obj);
+                let ctx = CellContext::new(obj, now);
                 let v = extract(&ctx);
                 if is_numeric_header(&self.plural, header) {
                     crate::views::SortValue::Num(parse_leading_num(&v))
                 } else {
-                    crate::views::SortValue::Text(v.to_lowercase())
+                    crate::views::SortValue::Text(v.to_lowercase().to_string())
                 }
             }
         })
@@ -602,14 +623,14 @@ pub(crate) fn parse_leading_num(s: &str) -> f64 {
 /// Cells whose display value changes with wall time even when the Kubernetes
 /// resourceVersion is unchanged. Table rendering can override cached values
 /// with these without recomputing every curated column.
-pub fn volatile_cell(obj: &DynamicObject, plural: &str, header: &str) -> Option<String> {
+pub fn volatile_cell(obj: &DynamicObject, plural: &str, header: &str, now: i64) -> Option<String> {
     match (plural, header) {
-        (_, "AGE") => Some(age(obj)),
+        (_, "AGE") => Some(age(obj, now)),
         ("jobs", "DURATION") if sget(&obj.data, &["status", "completionTime"]).is_none() => {
-            Some(job_duration(&obj.data))
+            Some(job_duration(&obj.data, now))
         }
         ("cronjobs", "LAST-SCHEDULE") => {
-            Some(time_since(&obj.data, &["status", "lastScheduleTime"]))
+            Some(time_since(&obj.data, &["status", "lastScheduleTime"], now))
         }
         _ => None,
     }
@@ -905,7 +926,7 @@ fn col_job_completions<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
 }
 
 fn col_job_duration<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
-    Cow::Owned(job_duration(ctx.data))
+    Cow::Owned(job_duration(ctx.data, ctx.now))
 }
 
 fn col_cronjob_schedule<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
@@ -921,7 +942,11 @@ fn col_cronjob_active<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
 }
 
 fn col_cronjob_last_schedule<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
-    Cow::Owned(time_since(ctx.data, &["status", "lastScheduleTime"]))
+    Cow::Owned(time_since(
+        ctx.data,
+        &["status", "lastScheduleTime"],
+        ctx.now,
+    ))
 }
 
 fn col_event_type<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
@@ -1256,8 +1281,8 @@ fn count_arr(v: &Value, path: &[&str]) -> usize {
 }
 
 /// Compact human age, e.g. `3d4h`, `12m`, `45s`.
-pub fn age(obj: &DynamicObject) -> String {
-    match age_secs(obj) {
+pub fn age(obj: &DynamicObject, now: i64) -> String {
+    match age_secs(obj, now) {
         Some(secs) => humanize(secs),
         None => "<unknown>".into(),
     }
@@ -1265,9 +1290,17 @@ pub fn age(obj: &DynamicObject) -> String {
 
 /// Age in seconds since creation, or `None` if the object has no timestamp.
 /// Used both for the AGE column and for sorting by age.
-pub fn age_secs(obj: &DynamicObject) -> Option<i64> {
+pub fn age_secs(obj: &DynamicObject, now: i64) -> Option<i64> {
     let ts = obj.metadata.creation_timestamp.as_ref()?;
-    Some((Timestamp::now().as_second() - ts.0.as_second()).max(0))
+    Some((now - ts.0.as_second()).max(0))
+}
+
+/// One reading of the wall clock, in epoch seconds, for a whole frame or
+/// rebuild. Every elapsed-time cell and sort key derives from a single call so
+/// a frame is internally consistent — and so a 2,000-row table takes one
+/// syscall instead of one per visible time cell.
+pub fn now_secs() -> i64 {
+    Timestamp::now().as_second()
 }
 
 fn timestamp_secs(d: &Value, path: &[&str]) -> Option<i64> {
@@ -1284,25 +1317,23 @@ pub fn last_schedule_secs(obj: &DynamicObject) -> Option<i64> {
 
 /// Elapsed seconds behind a Job's humanized DURATION cell (running jobs
 /// measure against now).
-pub fn job_duration_secs(obj: &DynamicObject) -> Option<i64> {
+pub fn job_duration_secs(obj: &DynamicObject, now: i64) -> Option<i64> {
     let start = timestamp_secs(&obj.data, &["status", "startTime"])?;
-    let end = timestamp_secs(&obj.data, &["status", "completionTime"])
-        .unwrap_or_else(|| Timestamp::now().as_second());
+    let end = timestamp_secs(&obj.data, &["status", "completionTime"]).unwrap_or(now);
     Some((end - start).max(0))
 }
 
-fn time_since(d: &Value, path: &[&str]) -> String {
+fn time_since(d: &Value, path: &[&str], now: i64) -> String {
     timestamp_secs(d, path)
-        .map(|secs| humanize((Timestamp::now().as_second() - secs).max(0)))
+        .map(|secs| humanize((now - secs).max(0)))
         .unwrap_or_else(|| "<none>".into())
 }
 
-fn job_duration(d: &Value) -> String {
+fn job_duration(d: &Value, now: i64) -> String {
     let Some(start) = timestamp_secs(d, &["status", "startTime"]) else {
         return "<none>".into();
     };
-    let end = timestamp_secs(d, &["status", "completionTime"])
-        .unwrap_or_else(|| Timestamp::now().as_second());
+    let end = timestamp_secs(d, &["status", "completionTime"]).unwrap_or(now);
     humanize((end - start).max(0))
 }
 
@@ -1812,6 +1843,84 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
+    /// Every elapsed-time cell reads the frame's clock, never its own. Fixing
+    /// `now` makes the rendered value exact instead of racing the wall clock.
+    #[test]
+    fn elapsed_cells_measure_against_the_frame_clock() {
+        let created = "2026-09-05T12:00:00Z";
+        let now = created.parse::<Timestamp>().unwrap().as_second() + 3600 + 120;
+
+        let p = obj(json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "web", "creationTimestamp": created},
+            "status": {"phase": "Running"}
+        }));
+
+        assert_eq!(age(&p, now), "1h2m");
+        assert_eq!(age_secs(&p, now), Some(3720));
+        assert_eq!(
+            volatile_cell(&p, "pods", "AGE", now).as_deref(),
+            Some("1h2m")
+        );
+    }
+
+    /// A running Job's DURATION also ends at the frame clock, so the whole row
+    /// is measured against one instant.
+    #[test]
+    fn a_running_job_measures_its_duration_against_the_frame_clock() {
+        let start = "2026-09-05T12:00:00Z";
+        let now = start.parse::<Timestamp>().unwrap().as_second() + 45;
+        let j = obj(json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "backup"},
+            "status": {"startTime": start}
+        }));
+
+        assert_eq!(job_duration_secs(&j, now), Some(45));
+        assert_eq!(
+            volatile_cell(&j, "jobs", "DURATION", now).as_deref(),
+            Some("45s")
+        );
+
+        // A finished Job measures start-to-completion and ignores the clock.
+        let done = obj(json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "backup"},
+            "status": {"startTime": start, "completionTime": "2026-09-05T12:00:30Z"}
+        }));
+        assert_eq!(job_duration_secs(&done, now), Some(30));
+        assert_eq!(job_duration_secs(&done, now + 10_000), Some(30));
+    }
+
+    /// The point of one reading per frame: two rows created a hair apart can
+    /// never be measured against two different "now"s, whatever the clock does
+    /// between them.
+    #[test]
+    fn one_frame_clock_keeps_rows_consistent() {
+        let base = "2026-09-05T12:00:00Z"
+            .parse::<Timestamp>()
+            .unwrap()
+            .as_second();
+        let row = |created: i64| {
+            obj(json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {
+                    "name": "web",
+                    "creationTimestamp": Timestamp::from_second(created)
+                        .unwrap()
+                        .to_string(),
+                },
+                "status": {"phase": "Running"}
+            }))
+        };
+        // Both created 59s before the frame's instant.
+        let now = base + 59;
+        assert_eq!(age(&row(base), now), age(&row(base), now));
+        assert_eq!(age(&row(base), now), "59s");
+        // One second later both roll over together, never one at a time.
+        assert_eq!(age(&row(base), now + 1), "1m");
+    }
+
     #[test]
     fn pod_cells_summarize_status_and_restarts() {
         let p = obj(json!({
@@ -1828,7 +1937,7 @@ mod tests {
                 ]
             }
         }));
-        let (cells, status_idx) = cells(&p, "pods");
+        let (cells, status_idx) = cells(&p, "pods", now_secs());
         assert_eq!(cells[0], "web");
         assert_eq!(cells[1], "1/2"); // ready
         assert_eq!(cells[2], "CrashLoopBackOff"); // waiting reason overrides phase
@@ -1854,7 +1963,7 @@ mod tests {
             3,
             json!({"replicas": 3, "readyReplicas": 3, "updatedReplicas": 3}),
         );
-        let (c, status_idx) = cells(&d, "deployments");
+        let (c, status_idx) = cells(&d, "deployments", now_secs());
         assert_eq!(c[1], "3/3");
         assert_eq!(c[2], "Ready");
         assert_eq!(status_idx, Some(2));
@@ -1864,14 +1973,14 @@ mod tests {
             3,
             json!({"replicas": 3, "readyReplicas": 0, "updatedReplicas": 3}),
         );
-        assert_eq!(cells(&d, "deployments").0[2], "Unavailable");
+        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Unavailable");
 
         // Rollout replacing pods (updated < desired) → progressing.
         let d = deploy(
             3,
             json!({"replicas": 4, "readyReplicas": 2, "updatedReplicas": 1}),
         );
-        assert_eq!(cells(&d, "deployments").0[2], "Progressing");
+        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Progressing");
 
         // Fully rolled out but pods unready (crash loops, failed probes) →
         // degraded, not "progressing" — nothing is coming to fix it.
@@ -1879,14 +1988,14 @@ mod tests {
             3,
             json!({"replicas": 3, "readyReplicas": 2, "updatedReplicas": 3}),
         );
-        assert_eq!(cells(&d, "deployments").0[2], "Degraded");
+        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Degraded");
 
         // Scaled to zero reads faded, not broken.
         let d = deploy(0, json!({}));
-        assert_eq!(cells(&d, "deployments").0[2], "ScaledDown");
+        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "ScaledDown");
         // ... and still tearing down reads transitional.
         let d = deploy(0, json!({"replicas": 2, "readyReplicas": 2}));
-        assert_eq!(cells(&d, "deployments").0[2], "Progressing");
+        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Progressing");
     }
 
     #[test]
@@ -1900,7 +2009,7 @@ mod tests {
                                 "reason": "ProgressDeadlineExceeded"}]
             }),
         );
-        assert_eq!(cells(&d, "deployments").0[2], "Stalled");
+        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Stalled");
 
         // Available=False overrides a numerically-satisfied ready count.
         let d = deploy(
@@ -1910,7 +2019,7 @@ mod tests {
                 "conditions": [{"type": "Available", "status": "False"}]
             }),
         );
-        assert_eq!(cells(&d, "deployments").0[2], "Unavailable");
+        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Unavailable");
     }
 
     #[test]
@@ -1922,7 +2031,7 @@ mod tests {
             "status": {"replicas": 3, "readyReplicas": 2, "updatedReplicas": 2}
         }));
         // Rolling update in flight (updated < desired) → progressing.
-        assert_eq!(cells(&sts, "statefulsets").0[2], "Progressing");
+        assert_eq!(cells(&sts, "statefulsets", now_secs()).0[2], "Progressing");
 
         let ds = obj(json!({
             "apiVersion": "apps/v1", "kind": "DaemonSet",
@@ -1931,7 +2040,7 @@ mod tests {
                        "numberReady": 3, "updatedNumberScheduled": 5}
         }));
         // Fully rolled out, nodes unready → degraded. STATUS follows AVAILABLE.
-        assert_eq!(cells(&ds, "daemonsets").0[5], "Degraded");
+        assert_eq!(cells(&ds, "daemonsets", now_secs()).0[5], "Degraded");
 
         // An old, scaled-down ReplicaSet must read faded, not broken.
         let rs = obj(json!({
@@ -1940,7 +2049,7 @@ mod tests {
             "spec": {"replicas": 0},
             "status": {"replicas": 0}
         }));
-        assert_eq!(cells(&rs, "replicasets").0[4], "ScaledDown");
+        assert_eq!(cells(&rs, "replicasets", now_secs()).0[4], "ScaledDown");
 
         // spec.replicas unset defaults to 1 — a bare RS with one ready pod
         // is healthy, not degraded.
@@ -1949,7 +2058,7 @@ mod tests {
             "metadata": {"name": "web-abc", "namespace": "default"},
             "status": {"replicas": 1, "readyReplicas": 1}
         }));
-        assert_eq!(cells(&rs, "replicasets").0[4], "Ready");
+        assert_eq!(cells(&rs, "replicasets", now_secs()).0[4], "Ready");
     }
 
     #[test]
@@ -1961,7 +2070,7 @@ mod tests {
             "spec": {"replicas": 3},
             "status": {"replicas": 3, "readyReplicas": 3, "updatedReplicas": 3}
         }));
-        assert_eq!(cells(&d, "deployments").0[2], "Terminating");
+        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Terminating");
     }
 
     #[test]
@@ -1977,7 +2086,7 @@ mod tests {
             "status": {"conditions": [{"type": "Ready", "status": "True"}],
                        "nodeInfo": {"kubeletVersion": "v1.31.0"}}
         }));
-        let (node_cells, status_idx) = cells(&n, "nodes");
+        let (node_cells, status_idx) = cells(&n, "nodes", now_secs());
         assert_eq!(node_cells[0], "cp-1");
         assert_eq!(node_cells[1], "Ready");
         assert_eq!(node_cells[2], "control-plane");
@@ -1986,7 +2095,7 @@ mod tests {
         assert_eq!(status_idx, Some(1));
 
         let bare = obj(json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": "w-1"}}));
-        let (bare_cells, _) = cells(&bare, "nodes");
+        let (bare_cells, _) = cells(&bare, "nodes", now_secs());
         assert_eq!(bare_cells[3], "0");
     }
 
@@ -1999,7 +2108,7 @@ mod tests {
                      "ports": [{"port": 80, "protocol": "TCP"}]},
             "status": {"loadBalancer": {}}
         }));
-        let (cells, _) = cells(&s, "services");
+        let (cells, _) = cells(&s, "services", now_secs());
         assert_eq!(cells[1], "LoadBalancer");
         assert_eq!(cells[3], "<pending>");
         assert_eq!(cells[4], "80/TCP");
@@ -2025,7 +2134,7 @@ mod tests {
             headers("customresourcedefinitions"),
             vec!["NAME", "GROUP", "KIND", "VERSIONS", "SCOPE", "AGE"]
         );
-        let (cells, _) = cells(&crd, "customresourcedefinitions");
+        let (cells, _) = cells(&crd, "customresourcedefinitions", now_secs());
         assert_eq!(cells[0], "widgets.example.com");
         assert_eq!(cells[1], "example.com");
         assert_eq!(cells[2], "Widget");
@@ -2049,7 +2158,7 @@ mod tests {
                 ]
             }
         }));
-        let (cells, status_idx) = cells(&ks, "kustomizations");
+        let (cells, status_idx) = cells(&ks, "kustomizations", now_secs());
         assert_eq!(cells[0], "apps");
         assert_eq!(cells[1], "True");
         assert_eq!(cells[2], "Applied revision: main@sha1:abc123");
@@ -2073,7 +2182,7 @@ mod tests {
                 ]
             }
         }));
-        let (cells, status_idx) = cells(&hr, "helmreleases");
+        let (cells, status_idx) = cells(&hr, "helmreleases", now_secs());
         assert_eq!(cells[1], "False");
         assert_eq!(cells[2], "install retries exhausted");
         assert_eq!(cells[3], "6.5.4");
@@ -2095,7 +2204,7 @@ mod tests {
                 ]
             }
         }));
-        let (cells, status_idx) = cells(&git, "gitrepositories");
+        let (cells, status_idx) = cells(&git, "gitrepositories", now_secs());
         assert_eq!(
             headers("gitrepositories"),
             vec![
@@ -2129,7 +2238,7 @@ mod tests {
                 "conditions": [{"type": "Ready", "status": "False", "message": "denied"}]
             }
         }));
-        let (cells, status_idx) = cells(&bucket, "buckets");
+        let (cells, status_idx) = cells(&bucket, "buckets", now_secs());
         assert_eq!(cells[1], "False");
         assert_eq!(cells[2], "denied");
         assert_eq!(cells[3], "sha256:abc123");
@@ -2151,7 +2260,7 @@ mod tests {
                 "completionTime": "2024-01-01T01:05:00Z"
             }
         }));
-        let (cells, _) = cells(&job, "jobs");
+        let (cells, _) = cells(&job, "jobs", now_secs());
         assert_eq!(
             headers("jobs"),
             vec!["NAME", "COMPLETIONS", "DURATION", "AGE"]
@@ -2169,7 +2278,7 @@ mod tests {
             "spec": {"schedule": "*/15 * * * *", "suspend": false},
             "status": {"active": [{"name": "backup-1"}]}
         }));
-        let (cells, _) = cells(&cron, "cronjobs");
+        let (cells, _) = cells(&cron, "cronjobs", now_secs());
         assert_eq!(
             headers("cronjobs"),
             vec![
@@ -2199,7 +2308,7 @@ mod tests {
             "note": "Back-off restarting\nfailed container",
             "series": {"count": 7}
         }));
-        let (cells, status_idx) = cells(&event, "events");
+        let (cells, status_idx) = cells(&event, "events", now_secs());
         assert_eq!(
             headers("events"),
             vec![
@@ -2243,7 +2352,7 @@ mod tests {
                 }]
             }
         }));
-        let (cells, _) = cells(&hpa, "horizontalpodautoscalers");
+        let (cells, _) = cells(&hpa, "horizontalpodautoscalers", now_secs());
         assert_eq!(
             headers("horizontalpodautoscalers"),
             vec![
@@ -2270,7 +2379,7 @@ mod tests {
             "kind": "Kustomization",
             "metadata": {"name": "new"}
         }));
-        let (cells, _) = cells(&ks, "kustomizations");
+        let (cells, _) = cells(&ks, "kustomizations", now_secs());
         assert_eq!(cells[1], "Unknown");
         assert_eq!(cells[2], "");
         assert_eq!(cells[3], "");
@@ -2288,7 +2397,7 @@ mod tests {
             },
             "status": {"loadBalancer": {"ingress": [{"ip": "203.0.113.10"}]}}
         }));
-        let (cells, _) = cells(&ing, "ingresses");
+        let (cells, _) = cells(&ing, "ingresses", now_secs());
         assert_eq!(
             headers("ingresses"),
             ["NAME", "CLASS", "HOSTS", "ADDRESS", "AGE"]
@@ -2305,13 +2414,16 @@ mod tests {
             "metadata": {"name": "lb"},
             "status": {"loadBalancer": {"ingress": [{"hostname": "abc.elb.amazonaws.com"}]}}
         }));
-        assert_eq!(cells(&hostname, "ingresses").0[3], "abc.elb.amazonaws.com");
+        assert_eq!(
+            cells(&hostname, "ingresses", now_secs()).0[3],
+            "abc.elb.amazonaws.com"
+        );
 
         let pending = obj(json!({
             "apiVersion": "networking.k8s.io/v1", "kind": "Ingress",
             "metadata": {"name": "pending"}
         }));
-        assert_eq!(cells(&pending, "ingresses").0[3], "<none>");
+        assert_eq!(cells(&pending, "ingresses", now_secs()).0[3], "<none>");
     }
 
     #[test]
@@ -2322,7 +2434,7 @@ mod tests {
             "metadata": {"name": "web"},
             "spec": {"hostnames": ["app.example.com", "www.example.com"]}
         }));
-        let (row, idx) = cells(&route, "httproutes");
+        let (row, idx) = cells(&route, "httproutes", now_secs());
         assert_eq!(headers("httproutes"), ["NAME", "HOSTNAMES", "AGE"]);
         assert_eq!(row[1], "app.example.com,www.example.com");
         assert_eq!(idx, None);
@@ -2331,7 +2443,7 @@ mod tests {
             "apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
             "metadata": {"name": "any"}
         }));
-        assert_eq!(cells(&wildcard, "httproutes").0[1], "*");
+        assert_eq!(cells(&wildcard, "httproutes", now_secs()).0[1], "*");
     }
 
     #[test]
@@ -2340,7 +2452,7 @@ mod tests {
             "apiVersion": "example.com/v1", "kind": "Widget",
             "metadata": {"name": "thingy"}
         }));
-        let (cells, idx) = cells(&o, "widgets");
+        let (cells, idx) = cells(&o, "widgets", now_secs());
         assert_eq!(cells[0], "thingy");
         assert_eq!(cells.len(), 2);
         assert_eq!(idx, None);
@@ -2385,7 +2497,7 @@ mod tests {
 
         for kind in kinds {
             let headers = headers(kind);
-            let (cells, status_idx) = cells(&o, kind);
+            let (cells, status_idx) = cells(&o, kind, now_secs());
             assert_eq!(headers.len(), cells.len(), "{kind} column count");
             if let Some(idx) = status_idx {
                 assert!(idx < cells.len(), "{kind} status index");
@@ -2441,7 +2553,7 @@ mod tests {
             "metadata": {"name": "web"},
             "status": {"phase": "Running", "hostIP": "10.0.0.9"}
         }));
-        let (cells, status_idx) = spec.cells(&o);
+        let (cells, status_idx) = spec.cells(&o, now_secs());
         assert_eq!(cells[2], "Running");
         assert_eq!(cells[4], "10.0.0.9");
         assert_eq!(status_idx, Some(2));
@@ -2522,11 +2634,11 @@ mod tests {
         }));
         assert!(spec.is_user_column("CPU"));
         assert!(!spec.is_user_column("NAME"));
-        match spec.sort_value(&o, "CPU").unwrap() {
+        match spec.sort_value(&o, "CPU", now_secs()).unwrap() {
             SortValue::Num(n) => assert_eq!(n, 0.5),
             SortValue::Text(t) => panic!("expected numeric sort, got '{t}'"),
         }
-        assert!(spec.sort_value(&o, "MISSING").is_none());
+        assert!(spec.sort_value(&o, "MISSING", now_secs()).is_none());
     }
 
     #[test]
@@ -2542,14 +2654,17 @@ mod tests {
         let spec = build_spec("pods", None, None, true);
 
         assert!(matches!(
-            spec.cell_at(&pod, 0),
+            spec.cell_at(&pod, 0, now_secs()),
             Some(Cow::Borrowed("pod-a"))
         ));
         assert!(matches!(
-            spec.cell_at(&pod, 4),
+            spec.cell_at(&pod, 4, now_secs()),
             Some(Cow::Borrowed("10.0.0.7"))
         ));
-        assert!(matches!(spec.cell_at(&pod, 1), Some(Cow::Owned(_))));
+        assert!(matches!(
+            spec.cell_at(&pod, 1, now_secs()),
+            Some(Cow::Owned(_))
+        ));
     }
 
     #[test]
@@ -2564,10 +2679,11 @@ mod tests {
             }))
         };
         let spec = build_spec("kustomizations", None, None, false);
-        let ready = |status: &str| match spec.sort_value(&flux(status), "READY").unwrap() {
-            SortValue::Text(t) => t,
-            SortValue::Num(n) => panic!("flux READY must sort as text, got {n}"),
-        };
+        let ready =
+            |status: &str| match spec.sort_value(&flux(status), "READY", now_secs()).unwrap() {
+                SortValue::Text(t) => t,
+                SortValue::Num(n) => panic!("flux READY must sort as text, got {n}"),
+            };
         assert!(ready("False") < ready("True"));
         assert!(ready("True") < ready("Unknown"));
 
@@ -2580,7 +2696,7 @@ mod tests {
             ]}
         }));
         let spec = build_spec("pods", None, None, false);
-        match spec.sort_value(&pod, "READY").unwrap() {
+        match spec.sort_value(&pod, "READY", now_secs()).unwrap() {
             SortValue::Num(n) => assert_eq!(n, 1.0),
             SortValue::Text(t) => panic!("pod READY must sort numerically, got '{t}'"),
         }

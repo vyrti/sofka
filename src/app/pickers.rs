@@ -67,16 +67,29 @@ impl App {
     /// then the remaining namespaces alphabetically. With a filter active,
     /// everything is fuzzy-matched (favourites/recents lose their pinning so
     /// the best textual match wins).
-    pub fn filtered_namespaces(&self) -> Vec<String> {
+    pub fn filtered_namespaces(&self) -> Rc<Vec<String>> {
+        if let Some(m) = self.picker_memos.borrow().namespaces.as_ref()
+            && m.filter == self.ns_filter
+            && m.context == self.cluster.context
+            && m.ns_list == self.ns_list
+            && m.favorites == self.namespace_favorites
+            && m.recents
+                .iter()
+                .map(String::as_str)
+                .eq(self.recent_namespaces_for_context())
+        {
+            return Rc::clone(&m.value);
+        }
+
         let mut out = vec!["<all>".to_string()];
         let rest = self.ns_list.iter().filter(|n| n.as_str() != "<all>");
         if !self.ns_filter.is_empty() {
             let mut scored: Vec<(i64, &String)> = rest
-                .filter_map(|n| self.matcher.fuzzy_match(n, &self.ns_filter).map(|s| (s, n)))
+                .filter_map(|n| self.matcher.score(n, &self.ns_filter).map(|s| (s, n)))
                 .collect();
             scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
             out.extend(scored.into_iter().map(|(_, n)| n.clone()));
-            return out;
+            return self.remember_namespaces(out);
         }
 
         let available: std::collections::HashSet<&str> = rest.map(String::as_str).collect();
@@ -90,8 +103,8 @@ impl App {
         }
         // Then session recents that still exist and aren't already favourites.
         for r in self.recent_namespaces_for_context() {
-            if available.contains(r.as_str()) && seen.insert(r.clone()) {
-                out.push(r);
+            if available.contains(r) && seen.insert(r.to_string()) {
+                out.push(r.to_string());
             }
         }
         // Then everything else (ns_list is already sorted).
@@ -100,15 +113,32 @@ impl App {
                 out.push(n.clone());
             }
         }
-        out
+        self.remember_namespaces(out)
     }
 
-    /// The recent namespaces for the current context, newest first.
-    fn recent_namespaces_for_context(&self) -> Vec<String> {
+    fn remember_namespaces(&self, out: Vec<String>) -> Rc<Vec<String>> {
+        let value = Rc::new(out);
+        self.picker_memos.borrow_mut().namespaces = Some(NamespaceMemo {
+            filter: self.ns_filter.clone(),
+            context: self.cluster.context.clone(),
+            ns_list: self.ns_list.clone(),
+            favorites: self.namespace_favorites.clone(),
+            recents: self
+                .recent_namespaces_for_context()
+                .map(str::to_string)
+                .collect(),
+            value: Rc::clone(&value),
+        });
+        value
+    }
+
+    /// The recent namespaces for the current context, newest first. Borrowed:
+    /// every caller only reads them.
+    fn recent_namespaces_for_context(&self) -> impl Iterator<Item = &str> + Clone {
         self.recent_namespaces
             .get(&self.cluster.context)
-            .map(|dq| dq.iter().cloned().collect())
-            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|dq| dq.iter().map(String::as_str))
     }
 
     /// Whether `n` is a configured favourite namespace.
@@ -182,24 +212,41 @@ impl App {
     /// Entries for the sort picker: the default ordering is always pinned
     /// first; column headers are fuzzy-matched against the type-to-filter
     /// buffer (see `filtered_namespaces` for the same pattern).
-    pub fn filtered_sort_entries(&self) -> Vec<String> {
-        let mut out = vec![DEFAULT_SORT_LABEL.to_string()];
+    pub fn filtered_sort_entries(&self) -> Rc<Vec<String>> {
         let headers = self.display_headers();
+        if let Some(m) = self.picker_memos.borrow().sort_entries.as_ref()
+            && m.filter == self.sort_picker_filter
+            && Rc::ptr_eq(&m.headers, &headers)
+        {
+            return Rc::clone(&m.value);
+        }
+
+        let mut out = vec![DEFAULT_SORT_LABEL.to_string()];
         if self.sort_picker_filter.is_empty() {
-            out.extend(headers);
-            return out;
+            out.extend(headers.iter().cloned());
+            return self.remember_sort_entries(headers, out);
         }
         let mut scored: Vec<(i64, String)> = headers
-            .into_iter()
+            .iter()
             .filter_map(|h| {
                 self.matcher
-                    .fuzzy_match(&h, &self.sort_picker_filter)
-                    .map(|s| (s, h))
+                    .score(h, &self.sort_picker_filter)
+                    .map(|s| (s, h.clone()))
             })
             .collect();
         scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         out.extend(scored.into_iter().map(|(_, h)| h));
-        out
+        self.remember_sort_entries(headers, out)
+    }
+
+    fn remember_sort_entries(&self, headers: Rc<[String]>, out: Vec<String>) -> Rc<Vec<String>> {
+        let value = Rc::new(out);
+        self.picker_memos.borrow_mut().sort_entries = Some(SortEntryMemo {
+            filter: self.sort_picker_filter.clone(),
+            headers,
+            value: Rc::clone(&value),
+        });
+        value
     }
 
     pub(super) fn key_sort_picker(&mut self, key: KeyEvent) {
@@ -306,21 +353,37 @@ impl App {
     /// Entries for the copy picker: the captured `(header, value)` pairs,
     /// fuzzy-matched against both the header and the value (so typing part
     /// of an IP finds it as readily as typing the column name).
-    pub fn filtered_copy_entries(&self) -> Vec<(String, String)> {
+    pub fn filtered_copy_entries(&self) -> Rc<Vec<(String, String)>> {
+        if let Some(m) = self.picker_memos.borrow().copy_entries.as_ref()
+            && m.filter == self.copy_picker_filter
+            && m.fields == self.copy_picker_fields
+        {
+            return Rc::clone(&m.value);
+        }
         if self.copy_picker_filter.is_empty() {
-            return self.copy_picker_fields.clone();
+            return self.remember_copy_entries(self.copy_picker_fields.clone());
         }
         let mut scored: Vec<(i64, (String, String))> = self
             .copy_picker_fields
             .iter()
             .filter_map(|(h, v)| {
                 self.matcher
-                    .fuzzy_match(&format!("{h} {v}"), &self.copy_picker_filter)
+                    .score(&format!("{h} {v}"), &self.copy_picker_filter)
                     .map(|s| (s, (h.clone(), v.clone())))
             })
             .collect();
         scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.0.cmp(&b.1.0)));
-        scored.into_iter().map(|(_, e)| e).collect()
+        self.remember_copy_entries(scored.into_iter().map(|(_, e)| e).collect())
+    }
+
+    fn remember_copy_entries(&self, out: Vec<(String, String)>) -> Rc<Vec<(String, String)>> {
+        let value = Rc::new(out);
+        self.picker_memos.borrow_mut().copy_entries = Some(CopyEntryMemo {
+            filter: self.copy_picker_filter.clone(),
+            fields: self.copy_picker_fields.clone(),
+            value: Rc::clone(&value),
+        });
+        value
     }
 
     pub(super) fn key_copy_picker(&mut self, key: KeyEvent) {
@@ -507,21 +570,33 @@ impl App {
 
     /// Contexts for the switcher, fuzzy-matched against the type-to-filter
     /// buffer (see `filtered_namespaces` for the same pattern).
-    pub fn filtered_contexts(&self) -> Vec<String> {
+    pub fn filtered_contexts(&self) -> Rc<Vec<String>> {
+        if let Some(m) = self.picker_memos.borrow().contexts.as_ref()
+            && m.filter == self.ctx_filter
+            && m.ctx_list == self.ctx_list
+        {
+            return Rc::clone(&m.value);
+        }
         if self.ctx_filter.is_empty() {
-            return self.ctx_list.clone();
+            return self.remember_contexts(self.ctx_list.clone());
         }
         let mut scored: Vec<(i64, &String)> = self
             .ctx_list
             .iter()
-            .filter_map(|c| {
-                self.matcher
-                    .fuzzy_match(c, &self.ctx_filter)
-                    .map(|s| (s, c))
-            })
+            .filter_map(|c| self.matcher.score(c, &self.ctx_filter).map(|s| (s, c)))
             .collect();
         scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
-        scored.into_iter().map(|(_, c)| c.clone()).collect()
+        self.remember_contexts(scored.into_iter().map(|(_, c)| c.clone()).collect())
+    }
+
+    fn remember_contexts(&self, out: Vec<String>) -> Rc<Vec<String>> {
+        let value = Rc::new(out);
+        self.picker_memos.borrow_mut().contexts = Some(ContextMemo {
+            filter: self.ctx_filter.clone(),
+            ctx_list: self.ctx_list.clone(),
+            value: Rc::clone(&value),
+        });
+        value
     }
 
     /// Contexts type-to-filter like the namespace picker. Existing action keys

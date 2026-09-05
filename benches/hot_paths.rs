@@ -75,10 +75,11 @@ fn cells(c: &mut Criterion) {
 
     let pods: Vec<_> = (0..256).map(bs::pod).collect();
     let pod_spec = columns::build_spec("pods", None, None, false);
+    let now = columns::now_secs();
     g.bench_function("pods_256", |b| {
         b.iter(|| {
             for o in &pods {
-                black_box(pod_spec.cells(o));
+                black_box(pod_spec.cells(o, now));
             }
         });
     });
@@ -89,7 +90,7 @@ fn cells(c: &mut Criterion) {
     g.bench_function("helm_16", |b| {
         b.iter(|| {
             for o in &helm {
-                black_box(helm_spec.cells(o));
+                black_box(helm_spec.cells(o, now));
             }
         });
     });
@@ -286,6 +287,27 @@ fn helm_decode(c: &mut Criterion) {
             black_box(v)
         });
     });
+    // The double base64 decode Helm's payload needs, SIMD against scalar.
+    {
+        let wire = secret
+            .data
+            .pointer("/data/release")
+            .and_then(serde_json::Value::as_str)
+            .expect("fixture payload")
+            .to_string();
+        let scalar = base64::engine::general_purpose::STANDARD;
+        let simd = base64::engine::Simd::standard(Default::default());
+        fn twice<E: base64::Engine>(e: &E, wire: &str) -> Vec<u8> {
+            let inner = e.decode(wire).expect("outer base64");
+            e.decode(inner).expect("inner base64")
+        }
+        g.bench_function("base64_scalar", |b| {
+            b.iter(|| black_box(twice(&scalar, black_box(&wire))));
+        });
+        g.bench_function("base64_simd", |b| {
+            b.iter(|| black_box(twice(&simd, black_box(&wire))));
+        });
+    }
     g.bench_function("parse_typed", |b| {
         b.iter(|| black_box(sofka::helm::parse_release_json(black_box(&json))));
     });
@@ -303,14 +325,47 @@ fn cell_extract(c: &mut Criterion) {
     g.bench_function("borrowed_ip_2000", |b| {
         b.iter(|| {
             for pod in &pods {
-                black_box(spec.cell_at(black_box(pod), 4).unwrap());
+                black_box(
+                    spec.cell_at(black_box(pod), 4, columns::now_secs())
+                        .unwrap(),
+                );
             }
         });
     });
     g.bench_function("owned_ip_baseline_2000", |b| {
         b.iter(|| {
             for pod in &pods {
-                black_box(spec.cell_at(black_box(pod), 4).unwrap().into_owned());
+                black_box(
+                    spec.cell_at(black_box(pod), 4, columns::now_secs())
+                        .unwrap()
+                        .into_owned(),
+                );
+            }
+        });
+    });
+    g.finish();
+}
+
+/// The per-frame clock. `now` measures the shipped path — one reading threaded
+/// through the row — against the previous one, where each elapsed cell read the
+/// clock for itself.
+fn frame_clock(c: &mut Criterion) {
+    let mut g = c.benchmark_group("frame_clock");
+    let pods: Vec<_> = (0..2_000).map(bs::pod).collect();
+    let spec = columns::build_spec("pods", None, None, false);
+
+    g.bench_function("one_reading_per_frame_2000", |b| {
+        b.iter(|| {
+            let now = columns::now_secs();
+            for pod in &pods {
+                black_box(spec.volatile(pod, "pods", 0, now));
+            }
+        });
+    });
+    g.bench_function("one_reading_per_cell_2000", |b| {
+        b.iter(|| {
+            for pod in &pods {
+                black_box(spec.volatile(pod, "pods", 0, columns::now_secs()));
             }
         });
     });
@@ -339,6 +394,208 @@ fn provider_selection(c: &mut Criterion) {
     g.finish();
 }
 
+/// The extract-then-render path the borrowed one replaced: an owned `Value`
+/// for the whole subtree, then the same formatting. The shipped `render_cell`
+/// produces exactly this text without the clone.
+fn render_owned(obj: &kube::core::DynamicObject, pointer: &str) -> String {
+    use serde_json::Value;
+    let Some(v) = sofka::views::extract(obj, pointer) else {
+        return "<none>".into();
+    };
+    match v {
+        Value::Null => "<none>".into(),
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        ref other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// Custom-column extraction: the shipped borrowed result against the owned
+/// `Value` it replaced, over the shapes a printer column actually points at.
+fn custom_columns(c: &mut Criterion) {
+    let mut g = c.benchmark_group("custom_columns");
+    let pods: Vec<_> = (0..2_000).map(bs::pod).collect();
+    let col = |pointer: &str| sofka::views::UserColumn {
+        header: "COL".into(),
+        pointer: pointer.into(),
+        kind: sofka::views::ColumnKind::Text,
+        wide: false,
+        width: None,
+        align: None,
+        condition_field: None,
+    };
+    let now = columns::now_secs();
+
+    for (name, pointer) in [
+        ("scalar", "/status/phase"),
+        ("label", "/metadata/labels/app.kubernetes.io~1name"),
+        ("array", "/spec/containers"),
+        ("nested", "/spec/containers/0/resources"),
+    ] {
+        let column = col(pointer);
+        g.bench_with_input(BenchmarkId::new("render_2000", name), &column, |b, col| {
+            b.iter(|| {
+                for pod in &pods {
+                    black_box(sofka::views::render_cell(pod, col, now));
+                }
+            });
+        });
+        g.bench_with_input(
+            BenchmarkId::new("owned_baseline_2000", name),
+            &column,
+            |b, col| {
+                b.iter(|| {
+                    for pod in &pods {
+                        black_box(render_owned(pod, &col.pointer));
+                    }
+                });
+            },
+        );
+    }
+    g.finish();
+}
+
+/// Provider log records: the shipped selective visitor against the
+/// `serde_json::Value` DOM it replaced, over records carrying the extra fields
+/// an ingestion pipeline attaches.
+fn provider_records(c: &mut Criterion) {
+    let mut g = c.benchmark_group("provider_records");
+
+    for extra in [0usize, 12] {
+        let fields: String = (0..extra)
+            .map(|i| format!(r#","field_{i}":"value {i}""#))
+            .collect();
+        let lines: Vec<String> = (0..10_000)
+            .map(|i| {
+                format!(
+                    r#"{{"_time":"2026-09-05T12:00:00Z","_msg":"request {i} served","kubernetes.pod_name":"api-{i}","kubernetes.container_name":"app"{fields}}}"#
+                )
+            })
+            .collect();
+
+        g.bench_with_input(
+            BenchmarkId::new("visitor_10000", extra),
+            &lines,
+            |b, lines| {
+                b.iter(|| {
+                    for l in lines {
+                        black_box(sofka::providers::bench_parse_entry(l));
+                    }
+                });
+            },
+        );
+        g.bench_with_input(
+            BenchmarkId::new("dom_baseline_10000", extra),
+            &lines,
+            |b, lines| {
+                b.iter(|| {
+                    for l in lines {
+                        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                        black_box((
+                            v.get("_msg").and_then(|v| v.as_str()).map(str::to_string),
+                            v.get("_time").and_then(|v| v.as_str()).map(str::to_string),
+                            v.get("kubernetes.pod_name")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
+                            v.get("kubernetes.container_name")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
+                        ));
+                    }
+                });
+            },
+        );
+    }
+    g.finish();
+}
+
+/// The fuzzy matcher, over the two shapes it runs in: one needle against every
+/// row of a store, and the highlight positions the renderer asks for.
+fn fuzzy(c: &mut Criterion) {
+    let mut g = c.benchmark_group("fuzzy");
+    let names: Vec<String> = (0..20_000)
+        .map(|i| format!("kube-httpcache-{i:05}"))
+        .collect();
+    let f = sofka::fuzzy::Fuzzy::new();
+
+    g.bench_function("score_20000", |b| {
+        b.iter(|| {
+            for n in &names {
+                black_box(f.score(n, "khc"));
+            }
+        });
+    });
+    g.bench_function("indices_visible_50", |b| {
+        b.iter(|| {
+            for n in names.iter().take(50) {
+                black_box(f.indices(n, "khc"));
+            }
+        });
+    });
+    g.finish();
+}
+
+/// The memoized per-frame models: headers and the picker lists. Each pair is
+/// the memo against the rebuild it replaced.
+fn frame_models(c: &mut Criterion) {
+    let mut g = c.benchmark_group("frame_models");
+    let (app, _rx) = bs::pods_app(2_000);
+
+    g.bench_function("display_headers", |b| {
+        b.iter(|| black_box(app.display_headers()));
+    });
+
+    let (ctx_app, _ctx_rx) = bs::contexts_app(2_000);
+    g.bench_function("filtered_contexts_2000", |b| {
+        b.iter(|| black_box(ctx_app.filtered_contexts()));
+    });
+    g.bench_function("filtered_sort_entries", |b| {
+        b.iter(|| black_box(app.filtered_sort_entries()));
+    });
+    g.finish();
+}
+
+/// The dependency swaps whose baseline is in `std`, each against the
+/// implementation it replaced. The fuzzy matcher is measured in `fuzzy` above;
+/// its predecessor is not carried as a dependency just to benchmark it.
+fn dependencies(c: &mut Criterion) {
+    let mut g = c.benchmark_group("dependencies");
+
+    // --- hasher: foldhash against SipHash, over real row keys ---------------
+    // The shape that matters is a filter keystroke, which looks up every key
+    // in the store once. Keys are `namespace/name`, as the store holds them.
+    for n in [2_000usize, 20_000] {
+        let keys: Vec<std::rc::Rc<str>> = (0..n)
+            .map(|i| std::rc::Rc::from(format!("namespace-{}/pod-{i:05}", i % 40).as_str()))
+            .collect();
+
+        let mut fold: sofka::store::FastMap<std::rc::Rc<str>, u32> = Default::default();
+        let mut sip: std::collections::HashMap<std::rc::Rc<str>, u32> = Default::default();
+        for (i, k) in keys.iter().enumerate() {
+            fold.insert(k.clone(), i as u32);
+            sip.insert(k.clone(), i as u32);
+        }
+
+        g.bench_with_input(BenchmarkId::new("lookup_foldhash", n), &n, |b, _| {
+            b.iter(|| {
+                for k in &keys {
+                    black_box(fold.get(k.as_ref()));
+                }
+            });
+        });
+        g.bench_with_input(BenchmarkId::new("lookup_siphash", n), &n, |b, _| {
+            b.iter(|| {
+                for k in &keys {
+                    black_box(sip.get(k.as_ref()));
+                }
+            });
+        });
+    }
+
+    g.finish();
+}
+
 criterion_group!(
     benches,
     rows_cache,
@@ -353,6 +610,12 @@ criterion_group!(
     log_wrap,
     log_viewport,
     cell_extract,
-    provider_selection
+    provider_selection,
+    frame_clock,
+    custom_columns,
+    provider_records,
+    fuzzy,
+    frame_models,
+    dependencies
 );
 criterion_main!(benches);

@@ -541,7 +541,7 @@ fn header_hints(app: &App) -> Vec<Line<'static>> {
 fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let show_ns = app.show_namespace_column();
     let metrics_cols = app.metrics_columns();
-    let headers: Vec<String> = app.display_headers();
+    let headers = app.display_headers();
     let pods_view = app.kind_plural == "pods";
     let sort_col = app.sort_column;
     let sort_arrow = if app.sort_desc { " ↓" } else { " ↑" };
@@ -639,6 +639,10 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let cell_cache = app.table_cell_cache();
     let spec = app.view_spec();
     let thresholds = app.resolved_thresholds();
+    // One clock reading for the whole frame. Every visible AGE/DURATION cell
+    // used to call `Timestamp::now()` for itself, so a full table took one
+    // reading per volatile cell and could show two rows a second apart.
+    let now = crate::columns::now_secs();
 
     // Widest visible value per display column (headers count too, plus the
     // sort arrow on the active sort column). Drives the content-aware widths
@@ -669,10 +673,10 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                 style_idx = status_idx.map(|i| i + 1);
             }
             for (i, cell) in base_cells.iter().enumerate() {
-                if let Some(value) = spec.volatile(obj, &app.kind_plural, i) {
+                if let Some(value) = spec.volatile(obj, &app.kind_plural, i, now) {
                     cells.push(TableCellText::Owned(value));
                 } else {
-                    cells.push(TableCellText::Borrowed(cell));
+                    cells.push(TableCellText::Borrowed(cell.as_str()));
                 }
             }
             if app.node_capacity_columns() {
@@ -1071,7 +1075,7 @@ fn render_name_cell(app: &App, name: &str, base: Color) -> Cell<'static> {
     let Some(matched) = app.filter_match_indices(name).filter(|idx| !idx.is_empty()) else {
         return Cell::from(name.to_string()).style(Style::default().fg(base));
     };
-    let matched: std::collections::HashSet<usize> = matched.into_iter().collect();
+    let matched: std::collections::HashSet<usize> = matched.iter().copied().collect();
     let plain = Style::default().fg(base);
     let hl = Style::default()
         .fg(theme::yellow())

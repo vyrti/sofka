@@ -1041,7 +1041,7 @@ async fn namespace_filter_selects_best_match_not_all() {
     }
     // "kube-system" is the only real match — it should be under the
     // cursor, not the pinned "<all>" at index 0.
-    let filtered = app.filtered_namespaces();
+    let filtered = app.filtered_namespaces().to_vec();
     let selected = app.ns_state.selected().and_then(|i| filtered.get(i));
     assert_eq!(selected.map(String::as_str), Some("kube-system"));
 
@@ -1688,6 +1688,7 @@ async fn mouse_click_selects_row_header_click_sorts_wheel_moves() {
     // Click the RESTARTS header → sort by it; again → flip direction.
     let ridx = app
         .display_headers()
+        .to_vec()
         .iter()
         .position(|h| h == "RESTARTS")
         .unwrap();
@@ -1736,7 +1737,7 @@ async fn horizontal_column_scroll_anchors_name_and_clamps() {
     );
     app.table_state.select(Some(0));
 
-    let headers = app.display_headers();
+    let headers = app.display_headers().to_vec();
     assert_eq!(headers[0], "NAME");
     let scrollable = headers.len() - 1;
 
@@ -4940,7 +4941,7 @@ async fn sort_by_numeric_column_and_invert() {
 
     // RESTARTS is the 4th pod column; sort by it numerically (not "1,5,9"
     // as strings, which happens to agree here, but parsing is what matters).
-    assert_eq!(app.display_headers()[3], "RESTARTS");
+    assert_eq!(app.display_headers().to_vec()[3], "RESTARTS");
     app.sort_column = Some(3);
     app.invalidate_rows();
     let names: Vec<String> = app
@@ -5039,7 +5040,7 @@ async fn sorted_order_updates_when_an_object_changes() {
     apply(&mut app, pod("a", "1", 5));
     apply(&mut app, pod("b", "1", 1));
     apply(&mut app, pod("c", "1", 9));
-    assert_eq!(app.display_headers()[3], "RESTARTS");
+    assert_eq!(app.display_headers().to_vec()[3], "RESTARTS");
     app.sort_column = Some(3);
     app.invalidate_rows();
     let names = |app: &App| -> Vec<String> {
@@ -5054,7 +5055,7 @@ async fn sorted_order_updates_when_an_object_changes() {
     assert_eq!(names(&app), ["a", "c", "b"]); // 5, 9, 20
 
     // Changing the sort column must not reuse keys computed for the old one.
-    assert_eq!(app.display_headers()[0], "NAME");
+    assert_eq!(app.display_headers().to_vec()[0], "NAME");
     app.sort_column = Some(0);
     app.invalidate_rows();
     assert_eq!(names(&app), ["a", "b", "c"]);
@@ -5068,7 +5069,7 @@ async fn sort_picker_picks_toggles_and_clears() {
     // `S` opens the picker: default entry pinned first and selected (no sort).
     app.handle_key(press(KeyCode::Char('S'))).unwrap();
     assert_eq!(app.mode, Mode::SortPicker);
-    assert_eq!(app.filtered_sort_entries()[0], DEFAULT_SORT_LABEL);
+    assert_eq!(app.filtered_sort_entries().to_vec()[0], DEFAULT_SORT_LABEL);
     assert_eq!(app.sort_picker_state.selected(), Some(0));
 
     // Type-to-filter fuzzy-matches columns; the cursor lands on the best
@@ -5076,11 +5077,15 @@ async fn sort_picker_picks_toggles_and_clears() {
     for c in "rst".chars() {
         app.handle_key(press(KeyCode::Char(c))).unwrap();
     }
-    assert_eq!(app.filtered_sort_entries()[1], "RESTARTS");
+    assert_eq!(app.filtered_sort_entries().to_vec()[1], "RESTARTS");
     assert_eq!(app.sort_picker_state.selected(), Some(1));
     app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.mode, Mode::Table);
-    let restarts = app.display_headers().iter().position(|h| h == "RESTARTS");
+    let restarts = app
+        .display_headers()
+        .to_vec()
+        .iter()
+        .position(|h| h == "RESTARTS");
     assert!(restarts.is_some());
     assert_eq!(app.sort_column, restarts);
     assert!(!app.sort_desc);
@@ -5120,7 +5125,11 @@ async fn sort_choice_is_remembered_per_kind_across_view_switches() {
     }
     app.handle_key(press(KeyCode::Enter)).unwrap();
     app.handle_key(press(KeyCode::Char('I'))).unwrap();
-    let restarts = app.display_headers().iter().position(|h| h == "RESTARTS");
+    let restarts = app
+        .display_headers()
+        .to_vec()
+        .iter()
+        .position(|h| h == "RESTARTS");
     assert_eq!(app.sort_column, restarts);
     assert!(app.sort_desc);
     assert_eq!(app.sort_memory.get("pods"), Some(("RESTARTS".into(), true)));
@@ -5134,7 +5143,10 @@ async fn sort_choice_is_remembered_per_kind_across_view_switches() {
     app.switch_kind("pods");
     assert_eq!(
         app.sort_column,
-        app.display_headers().iter().position(|h| h == "RESTARTS")
+        app.display_headers()
+            .to_vec()
+            .iter()
+            .position(|h| h == "RESTARTS")
     );
     assert!(app.sort_desc);
 
@@ -5142,6 +5154,7 @@ async fn sort_choice_is_remembered_per_kind_across_view_switches() {
     app.switch_kind("deployments");
     let ready = app
         .display_headers()
+        .to_vec()
         .iter()
         .position(|h| h == "READY")
         .unwrap();
@@ -5215,7 +5228,7 @@ async fn copy_picker_lists_full_row_fields_and_filters_on_values() {
     for c in "96.13".chars() {
         app.handle_key(press(KeyCode::Char(c))).unwrap();
     }
-    let entries = app.filtered_copy_entries();
+    let entries = app.filtered_copy_entries().to_vec();
     assert_eq!(entries[0], ("CLUSTER-IP".into(), "10.96.13.5".into()));
     assert_eq!(app.copy_picker_state.selected(), Some(0));
 
@@ -5251,6 +5264,7 @@ async fn metrics_update_invalidates_metric_sorted_rows() {
 
     let cpu_idx = app
         .display_headers()
+        .to_vec()
         .iter()
         .position(|h| *h == "CPU")
         .unwrap();
@@ -5285,7 +5299,7 @@ async fn node_capacity_percent_columns_render_and_sort() {
     let (mut app, _rx) = test_app();
     // Pods must not grow the node columns.
     app.switch_kind("pods");
-    assert!(!app.display_headers().contains(&"%CPU".to_string()));
+    assert!(!app.display_headers().to_vec().contains(&"%CPU".to_string()));
 
     app.switch_kind("nodes");
     let node = |name: &str, cpu: &str| {
@@ -5296,7 +5310,7 @@ async fn node_capacity_percent_columns_render_and_sort() {
     apply(&mut app, node("big", "4"));
     apply(&mut app, node("small", "2"));
 
-    let headers = app.display_headers();
+    let headers = app.display_headers().to_vec();
     assert!(headers.contains(&"%CPU".to_string()), "{headers:?}");
     assert!(headers.contains(&"%MEM".to_string()), "{headers:?}");
 
@@ -5312,6 +5326,7 @@ async fn node_capacity_percent_columns_render_and_sort() {
     });
     let pct_idx = app
         .display_headers()
+        .to_vec()
         .iter()
         .position(|h| *h == "%CPU")
         .unwrap();
@@ -5331,10 +5346,10 @@ async fn nodes_view_pods_column_counts_and_sorts() {
     let (mut app, _rx) = test_app();
     // Pods must not grow a PODS column.
     app.switch_kind("pods");
-    assert!(!app.display_headers().contains(&"PODS".to_string()));
+    assert!(!app.display_headers().to_vec().contains(&"PODS".to_string()));
 
     app.switch_kind("nodes");
-    let headers = app.display_headers();
+    let headers = app.display_headers().to_vec();
     let pods_idx = headers.iter().position(|h| *h == "PODS").unwrap();
     // PODS sits right before the CPU/MEM usage columns, k9s-style.
     assert_eq!(headers[pods_idx + 1], "CPU", "{headers:?}");
@@ -5393,6 +5408,7 @@ async fn node_pods_update_invalidates_pods_sorted_rows() {
     }
     let pods_idx = app
         .display_headers()
+        .to_vec()
         .iter()
         .position(|h| *h == "PODS")
         .unwrap();
@@ -5743,12 +5759,12 @@ async fn namespace_switcher_pins_all_and_fuzzy_filters() {
         "prod".into(),
     ];
     // No filter: <all> first, then the rest.
-    assert_eq!(app.filtered_namespaces()[0], "<all>");
-    assert_eq!(app.filtered_namespaces().len(), 4);
+    assert_eq!(app.filtered_namespaces().to_vec()[0], "<all>");
+    assert_eq!(app.filtered_namespaces().to_vec().len(), 4);
 
     // Fuzzy filter (subsequence) keeps <all> pinned on top.
     app.ns_filter = "sys".into();
-    let f = app.filtered_namespaces();
+    let f = app.filtered_namespaces().to_vec();
     assert_eq!(f[0], "<all>");
     assert!(f.contains(&"kube-system".to_string()));
     assert!(!f.contains(&"default".to_string()));
@@ -6118,22 +6134,86 @@ async fn context_picker_typing_filters_and_backspace_widens() {
     app.handle_key(press(KeyCode::Char('p'))).unwrap();
     assert!(app.ctx_filtering);
     assert_eq!(app.ctx_filter, "p");
-    assert_eq!(app.filtered_contexts(), vec!["prod".to_string()]);
+    assert_eq!(app.filtered_contexts().to_vec(), vec!["prod".to_string()]);
     assert_eq!(app.ctx_state.selected(), Some(0));
 
     app.handle_key(press(KeyCode::Backspace)).unwrap();
     assert!(app.ctx_filter.is_empty());
     assert_eq!(
-        app.filtered_contexts(),
+        app.filtered_contexts().to_vec(),
         vec!["dev".to_string(), "prod".to_string(), "test".to_string()]
     );
     assert_eq!(app.ctx_state.selected(), Some(0));
 
     app.handle_key(press(KeyCode::Char('z'))).unwrap();
-    assert!(app.filtered_contexts().is_empty());
+    assert!(app.filtered_contexts().to_vec().is_empty());
     assert_eq!(app.ctx_state.selected(), None);
     app.handle_key(press(KeyCode::Backspace)).unwrap();
     assert_eq!(app.ctx_state.selected(), Some(0));
+}
+
+/// The namespace list is memoized against its inputs, so each of them has to
+/// move it: the type-to-filter buffer, the list itself arriving from the API,
+/// and the configured favourites.
+#[tokio::test]
+async fn namespace_switcher_follows_its_inputs() {
+    let (mut app, _rx) = test_app();
+    app.handle_msg(Msg::Namespaces {
+        generation: app.generation,
+        list: vec!["dev".into(), "prod".into(), "test".into()],
+    });
+
+    let browsing = app.filtered_namespaces().to_vec();
+    assert_eq!(browsing, ["<all>", "dev", "prod", "test"]);
+    // A second read comes from the memo and must not differ.
+    assert_eq!(app.filtered_namespaces().to_vec(), browsing);
+
+    // Typing narrows it.
+    app.ns_filter = "pr".into();
+    assert_eq!(app.filtered_namespaces().to_vec(), ["<all>", "prod"]);
+    // Clearing restores it.
+    app.ns_filter.clear();
+    assert_eq!(app.filtered_namespaces().to_vec(), browsing);
+
+    // A later list from the API replaces it, with no filter keystroke to
+    // prompt a rebuild.
+    app.handle_msg(Msg::Namespaces {
+        generation: app.generation,
+        list: vec!["dev".into(), "staging".into()],
+    });
+    assert_eq!(
+        app.filtered_namespaces().to_vec(),
+        ["<all>", "dev", "staging"]
+    );
+
+    // Favourites re-order it without touching the list.
+    app.namespace_favorites = vec!["staging".into()];
+    assert_eq!(
+        app.filtered_namespaces().to_vec(),
+        ["<all>", "staging", "dev"]
+    );
+}
+
+/// The sort picker is memoized against the header list, so a view change has
+/// to move it even though the filter buffer never changed.
+#[tokio::test]
+async fn sort_picker_entries_follow_the_headers() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let pods = app.filtered_sort_entries().to_vec();
+    assert_eq!(app.filtered_sort_entries().to_vec(), pods);
+    assert!(pods.len() > 1);
+
+    app.wide = true;
+    app.refresh_view_spec();
+    let wide = app.filtered_sort_entries().to_vec();
+    assert_ne!(wide, pods, "a wider header list means more sort entries");
+
+    // And the filter still narrows whatever the current headers are.
+    app.sort_picker_filter = "age".into();
+    let filtered = app.filtered_sort_entries().to_vec();
+    assert!(filtered.len() < wide.len());
+    assert!(filtered.iter().any(|e| e == "AGE"), "{filtered:?}");
 }
 
 #[tokio::test]
@@ -6147,7 +6227,7 @@ async fn context_picker_enter_switches_to_filtered_selection() {
 
     app.handle_key(press(KeyCode::Char('p'))).unwrap();
     assert_eq!(
-        app.filtered_contexts(),
+        app.filtered_contexts().to_vec(),
         vec!["prod-east".to_string(), "prod-west".to_string()]
     );
     app.handle_key(press(KeyCode::Down)).unwrap();
@@ -6673,7 +6753,7 @@ async fn helm_list_shows_only_latest_revision_per_release() {
         .expect("myapp row present");
     assert_eq!(crate::helm::revision(myapp_row), Some(2));
 
-    let (cells, _) = crate::columns::cells(myapp_row, "helm");
+    let (cells, _) = crate::columns::cells(myapp_row, "helm", crate::columns::now_secs());
     assert_eq!(
         cells[0], "myapp",
         "NAME cell shows the release, not the secret"
@@ -6902,7 +6982,7 @@ async fn helm_sorts_updated_and_revision_by_value_not_text() {
     apply(&mut app, rel("alpha", 4, "2024-03-01T00:00:00Z"));
     apply(&mut app, rel("beta", 61, "2024-01-01T00:00:00Z"));
     apply(&mut app, rel("gamma", 11951, "2024-02-01T00:00:00Z"));
-    let headers = app.display_headers();
+    let headers = app.display_headers().to_vec();
 
     // UPDATED sorts by the deploy timestamp (ascending = most recent first,
     // like AGE), never the humanized "5d23h" cell text.
@@ -7498,7 +7578,7 @@ async fn namespace_switcher_pins_favorites_then_recents() {
 
     // Browsing: <all>, favourite, recents (newest first), then the rest.
     assert_eq!(
-        app.filtered_namespaces(),
+        app.filtered_namespaces().to_vec(),
         vec!["<all>", "monitoring", "alpha", "checkout", "beta"]
     );
     assert!(app.is_favorite_namespace("monitoring"));
@@ -7506,7 +7586,7 @@ async fn namespace_switcher_pins_favorites_then_recents() {
 
     // A filter falls back to pure fuzzy ranking (no pinning).
     app.ns_filter = "beta".into();
-    assert_eq!(app.filtered_namespaces(), vec!["<all>", "beta"]);
+    assert_eq!(app.filtered_namespaces().to_vec(), vec!["<all>", "beta"]);
 }
 
 #[tokio::test]
@@ -8082,7 +8162,10 @@ async fn user_view_overlays_columns_and_applies_initial_sort() {
     app.switch_kind("certificates");
 
     // Overlay: custom columns slot in before the trailing AGE.
-    assert_eq!(app.display_headers(), ["NAME", "READY", "EXPIRES", "AGE"]);
+    assert_eq!(
+        app.display_headers().to_vec(),
+        ["NAME", "READY", "EXPIRES", "AGE"]
+    );
     // The configured initial sort is active (EXPIRES, descending).
     assert_eq!(app.sort_column, Some(2));
     assert!(app.sort_desc);
@@ -8139,7 +8222,7 @@ async fn user_view_adds_provider_label_columns_to_curated_nodes() {
     app.switch_kind("nodes");
 
     assert_eq!(
-        app.display_headers(),
+        app.display_headers().to_vec(),
         [
             "NAME", "STATUS", "ROLES", "TAINTS", "VERSION", "NODEPOOL", "ZONE", "INSTANCE", "TYPE",
             "AGE", "PODS", "CPU", "MEM", "%CPU", "%MEM"
@@ -8195,7 +8278,7 @@ async fn user_view_replace_swaps_out_curated_columns() {
         "#,
     );
     app.switch_kind("certificates");
-    assert_eq!(app.display_headers(), ["NAME", "CPU"]);
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "CPU"]);
 
     // Quantities sort by value: 500m < 2 despite "2" < "500m" lexically.
     apply(&mut app, certificate("big", "True", "", "2"));
@@ -8211,7 +8294,7 @@ async fn user_view_replace_swaps_out_curated_columns() {
 async fn printer_columns_msg_upgrades_name_age_fallback() {
     let (mut app, _rx) = test_app();
     app.switch_kind("certificates");
-    assert_eq!(app.display_headers(), ["NAME", "AGE"]);
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "AGE"]);
 
     let crd = json!({
         "spec": {
@@ -8232,9 +8315,12 @@ async fn printer_columns_msg_upgrades_name_age_fallback() {
         view: Box::new(view),
     });
     // Narrow mode hides the priority>0 column; wide shows it.
-    assert_eq!(app.display_headers(), ["NAME", "READY", "AGE"]);
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "READY", "AGE"]);
     app.handle_key(press(KeyCode::Char('w'))).unwrap();
-    assert_eq!(app.display_headers(), ["NAME", "READY", "DETAIL", "AGE"]);
+    assert_eq!(
+        app.display_headers().to_vec(),
+        ["NAME", "READY", "DETAIL", "AGE"]
+    );
 
     // A stale-generation message must be dropped.
     app.switch_kind("pods");
@@ -8274,7 +8360,7 @@ async fn user_view_wins_over_printer_columns() {
             ..Default::default()
         })),
     });
-    assert_eq!(app.display_headers(), ["NAME", "MINE", "AGE"]);
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "MINE", "AGE"]);
 }
 
 #[tokio::test]
@@ -8282,7 +8368,7 @@ async fn wide_toggle_reveals_pod_columns_and_keeps_sort() {
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
     assert_eq!(
-        app.display_headers(),
+        app.display_headers().to_vec(),
         ["NAME", "READY", "STATUS", "RESTARTS", "AGE", "CPU", "MEM"]
     );
 
@@ -8290,7 +8376,7 @@ async fn wide_toggle_reveals_pod_columns_and_keeps_sort() {
     app.sort_column = Some(4);
     app.handle_key(press(KeyCode::Char('w'))).unwrap();
     assert_eq!(
-        app.display_headers(),
+        app.display_headers().to_vec(),
         [
             "NAME", "READY", "STATUS", "RESTARTS", "IP", "NODE", "AGE", "CPU", "MEM"
         ]
@@ -8513,7 +8599,59 @@ async fn crd_drill_seeds_printer_columns_from_the_crd() {
     }));
     app.drill_into_crd(&crd);
     assert_eq!(app.kind_plural, "widgets");
-    assert_eq!(app.display_headers(), ["NAMESPACE", "NAME", "PHASE", "AGE"]);
+    assert_eq!(
+        app.display_headers().to_vec(),
+        ["NAMESPACE", "NAME", "PHASE", "AGE"]
+    );
+}
+
+/// The header list is memoized, so both of the things it derives from have to
+/// invalidate it: the view spec, and the toggles that add columns around it.
+#[tokio::test]
+async fn header_list_follows_the_spec_and_the_column_toggles() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let crd = obj(json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": "widgets.example.com"},
+        "spec": {
+            "group": "example.com",
+            "names": {"plural": "widgets", "kind": "Widget"},
+            "scope": "Namespaced",
+            "versions": [{
+                "name": "v1", "served": true, "storage": true,
+                "additionalPrinterColumns": [
+                    {"name": "Phase", "type": "string", "jsonPath": ".status.phase"}
+                ]
+            }]
+        }
+    }));
+    app.drill_into_crd(&crd);
+
+    let all_ns = app.display_headers().to_vec();
+    assert_eq!(all_ns, ["NAMESPACE", "NAME", "PHASE", "AGE"]);
+    // A second read comes from the memo and must not differ.
+    assert_eq!(app.display_headers().to_vec(), all_ns);
+
+    // A column toggle with no spec rebuild: scoping to one namespace drops
+    // the NAMESPACE column, and the memo has to notice.
+    app.namespace = "default".into();
+    assert_eq!(app.display_headers().to_vec(), ["NAME", "PHASE", "AGE"]);
+
+    // …and back, so the memo is not one-way.
+    app.namespace.clear();
+    assert_eq!(app.display_headers().to_vec(), all_ns);
+
+    // A spec rebuild with no toggle change: wide mode widens the list.
+    app.wide = true;
+    app.refresh_view_spec();
+    let wide = app.display_headers().to_vec();
+    assert_eq!(app.display_headers().to_vec(), wide);
+
+    app.wide = false;
+    app.refresh_view_spec();
+    assert_eq!(app.display_headers().to_vec(), all_ns);
 }
 
 #[tokio::test]
@@ -8858,6 +8996,65 @@ async fn malformed_filter_enter_warns_and_stays_local() {
     assert_eq!(app.generation, before, "broken selector must not rewatch");
     assert!(!app.filter_server_side());
     assert!(app.filter_error().is_some());
+}
+
+/// Replace the filter through the same keys a user would press: `/` reopens
+/// the prompt with the current text, so the old text is backspaced away.
+fn retype_filter(app: &mut App, text: &str) {
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for _ in 0..app.filter.chars().count() {
+        app.handle_key(press(KeyCode::Backspace)).unwrap();
+    }
+    for c in text.chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+}
+
+/// Highlight positions are memoized per needle, so retyping the filter has to
+/// invalidate them — a stale entry would underline the wrong characters.
+#[tokio::test]
+async fn retyping_the_filter_recomputes_the_highlights() {
+    let (mut app, _rx) = test_app();
+
+    retype_filter(&mut app, "khc");
+    let first = app.filter_match_indices("kube-httpcache-0").unwrap();
+    assert_eq!(first.len(), 3);
+    // Asking again reads the memo and must answer identically.
+    assert_eq!(
+        app.filter_match_indices("kube-httpcache-0").unwrap(),
+        first,
+        "a second lookup must not change the answer"
+    );
+
+    // A different needle over the same name: different positions.
+    retype_filter(&mut app, "cache");
+    let second = app.filter_match_indices("kube-httpcache-0").unwrap();
+    assert_eq!(second.len(), 5);
+    assert_ne!(second, first, "the new needle must not reuse the old memo");
+
+    // A needle that matches nothing is remembered as "no match", not as the
+    // previous needle's positions.
+    retype_filter(&mut app, "zzz");
+    assert_eq!(app.filter_match_indices("kube-httpcache-0"), None);
+    assert_eq!(app.filter_match_indices("kube-httpcache-0"), None);
+
+    // Clearing the filter goes back to no highlighting at all.
+    retype_filter(&mut app, "");
+    assert_eq!(app.filter_match_indices("kube-httpcache-0"), None);
+}
+
+/// Two names under one needle must not share an entry.
+#[tokio::test]
+async fn highlights_are_memoized_per_name_not_per_needle() {
+    let (mut app, _rx) = test_app();
+    retype_filter(&mut app, "ap");
+
+    let a = app.filter_match_indices("api-server").unwrap();
+    let b = app.filter_match_indices("xxapp").unwrap();
+    assert_eq!(app.filter_match_indices("api-server").unwrap(), a);
+    assert_eq!(app.filter_match_indices("xxapp").unwrap(), b);
+    assert_ne!(a, b, "each name keeps its own positions");
 }
 
 #[tokio::test]
@@ -10054,7 +10251,7 @@ async fn filtering_matches_a_naive_fuzzy_pass() {
         });
 
         // Naive expectation: name haystack, else any rendered cell.
-        let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
+        let matcher = crate::fuzzy::Fuzzy::new();
         let spec = crate::columns::build_spec("pods", None, None, false);
         let mut want: Vec<String> = Vec::new();
         for (k, o) in app.store.iter() {
@@ -10063,9 +10260,9 @@ async fn filtering_matches_a_naive_fuzzy_pass() {
                 o.metadata.namespace.as_deref().unwrap_or(""),
                 o.metadata.name.as_deref().unwrap_or("")
             );
-            let hit = matcher.fuzzy_match(&hay, pat).is_some() || {
-                let (cells, _) = spec.cells(o);
-                cells.iter().any(|c| matcher.fuzzy_match(c, pat).is_some())
+            let hit = matcher.score(&hay, pat).is_some() || {
+                let (cells, _) = spec.cells(o, crate::columns::now_secs());
+                cells.iter().any(|c| matcher.score(c, pat).is_some())
             };
             if hit {
                 want.push(k.to_string());
