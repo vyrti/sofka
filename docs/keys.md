@@ -32,6 +32,7 @@ pickers keep both characters available as input.
 | `:can-i` / `:can-i <verb> <resource> [ns]`    | what you can do here / check a single action (`SelfSubjectAccessReview`)                                                                                      |
 | `:journal` / `:audit`                         | session-local log of the mutating actions you've taken                                                                                                        |
 | `:rightsize`                                  | historical right-sizing: P50/P95/P99 usage → suggested requests + patch preview (needs a metrics backend)                                                     |
+| `:popeye`                                     | run Popeye for the active context and namespace; shown only when `popeye` or `kubectl-popeye` is executable on `PATH`                                         |
 | `:ctx` / `:ctx <name>`                        | context switcher popup (type to filter, `r` renames, `space` toggles fleet membership) / switch directly (the name tab-completes)                             |
 | `:helm`                                       | Helm releases (native storage-Secret decode): ⏎ history → values · `y` manifest · `d` notes · `r` rollback                                                    |
 | `:fleet`                                      | cross-context health dashboard (opt-in: `[fleet]` contexts or `space` in `:ctx`; `⏎` switches, `r` refreshes)                                                 |

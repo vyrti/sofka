@@ -542,6 +542,7 @@ enum PaletteAction {
     Skin,
     Helm,
     Notify,
+    Popeye,
     Reload,
     ConfigInfo,
 }
@@ -610,6 +611,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         action: PaletteAction::Notify,
         names: &["notify", "bell"],
+    },
+    PaletteCommand {
+        action: PaletteAction::Popeye,
+        names: &["popeye"],
     },
     PaletteCommand {
         action: PaletteAction::Find,
@@ -1585,6 +1590,15 @@ pub struct App {
     pub forwards_cfg: Vec<crate::config::Forward>,
     /// `[notify]` delivery options (bell, desktop-notification protocol).
     pub notify_cfg: crate::config::NotifyConfig,
+    /// Resolved once at startup and on `:reload`. `None` keeps the optional
+    /// command out of both palette completion and dispatch.
+    pub popeye_path: Option<std::path::PathBuf>,
+    /// At most one scan is live. Aborting this handle drops and kills the
+    /// subprocess because the command is configured with `kill_on_drop`.
+    popeye_task: Option<JoinHandle<()>>,
+    popeye_run: u64,
+    #[cfg(test)]
+    popeye_test_path: Option<std::ffi::OsString>,
     /// Compiled `[keys]` palette-completion bindings.
     pub palette_keys: crate::config::PaletteKeys,
 
@@ -1724,6 +1738,10 @@ pub struct App {
 impl App {
     pub fn new(cluster: Cluster, tx: Sender<Msg>) -> Self {
         let namespace = cluster.default_namespace.clone();
+        #[cfg(not(test))]
+        let popeye_path = crate::popeye::detect();
+        #[cfg(test)]
+        let popeye_path = None;
         Self {
             cluster,
             store: Store::default(),
@@ -1835,6 +1853,11 @@ impl App {
             port_forwards: Vec::new(),
             forwards_cfg: Vec::new(),
             notify_cfg: crate::config::NotifyConfig::default(),
+            popeye_path,
+            popeye_task: None,
+            popeye_run: 0,
+            #[cfg(test)]
+            popeye_test_path: None,
             palette_keys: crate::config::PaletteKeys::default(),
             pf_state: ListState::default(),
             skin_list: crate::theme::BUILTIN_NAMES
@@ -1954,6 +1977,7 @@ mod navigation;
 mod notify;
 mod overlays;
 mod pickers;
+mod popeye;
 mod rightsize;
 mod rows;
 mod snapshot;

@@ -26,6 +26,7 @@ pub mod k8s;
 pub mod keys;
 pub mod logfilter;
 pub mod nsmem;
+pub mod popeye;
 pub mod providers;
 pub mod rightsize;
 pub mod snapshot;

@@ -1060,6 +1060,93 @@ async fn palette_merges_commands_with_resources() {
 }
 
 #[tokio::test]
+async fn popeye_command_is_visible_only_when_detected() {
+    let (mut app, _rx) = test_app();
+    app.popeye_path = None;
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "popeye".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    assert!(
+        app.cmd_suggestions
+            .iter()
+            .all(|suggestion| suggestion.label != "popeye")
+    );
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(app.popeye_task.is_none());
+
+    app.popeye_path = Some("/test/bin/popeye".into());
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "popeye".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    assert!(
+        app.cmd_suggestions
+            .iter()
+            .any(|suggestion| suggestion.kind == SuggestKind::Command
+                && suggestion.label == "popeye")
+    );
+}
+
+#[cfg(unix)]
+fn write_fake_popeye(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let report = r#"{"popeye":{"report_time":"2026-09-06T12:00:00Z","score":91,"grade":"A","sections":[{"linter":"pods","gvr":"v1/pods","tally":{"ok":1,"info":0,"warning":1,"error":0,"score":80},"issues":{"default/web":[{"level":2,"message":"[POP-107] No probes"}]}}]},"ClusterName":"test-cluster","ContextName":"test"}"#;
+    let script = format!(
+        "#!/bin/sh\ncase \" $* \" in\n  *\" --context test --namespace default \"*) printf '%s\\n' '{report}' ;;\n  *) echo 'wrong scan scope' >&2; exit 9 ;;\nesac\n"
+    );
+    std::fs::write(path, script).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn popeye_command_runs_and_opens_parsed_report() {
+    let dir = std::env::temp_dir().join(format!(
+        "sofka-app-popeye-run-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let executable = dir.join("kubectl-popeye");
+    write_fake_popeye(&executable);
+    let (mut app, mut rx) = test_app();
+    app.popeye_path = Some(executable);
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "popeye".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(app.flash.contains("Popeye: scanning"), "{}", app.flash);
+
+    loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("Popeye result timed out")
+            .expect("message channel closed");
+        let finished = matches!(&msg, Msg::Popeye { .. });
+        app.handle_msg(msg);
+        if finished {
+            break;
+        }
+    }
+    assert_eq!(app.mode, Mode::Detail);
+    assert_eq!(app.detail.title, "popeye — 91% (A)");
+    assert!(
+        app.detail
+            .lines
+            .iter()
+            .any(|line| line.contains("WARNING [POP-107] No probes"))
+    );
+    assert_eq!(app.flash, "Popeye score: 91% (A)");
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn palette_command_dispatch() {
     let (mut app, _rx) = test_app();
     assert!(app.run_palette_command("q")); // alias for quit
@@ -3287,6 +3374,20 @@ async fn every_async_result_is_scoped_to_its_own_operation() {
     assert_eq!(app.flash, "deleting 3 pods…");
     // The results still land, only the status is scoped.
     assert_eq!(app.find_query, "foo");
+
+    app.handle_msg(Msg::Popeye {
+        generation: app.generation,
+        run: app.popeye_run,
+        claim: find,
+        result: Ok(crate::popeye::ReportView {
+            title: "popeye — 100% (A)".into(),
+            lines: vec!["Summary".into()],
+            score: 100,
+            grade: "A".into(),
+        }),
+    });
+    assert_eq!(app.flash, "deleting 3 pods…");
+    assert_eq!(app.detail.title, "popeye — 100% (A)");
 
     app.handle_msg(Msg::TransferDone {
         generation: app.generation,
@@ -8800,6 +8901,43 @@ async fn reload_palette_command_dispatches() {
     let (mut app, _rx) = test_app();
     assert!(app.run_palette_command("reload"));
     assert!(app.flash.contains("config reloaded"), "{}", app.flash);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reload_redetects_a_new_popeye_install_through_key_handling() {
+    let dir = std::env::temp_dir().join(format!(
+        "sofka-app-popeye-reload-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let executable = dir.join("popeye");
+    let (mut app, _rx) = test_app();
+    app.popeye_test_path = Some(dir.as_os_str().to_owned());
+    assert!(app.popeye_path.is_none());
+
+    // The binary appears after Sofka is already running. Dispatch reload
+    // through the same key path a user takes, then verify palette discovery.
+    write_fake_popeye(&executable);
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "reload".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.popeye_path.as_deref(), Some(executable.as_path()));
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "popeye".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    assert!(
+        app.cmd_suggestions
+            .iter()
+            .any(|suggestion| suggestion.label == "popeye")
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test]
