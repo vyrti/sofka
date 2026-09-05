@@ -2135,6 +2135,15 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         bind(":q / ctrl-c", "quit"),
         bind("?", "global help — close to return to the previous screen"),
     ];
+    if app.trivy_path.is_some() {
+        lines.insert(
+            10,
+            bind(
+                ":trivy",
+                "scan the current context and namespace (optional Trivy CLI)",
+            ),
+        );
+    }
     // Config-defined plugins, with their (possibly modified) key chords.
     if !app.plugins.is_empty() {
         lines.push(Line::from(""));

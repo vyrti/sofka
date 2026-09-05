@@ -27,8 +27,9 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   `pulse`, `xray`, `explain`, `timeline`, `gitops`, `can-i`, `journal`, `debug`,
   `debug-clean`, `bundle`, `bundle-save`, `snapshot`, `snapshots`, `diff`,
   `events`, `pf`, `notify`, `find`, `vlogs`, `rightsize`, `fleet`, `skin`,
-  `reload`, `config`, `info`). `:` and `?` open the palette and help from every
-  navigation screen, then close back to the screen where they were opened.
+  `reload`, `config`, `info`, plus `trivy` when the Trivy CLI is installed). `:`
+  and `?` open the palette and help from every navigation screen, then close
+  back to the screen where they were opened.
 - **Filtering** (`/`) with matched-character highlighting: fuzzy text, `!text`
   inverse match, `-l`/`-f` label and field selectors (evaluated server-side on
   ⏎), and typed column comparisons (`status=CrashLoopBackOff`, `cpu>500m`,
@@ -66,6 +67,12 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 
 ## Metrics and health
 
+- **Trivy integration** (`:trivy`) - when `trivy` is executable on `PATH`, scan
+  the active context and current namespace (or all namespaces in all-namespace
+  mode) and show its parsed Kubernetes JSON report in a searchable document
+  view. Availability is checked at startup and rescanned by `:reload`. Scans use
+  one worker, disable the node collector, time out after five minutes, and cap
+  rendered reports with a visible truncation marker.
 - **Live CPU and MEM columns** for pods and nodes from the metrics API, colored
   on unusual values. Nodes also get **%CPU and %MEM of allocatable**
   (`status.allocatable` - the pool the scheduler hands out), colored by the

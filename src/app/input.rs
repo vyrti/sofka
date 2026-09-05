@@ -667,6 +667,7 @@ impl App {
             PaletteAction::Skin => self.open_skins(),
             PaletteAction::Helm => self.open_helm_releases(),
             PaletteAction::Notify => self.toggle_notify(),
+            PaletteAction::Trivy => self.open_trivy(),
             PaletteAction::Reload => self.reload_config(),
             PaletteAction::ConfigInfo => self.open_config_info(),
         }
@@ -736,7 +737,7 @@ impl App {
         }
         let action = PALETTE_COMMANDS
             .iter()
-            .find(|c| c.names.contains(&cmd))
+            .find(|c| c.names.contains(&cmd) && self.palette_action_available(c.action))
             .map(|c| c.action);
         match action {
             Some(a) => {
@@ -780,6 +781,9 @@ impl App {
         // Skipped for an empty query so they don't pre-empt the resource list.
         if !q.is_empty() {
             for c in PALETTE_COMMANDS {
+                if !self.palette_action_available(c.action) {
+                    continue;
+                }
                 let best = c
                     .names
                     .iter()
@@ -891,6 +895,10 @@ impl App {
         rank_completions(&mut scored, |s| s.label.as_str(), !q.is_empty());
         self.cmd_suggestions = scored.into_iter().take(100).map(|(_, s)| s).collect();
         self.cmd_sel = 0;
+    }
+
+    fn palette_action_available(&self, action: PaletteAction) -> bool {
+        !matches!(action, PaletteAction::Trivy) || self.trivy_path.is_some()
     }
 
     /// Palette completions for `:<kind> <ns>`: cached namespaces fuzzy-matched

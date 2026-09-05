@@ -542,6 +542,7 @@ enum PaletteAction {
     Skin,
     Helm,
     Notify,
+    Trivy,
     Reload,
     ConfigInfo,
 }
@@ -610,6 +611,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         action: PaletteAction::Notify,
         names: &["notify", "bell"],
+    },
+    PaletteCommand {
+        action: PaletteAction::Trivy,
+        names: &["trivy"],
     },
     PaletteCommand {
         action: PaletteAction::Find,
@@ -1585,6 +1590,17 @@ pub struct App {
     pub forwards_cfg: Vec<crate::config::Forward>,
     /// `[notify]` delivery options (bell, desktop-notification protocol).
     pub notify_cfg: crate::config::NotifyConfig,
+    /// Resolved once at startup and on `:reload`. `None` keeps the optional
+    /// command out of both palette completion and dispatch.
+    pub trivy_path: Option<std::path::PathBuf>,
+    /// At most one scan is live. Aborting this handle drops and kills the
+    /// subprocess because the command is configured with `kill_on_drop`.
+    trivy_task: Option<JoinHandle<()>>,
+    trivy_run: u64,
+    #[cfg(test)]
+    trivy_test_path: Option<std::ffi::OsString>,
+    #[cfg(test)]
+    trivy_test_timeout: Option<Duration>,
     /// Compiled `[keys]` palette-completion bindings.
     pub palette_keys: crate::config::PaletteKeys,
 
@@ -1724,6 +1740,10 @@ pub struct App {
 impl App {
     pub fn new(cluster: Cluster, tx: Sender<Msg>) -> Self {
         let namespace = cluster.default_namespace.clone();
+        #[cfg(not(test))]
+        let trivy_path = crate::trivy::detect();
+        #[cfg(test)]
+        let trivy_path = None;
         Self {
             cluster,
             store: Store::default(),
@@ -1835,6 +1855,13 @@ impl App {
             port_forwards: Vec::new(),
             forwards_cfg: Vec::new(),
             notify_cfg: crate::config::NotifyConfig::default(),
+            trivy_path,
+            trivy_task: None,
+            trivy_run: 0,
+            #[cfg(test)]
+            trivy_test_path: None,
+            #[cfg(test)]
+            trivy_test_timeout: None,
             palette_keys: crate::config::PaletteKeys::default(),
             pf_state: ListState::default(),
             skin_list: crate::theme::BUILTIN_NAMES
@@ -1958,6 +1985,7 @@ mod rightsize;
 mod rows;
 mod snapshot;
 mod timeline;
+mod trivy;
 mod workspaces;
 
 use helpers::*;

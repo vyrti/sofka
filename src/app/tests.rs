@@ -1060,6 +1060,221 @@ async fn palette_merges_commands_with_resources() {
 }
 
 #[tokio::test]
+async fn trivy_command_is_visible_only_when_detected() {
+    let (mut app, _rx) = test_app();
+    app.trivy_path = None;
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "trivy".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    assert!(
+        app.cmd_suggestions
+            .iter()
+            .all(|suggestion| suggestion.label != "trivy")
+    );
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(app.trivy_task.is_none());
+
+    app.trivy_path = Some("/test/bin/trivy".into());
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "trivy".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    assert!(
+        app.cmd_suggestions.iter().any(
+            |suggestion| suggestion.kind == SuggestKind::Command && suggestion.label == "trivy"
+        )
+    );
+}
+
+#[cfg(unix)]
+fn write_fake_trivy_response(path: &std::path::Path, report: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = format!(
+        "#!/bin/sh\ncase \" $* \" in\n  *\" kubernetes --format json --report summary --quiet --disable-telemetry --skip-version-check --no-progress --parallel 1 --list-all-pkgs=false --disable-node-collector --timeout 5m --include-namespaces default test \"*) printf '%s\\n' '{report}' ;;\n  *) echo 'wrong scan arguments' >&2; exit 9 ;;\nesac\n"
+    );
+    std::fs::write(path, script).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+fn write_fake_trivy(path: &std::path::Path) {
+    let report = r#"{"SchemaVersion":2,"ClusterName":"test-cluster","Findings":[{"Namespace":"default","Kind":"Deployment","Name":"web","Results":[{"Vulnerabilities":[{"VulnerabilityID":"CVE-2026-1234","PkgName":"openssl","InstalledVersion":"1.0","FixedVersion":"1.1","Title":"Example vulnerability","Severity":"CRITICAL"}],"Misconfigurations":[{"ID":"AVD-KSV-0001","Title":"Runs as root","Severity":"HIGH","Status":"FAIL"}]}]}]}"#;
+    write_fake_trivy_response(path, report);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn trivy_command_runs_and_opens_parsed_report() {
+    let dir = std::env::temp_dir().join(format!(
+        "sofka-app-trivy-run-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let executable = dir.join("trivy");
+    write_fake_trivy(&executable);
+    let (mut app, mut rx) = test_app();
+    app.trivy_path = Some(executable);
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "trivy".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(app.flash.contains("Trivy: scanning"), "{}", app.flash);
+
+    loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("Trivy result timed out")
+            .expect("message channel closed");
+        let finished = matches!(&msg, Msg::Trivy { .. });
+        app.handle_msg(msg);
+        if finished {
+            break;
+        }
+    }
+    assert_eq!(app.mode, Mode::Detail);
+    assert_eq!(app.detail.title, "trivy — 2 findings");
+    assert!(
+        app.detail
+            .lines
+            .iter()
+            .any(|line| line.contains("CRITICAL CVE-2026-1234"))
+    );
+    assert_eq!(app.flash, "Trivy: 2 findings (1 critical, 1 high)");
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn trivy_command_marks_an_oversized_report_as_truncated() {
+    let dir = std::env::temp_dir().join(format!(
+        "sofka-app-trivy-limit-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let executable = dir.join("trivy");
+    let vulnerabilities = (0..300)
+        .map(|index| {
+            json!({
+                "VulnerabilityID": format!("CVE-2026-{index:04}"),
+                "Severity": "HIGH"
+            })
+        })
+        .collect::<Vec<_>>();
+    let report = json!({
+        "SchemaVersion": 2,
+        "ClusterName": "test-cluster",
+        "Findings": [{
+            "Namespace": "default",
+            "Kind": "Deployment",
+            "Name": "web",
+            "Results": [{"Vulnerabilities": vulnerabilities}]
+        }]
+    })
+    .to_string();
+    write_fake_trivy_response(&executable, &report);
+    let (mut app, mut rx) = test_app();
+    app.trivy_path = Some(executable);
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "trivy".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+        .await
+        .expect("Trivy result timed out")
+        .expect("message channel closed");
+    app.handle_msg(msg);
+
+    assert_eq!(app.mode, Mode::Detail);
+    assert!(app.detail.title.ends_with("+ findings"));
+    assert_eq!(
+        app.detail.lines.back().map(String::as_str),
+        Some("… report truncated to protect memory")
+    );
+    assert!(app.detail.lines.len() <= 256);
+    assert!(app.flash.contains("at least"), "{}", app.flash);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn trivy_command_times_out_a_hung_scan() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!(
+        "sofka-app-trivy-hung-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let executable = dir.join("trivy");
+    std::fs::write(&executable, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (mut app, mut rx) = test_app();
+    app.trivy_path = Some(executable);
+    app.trivy_test_timeout = Some(std::time::Duration::from_millis(25));
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "trivy".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+        .await
+        .expect("Trivy timeout result was not delivered")
+        .expect("message channel closed");
+    app.handle_msg(msg);
+
+    assert!(app.flash_err);
+    assert!(app.flash.contains("Trivy scan timed out"), "{}", app.flash);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reload_redetects_a_new_trivy_install_through_key_handling() {
+    let dir = std::env::temp_dir().join(format!(
+        "sofka-app-trivy-reload-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let executable = dir.join("trivy");
+    let (mut app, _rx) = test_app();
+    app.trivy_test_path = Some(dir.as_os_str().to_owned());
+    assert!(app.trivy_path.is_none());
+
+    write_fake_trivy(&executable);
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "reload".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.trivy_path.as_deref(), Some(executable.as_path()));
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "trivy".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    assert!(
+        app.cmd_suggestions
+            .iter()
+            .any(|suggestion| suggestion.label == "trivy")
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn palette_command_dispatch() {
     let (mut app, _rx) = test_app();
     assert!(app.run_palette_command("q")); // alias for quit
@@ -3287,6 +3502,22 @@ async fn every_async_result_is_scoped_to_its_own_operation() {
     assert_eq!(app.flash, "deleting 3 pods…");
     // The results still land, only the status is scoped.
     assert_eq!(app.find_query, "foo");
+
+    app.handle_msg(Msg::Trivy {
+        generation: app.generation,
+        run: app.trivy_run,
+        claim: find,
+        result: Ok(crate::trivy::ReportView {
+            title: "trivy — 0 findings".into(),
+            lines: vec!["Summary".into()],
+            findings: 0,
+            critical: 0,
+            high: 0,
+            truncated: false,
+        }),
+    });
+    assert_eq!(app.flash, "deleting 3 pods…");
+    assert_eq!(app.detail.title, "trivy — 0 findings");
 
     app.handle_msg(Msg::TransferDone {
         generation: app.generation,

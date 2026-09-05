@@ -35,5 +35,6 @@ pub mod text;
 pub mod theme;
 pub mod thresholds;
 pub mod timeline;
+pub mod trivy;
 pub mod ui;
 pub mod views;

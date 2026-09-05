@@ -266,6 +266,7 @@ impl App {
         };
         self.applied_filter_labels = filter_labels;
         self.applied_filter_fields = filter_fields;
+        self.stop_trivy();
         self.clear_progress_flash();
         self.generation += 1;
         self.gen_flag.store(self.generation, Ordering::SeqCst);
@@ -782,6 +783,7 @@ impl App {
 
     pub(super) fn bump_generation(&mut self) {
         self.stop_event_stream();
+        self.stop_trivy();
         self.clear_progress_flash();
         self.generation += 1;
         self.gen_flag.store(self.generation, Ordering::SeqCst);
@@ -1065,6 +1067,39 @@ impl App {
                         ),
                         true,
                     );
+                }
+            }
+            Msg::Trivy {
+                generation,
+                run,
+                claim,
+                result,
+            } if generation == self.generation && run == self.trivy_run => {
+                self.trivy_task = None;
+                match result {
+                    Ok(report) => {
+                        let summary = if report.truncated {
+                            format!(
+                                "Trivy: at least {} findings ({} critical, {} high)",
+                                report.findings, report.critical, report.high
+                            )
+                        } else {
+                            format!(
+                                "Trivy: {} findings ({} critical, {} high)",
+                                report.findings, report.critical, report.high
+                            )
+                        };
+                        self.detail = Scrollable {
+                            title: report.title,
+                            lines: report.lines.into(),
+                            ..Default::default()
+                        };
+                        self.mode = Mode::Detail;
+                        self.set_claimed_status(claim, summary, false);
+                    }
+                    Err(error) => {
+                        self.set_claimed_status(claim, format!("Trivy scan failed: {error}"), true);
+                    }
                 }
             }
             Msg::DebuggersCleaned {
