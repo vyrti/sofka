@@ -85,6 +85,14 @@ view = "xray"                            # optional: xray | pulse
 
 ## Workspaces
 
+Without an active workspace, `Tab` / `Shift-Tab` cycle pods → services →
+deployments → statefulsets → daemonsets → secrets → configmaps → ingresses →
+PVCs in the current namespace, including all namespaces. The cycle wraps and
+skips kinds absent from API discovery. From a resource outside this set, `Tab`
+starts at pods and `Shift-Tab` starts at PVCs (or the next available kind in
+that direction). Switching resources clears filters and drill-down scope, as
+with `:resource`; `[` / `]` still navigate view history.
+
 `[[workspaces]]` group several views into a named set for one task - checkout
 ops, a cluster upgrade, cert renewal. Open one with a chord or the palette (`▦`).
 sofka switches the optional context once and shows the first view. `Tab` /

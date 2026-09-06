@@ -22,6 +22,12 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 - **Drill-down navigation** with a breadcrumb stack: workload/service → pods,
   cronjob → its jobs, node → its pods, pod → containers, namespace → re-scope,
   CRD → its custom resources. `esc` goes back.
+- **Resource cycling** (`Tab` / `Shift-Tab`) - browse pods → services →
+  deployments → statefulsets → daemonsets → secrets → configmaps → ingresses →
+  PVCs, wrapping in either direction without configuration. Keeps the current
+  namespace (including all namespaces), skips kinds absent from API discovery,
+  and follows the active workspace's views when one is open. `[` / `]` remain
+  view history.
 - **Command palette** (`:`) - fuzzy search over the full resource catalog, your
   saved bookmarks and workspaces, and the built-in commands (`ctx`, `helm`,
   `pulse`, `xray`, `explain`, `timeline`, `gitops`, `can-i`, `journal`, `debug`,

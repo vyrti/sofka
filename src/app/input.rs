@@ -258,12 +258,12 @@ impl App {
             // Browser-style view history: [ back, ] forward.
             KeyCode::Char('[') => self.history_back(),
             KeyCode::Char(']') => self.history_forward(),
-            // Cycle the active workspace's views (no-op when none is open).
+            // Cycle workspace views, or the default resources in this namespace.
             KeyCode::Tab => {
-                self.cycle_workspace(true);
+                self.cycle_views(true);
             }
             KeyCode::BackTab => {
-                self.cycle_workspace(false);
+                self.cycle_views(false);
             }
             // k9s: 0 = all namespaces.
             KeyCode::Char('0') => {

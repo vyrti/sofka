@@ -12,7 +12,7 @@ pickers keep both characters available as input.
 | `:<resource>`                                 | command palette - fuzzy over kinds and built-in commands                                                                                                      |
 | `:<resource> <ns>`                            | switch kind and namespace at once (`:deploy social`; `all`/`*` = all namespaces; the namespace tab-completes)                                                 |
 | `[` / `]`                                     | view history - back / forward through visited kind+namespace views                                                                                            |
-| `Tab` / `shift-Tab`                           | cycle views of the active workspace (when one is open)                                                                                                        |
+| `Tab` / `shift-Tab`                           | next / previous common resource in the current namespace; cycle workspace views when one is open                                                              |
 | `enter`                                       | drill down (workload/svc → pods, cronjob → jobs, node → pods, pod → containers, ns → re-scope, CRD → resources, or [views](views.md))                         |
 | `esc`                                         | go back / pop the view stack / clear filter / clear marks                                                                                                     |
 | `j`/`k`, `↓`/`↑`, `g`/`G`                     | navigate                                                                                                                                                      |
