@@ -222,6 +222,20 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   stays visible in the main header.
   Identifiers and counts only, never credentials, tokens, or Secret values.
 
+## Bundled plugins
+
+- **`:sanitize`** deletes the pods a namespace has finished with - completed
+  jobs, failed and evicted pods, and optionally the wedged ones. It ships with
+  sofka and needs no runtime on `PATH`; the adapter is the sofka binary.
+  `states` selects `terminal` (the default), `stuck`, or `all`, named after the
+  STATUS values the pods view shows. `dry_run=true` reports without deleting.
+  It confirms before running, is blocked in read-only mode, and matches
+  guardrails as `plugin:sanitize`. It never deletes a pod that is terminating,
+  still has a running container, or was replaced since the scan.
+  The scope is the current namespace - **all namespaces when the view is** -
+  and the view filter does not narrow it.
+  See [Sanitize pods](../plugins/sanitize/README.md).
+
 ## External plugin packages
 
 - **Package discovery** reads `plugins/*/plugin.toml` from the sofka configuration directory.

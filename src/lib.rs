@@ -31,6 +31,7 @@ pub mod nsmem;
 pub mod plugins;
 pub mod providers;
 pub mod rightsize;
+pub mod sanitize;
 pub mod snapshot;
 pub mod sortmem;
 pub mod state_writer;
