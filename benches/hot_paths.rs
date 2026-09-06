@@ -353,19 +353,30 @@ fn frame_clock(c: &mut Criterion) {
     let mut g = c.benchmark_group("frame_clock");
     let pods: Vec<_> = (0..2_000).map(bs::pod).collect();
     let spec = columns::build_spec("pods", None, None, false);
+    // AGE is the elapsed cell this measures, and it is not column 0 — that is
+    // NAME, which is not volatile, so both sides would have returned `None`
+    // and timed the clock call against an empty result.
+    let age = spec
+        .header_index("AGE")
+        .expect("pods view must have an AGE column");
+    assert!(
+        spec.volatile(&pods[0], "pods", age, columns::now_secs())
+            .is_some(),
+        "AGE must render an elapsed value, or this measures nothing"
+    );
 
     g.bench_function("one_reading_per_frame_2000", |b| {
         b.iter(|| {
             let now = columns::now_secs();
             for pod in &pods {
-                black_box(spec.volatile(pod, "pods", 0, now));
+                black_box(spec.volatile(pod, "pods", age, now));
             }
         });
     });
     g.bench_function("one_reading_per_cell_2000", |b| {
         b.iter(|| {
             for pod in &pods {
-                black_box(spec.volatile(pod, "pods", 0, columns::now_secs()));
+                black_box(spec.volatile(pod, "pods", age, columns::now_secs()));
             }
         });
     });
