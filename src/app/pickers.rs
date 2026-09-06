@@ -752,18 +752,21 @@ impl App {
     /// Reconnecting re-runs API discovery, which can take seconds, so it runs
     /// off-thread; the new cluster (or error) arrives as `Msg::ContextSwitched`.
     pub(super) fn switch_context(&mut self, name: String) {
-        // One deferred navigation at a time. Whatever asked for this switch
-        // owns what lands when it completes, so anything armed by an earlier
-        // switch is dropped here rather than left to fire on a later one.
-        // Callers that defer arm their own slot *after* this returns.
-        self.pending_resource_query = None;
-        self.pending_bookmark = None;
-        self.pending_workspace = None;
         // Re-selecting the current context is a no-op — unless we never
         // connected to it, in which case picking it again is a retry.
         if name == self.cluster.context && self.cluster.connected {
             return;
         }
+        // One deferred navigation at a time. Whatever asked for this switch
+        // owns what lands when it completes, so anything armed by an earlier
+        // switch is dropped here rather than left to fire on a later one.
+        // Below the no-op return, deliberately: a re-select that starts no
+        // switch must not disarm one already in flight. Callers that defer
+        // arm their own slot *after* this returns, and each guards on the
+        // context actually differing, so none of them reach that return.
+        self.pending_resource_query = None;
+        self.pending_bookmark = None;
+        self.pending_workspace = None;
         // Stop the current context's watches and clear stale rows while we
         // reconnect; the new watch starts when the connection lands. The rows
         // are stashed first — if the switch fails we stay on this context,

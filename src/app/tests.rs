@@ -9604,6 +9604,38 @@ async fn palette_query_scopes_first_watch_and_supports_history() {
     assert!(!app.filter_server_side());
 }
 
+/// The no-op branch of a context re-select starts no switch, so it must not
+/// disarm a navigation that an in-flight one still owns.
+#[tokio::test]
+async fn a_noop_context_reselect_keeps_an_inflight_navigation() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    let home = app.cluster.context.clone();
+    app.apply_bookmark(crate::config::Bookmark {
+        name: "svc".into(),
+        resource: "services".into(),
+        context: Some("west".into()),
+        ..Default::default()
+    });
+    let inflight = app.generation;
+
+    // Re-selecting the context we are already on does nothing at all.
+    app.switch_context(home);
+    assert!(
+        app.pending_bookmark.is_some(),
+        "in-flight bookmark disarmed"
+    );
+
+    let mut cluster = Cluster::fake();
+    cluster.context = "west".into();
+    app.handle_msg(Msg::ContextSwitched {
+        generation: inflight,
+        name: "west".into(),
+        result: Ok(Box::new(cluster)),
+    });
+    assert_eq!(app.kind_plural, "services");
+}
+
 /// Deferred navigations are mutually exclusive: a bookmark, workspace or
 /// palette query that starts a context switch owns what lands when it
 /// completes, and must not leave an earlier one armed to fire later.
