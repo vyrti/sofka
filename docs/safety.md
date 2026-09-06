@@ -20,13 +20,26 @@ and "no more than 5 at a time" into enforced rules instead of things you have to
 remember.
 
 Each rule matches on `contexts`, `namespaces`, `resources`, and `actions` globs
-(all optional - an omitted glob matches everything), then applies the strictest
-of: `deny` (block the action), `confirmation` (type to confirm), and `max_bulk`
-(a row cap for one action). The gated `actions` are the destructive verbs sofka
+(all optional - an omitted glob matches everything). Rules can set `deny`
+(block the action), `confirmation` (require confirmation), and `max_bulk`
+(a row limit for one action). The gated `actions` are the destructive verbs sofka
 performs directly: `delete`, `force-delete`, `drain`, `restart`, `shell` (exec),
 `debug`, `node-debug`, and `transfer` (a file upload into a pod).
 
-The first matching rule wins. sofka shows the rule's `reason` when it fires.
+sofka combines the restrictions from all matching rules:
+
+- Any matching rule with `deny = true` blocks the action.
+- The smallest matching `max_bulk` limit applies. If the number of targets
+  exceeds this limit, sofka blocks the action.
+- The strongest matching `confirmation` level applies: `type-context-name`
+  is stronger than `type-resource-name`, which is stronger than a plain y/N
+  confirmation. A rule cannot reduce the action's default confirmation level.
+  For a bulk action, `type-resource-name` requires the target count.
+
+Denial takes priority over the bulk limit and confirmation. Rule order does not
+change these restrictions. For a denial, sofka shows the `reason` from the last
+matching rule with `deny = true`, if that rule has a non-empty reason. Bulk-limit
+warnings and confirmation prompts do not show a rule's `reason`.
 
 ```toml
 [[guardrails]]
