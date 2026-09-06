@@ -456,10 +456,7 @@ async fn snapshot(app: &mut App, rx: &mut mpsc::Receiver<store::Msg>) -> Result<
         }
         match tokio::time::timeout(SNAPSHOT_QUIET.min(deadline - now), rx.recv()).await {
             Ok(Some(msg)) => {
-                metrics_reported |= matches!(
-                    msg,
-                    store::Msg::Metrics { .. } | store::Msg::MetricsError { .. }
-                );
+                metrics_reported |= metrics_reported_for(&msg, app.generation);
                 app.handle_msg(msg);
             }
             Ok(None) => break,
@@ -562,6 +559,22 @@ async fn snapshot(app: &mut App, rx: &mut mpsc::Receiver<store::Msg>) -> Result<
         println!("{}", line.trim_end());
     }
     Ok(())
+}
+
+/// Whether `msg` completes the metrics wait for the active view. Metrics from
+/// a superseded watch are discarded by [`App::handle_msg`] and must not make a
+/// headless snapshot ready either.
+fn metrics_reported_for(msg: &store::Msg, generation: u64) -> bool {
+    matches!(
+        msg,
+        store::Msg::Metrics {
+            generation: reported,
+            ..
+        } | store::Msg::MetricsError {
+            generation: reported,
+            ..
+        } if *reported == generation
+    )
 }
 
 /// Whether a headless snapshot has everything it is going to draw: the watch's
@@ -859,5 +872,30 @@ async fn run(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[test]
+    fn snapshot_metrics_wait_only_accepts_the_active_generation() {
+        let metrics = store::Msg::Metrics {
+            generation: 8,
+            data: HashMap::new(),
+            containers: HashMap::new(),
+        };
+        let error = store::Msg::MetricsError {
+            generation: 8,
+            error: "unavailable".into(),
+        };
+
+        assert!(metrics_reported_for(&metrics, 8));
+        assert!(metrics_reported_for(&error, 8));
+        assert!(!metrics_reported_for(&metrics, 9));
+        assert!(!metrics_reported_for(&error, 9));
     }
 }
