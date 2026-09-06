@@ -552,9 +552,9 @@ async fn snapshot(app: &mut App, rx: &mut mpsc::Receiver<store::Msg>) -> Result<
 
 /// Whether a headless snapshot has everything it is going to draw: the watch's
 /// initial list, a report from the metrics poll when the CPU/MEM columns are
-/// shown (pods/nodes only), and the dashboard `PUP_DEMO` asked for.
-/// Deliberately narrow — anything not rendered by the frame must not hold the
-/// snapshot open.
+/// shown (pods/nodes only), the pod counts behind the nodes view's PODS
+/// column, and the dashboard `PUP_DEMO` asked for. Deliberately narrow —
+/// anything not rendered by the frame must not hold the snapshot open.
 fn snapshot_ready(app: &App, metrics_reported: bool) -> bool {
     if !app.store.synced {
         return false;
@@ -565,6 +565,17 @@ fn snapshot_ready(app: &App, metrics_reported: bool) -> bool {
     // metrics-server has not reported yet renders here exactly as the live
     // table renders it at the same moment.
     if app.metrics_columns() && !metrics_reported {
+        return false;
+    }
+    // PODS is fed by its own watcher, which holds its counts back until
+    // `InitDone` and then publishes on a one-second ticker — strictly later
+    // than the sync and the metrics report it races. Leaving it out let the
+    // quiet window close first and drew "-" in every PODS cell, which the old
+    // fixed three-second wait had been hiding. No flag to thread through here:
+    // `node_pods` is `None` until that first publication, so the field already
+    // is the "has reported" state, and it is the same `None` the cell renders
+    // from.
+    if app.node_capacity_columns() && app.node_pods.is_none() {
         return false;
     }
     match app.mode {
