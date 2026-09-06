@@ -74,7 +74,7 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   first, so an in-cluster or VPN session benchmarks it directly; only when
   nothing answers does sofka reuse a running `f` port-forward, or open a
   temporary one that is torn down with the run. Defaults to a deliberately gentle
-  10s / 20 connections, capped at 5m and 500 connections, and validated before
+  10s / 20 connections, capped at 5m and 200k connections, and validated before
   any process starts. Availability is checked at startup and rescanned by
   `:reload`.
 - **Live CPU and MEM columns** for pods and nodes from the metrics API, colored

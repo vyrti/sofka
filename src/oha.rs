@@ -37,7 +37,7 @@ const TRUNCATION_LINE: &str = "… report truncated to protect memory";
 pub const MAX_DURATION: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_DURATION: Duration = Duration::from_secs(10);
 const DEFAULT_CONNECTIONS: u32 = 20;
-const MAX_CONNECTIONS: u32 = 500;
+const MAX_CONNECTIONS: u32 = 200_000;
 /// Head-room over the requested duration for DNS, connection setup, the
 /// optional forward, and oha's own reporting.
 const RUN_SLACK: Duration = Duration::from_secs(30);
@@ -1205,7 +1205,10 @@ mod tests {
     fn options_are_capped_and_validated_before_any_process_starts() {
         assert!(parse_options("99h").is_err());
         assert!(parse_options("6m").unwrap_err().contains("cap"));
-        assert!(parse_options("10s 10000").unwrap_err().contains("cap"));
+        assert!(parse_options("10s 200001").unwrap_err().contains("cap"));
+        // Well inside the raised ceiling.
+        assert_eq!(parse_options("10s 10000").unwrap().connections, 10_000);
+        assert_eq!(parse_options("10s 200000").unwrap().connections, 200_000);
         assert!(parse_options("0s").is_err());
         assert!(parse_options("10s 0").is_err());
         assert!(parse_options("soon").is_err());
