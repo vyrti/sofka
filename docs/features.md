@@ -10,7 +10,8 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   aliases (`po`, `dp`, `svc`, `no`, `cm`, `sts`, `ds`, `ks`, `hr`, …) and correct
   precedence - core `pods` wins over `pods.metrics.k8s.io`.
 - **Live watch** of any kind through `kube::runtime::watcher`, streamed into an
-  in-memory store.
+  in-memory store. Watch requests use uncompressed responses to avoid gzip
+  stream errors. List requests retain gzip compression.
 - **Curated columns** for common kinds (pods, deployments, replicasets,
   statefulsets, daemonsets, services, nodes, namespaces, configmaps, secrets,
   jobs, cronjobs, PVC/PV, ingresses, endpoints, CustomResourceDefinitions), with

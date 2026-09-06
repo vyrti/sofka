@@ -2915,6 +2915,7 @@ dependencies = [
  "terminal-colorsaurus",
  "tokio",
  "toml",
+ "tower",
  "unicode-width",
 ]
 
