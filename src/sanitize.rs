@@ -45,13 +45,19 @@ fn wanted(states: &str) -> Option<Vec<&'static str>> {
     Some(set)
 }
 
-/// Whether any container is still running.
+/// Whether an application container is still running.
 ///
 /// The STATUS column reports the reason of the last container that terminated,
 /// so a multi-container pod reads `OOMKilled` while a sibling still serves. That
 /// is right for a column and wrong for a delete. Readiness is deliberately not
 /// part of this: a container failing its readiness probe, or still inside its
 /// startup probe, is out of the load balancer and very much alive.
+///
+/// Restartable init containers (native sidecars) are deliberately not consulted.
+/// They are infrastructure for the workload rather than the workload, and
+/// counting them would make an identical crash-looping pod exempt from
+/// `states = stuck` purely because something injected a proxy into it. The
+/// STATUS column ignores them for the same reason, so the two agree.
 fn running(pod: &Pod) -> bool {
     pod.status
         .as_ref()
@@ -320,6 +326,47 @@ mod tests {
                  "state": {"terminated": {"reason": "OOMKilled", "exitCode": 137}}}]}
         }));
         assert!(running(&unready));
+    }
+
+    #[test]
+    fn a_native_sidecar_does_not_exempt_a_dead_workload() {
+        // A restartable init container keeps running for the pod's lifetime and
+        // lands in initContainerStatuses, not containerStatuses. Counting it as
+        // "running" would spare a crash-looping pod that an identical pod
+        // without a proxy would not be spared, so it is left out on purpose.
+        let sidecar = json!({"name": "proxy", "restartPolicy": "Always"});
+        let crashing = pod(json!({
+            "metadata": {"name": "wedged", "namespace": "default"},
+            "spec": {"initContainers": [sidecar]},
+            "status": {"phase": "Running",
+                "initContainerStatuses": [
+                    {"name": "proxy", "ready": true, "restartCount": 0,
+                     "state": {"running": {}}}],
+                "containerStatuses": [
+                    {"name": "app", "ready": false, "restartCount": 7,
+                     "state": {"waiting": {"reason": "CrashLoopBackOff"}}}]}
+        }));
+        assert_eq!(status_of(&crashing).unwrap(), "CrashLoopBackOff");
+        assert!(
+            !running(&crashing),
+            "a proxy must not exempt a dead workload"
+        );
+
+        // The benign case needs no special handling: once the application
+        // container finishes cleanly the status is no longer in any set.
+        let finished = pod(json!({
+            "metadata": {"name": "done", "namespace": "default"},
+            "spec": {"initContainers": [sidecar]},
+            "status": {"phase": "Running",
+                "initContainerStatuses": [
+                    {"name": "proxy", "ready": true, "restartCount": 0,
+                     "state": {"running": {}}}],
+                "containerStatuses": [
+                    {"name": "app", "ready": false, "restartCount": 0,
+                     "state": {"terminated": {"reason": "Completed", "exitCode": 0}}}]}
+        }));
+        assert_eq!(status_of(&finished).unwrap(), "Running");
+        assert!(!wanted("all").unwrap().contains(&"Running"));
     }
 
     #[test]

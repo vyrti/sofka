@@ -45,11 +45,14 @@ pod is usually a pod waiting for a node rather than a pod that failed.
 ## What it will not delete
 
 - A pod that is already `Terminating`.
-- A pod with a running container, whatever its STATUS reads. A multi-container
-  pod reports the reason of the last container that terminated, so one can read
-  `OOMKilled` while another still serves traffic. Readiness is not part of this
-  check: a container failing its readiness probe, or still inside its startup
-  probe, is out of the load balancer and still alive.
+- A pod with a running application container, whatever its STATUS reads. A
+  multi-container pod reports the reason of the last container that terminated,
+  so one can read `OOMKilled` while another still serves traffic. Readiness is
+  not part of this check: a container failing its readiness probe, or still
+  inside its startup probe, is out of the load balancer and still alive.
+  Restartable init containers (native sidecars) do not count. They support the
+  workload rather than being it, and counting them would exempt a crash-looping
+  pod from `states=stuck` purely for having a proxy injected.
 - A pod that was replaced between the scan and the delete. Each delete carries a
   UID precondition, so if a StatefulSet has put a fresh `db-0` behind the name
   that was dead a moment ago, the API rejects the delete and the report counts
