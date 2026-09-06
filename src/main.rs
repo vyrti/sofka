@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use sofka::app::App;
 use sofka::k8s::Cluster;
 use sofka::{
-    altscroll, app, config, diagnostics, fleet, k8s, nsmem, providers, snapshot, sortmem, store,
+    altscroll, app, applog, config, diagnostics, fleet, k8s, nsmem, providers, sortmem, store,
     theme, thresholds, ui, views,
 };
 
@@ -24,6 +24,9 @@ const EVENT_CHANNEL_CAP: usize = 4096;
 #[derive(Parser, Debug)]
 #[command(name = "sofka", version, about)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Resource to open on launch (alias/plural/kind), e.g. pods, svc, dp.
     /// Defaults to config `default_resource`, then "pods".
     resource: Option<String>,
@@ -74,11 +77,28 @@ struct Args {
     #[arg(long, value_name = "FILE", conflicts_with_all = ["check", "snapshot", "info"])]
     validate_plugin_report: Option<PathBuf>,
 
-    /// Print version/build, config sources, directories, and the current
-    /// kubeconfig context, then exit (no cluster connection). For live
-    /// discovery/metrics/watch status, use `:info` inside the TUI.
+    /// Deprecated alias for `sofka info --offline`.
     #[arg(long)]
     info: bool,
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+enum Command {
+    /// Print runtime diagnostics and exit: version and build, config sources,
+    /// context/cluster/API server, discovery and Metrics API status, request
+    /// latency, logging, and the directories sofka uses.
+    ///
+    /// Connects to the cluster (briefly) unless `--offline`. Identifiers,
+    /// paths, and counts only — never credentials, tokens, or Secret values.
+    Info(InfoArgs),
+}
+
+#[derive(clap::Args, Debug, Clone, Default)]
+struct InfoArgs {
+    /// Report only what can be known without a cluster: build, config sources,
+    /// kubeconfig context, logging, and directories.
+    #[arg(long)]
+    offline: bool,
 }
 
 /// Heap profiling build (`--features dhat-heap`). dhat replaces the global
@@ -130,10 +150,17 @@ async fn run_main(args: Args) -> Result<()> {
 
     let (loader, mut config_warnings) = config::ConfigLoader::load();
 
-    // `--info`: print static diagnostics (no cluster connection) and exit.
-    if args.info {
-        print_info(&loader, &config_warnings);
-        return Ok(());
+    // Logging starts before the first cluster request, so the base config
+    // decides it — a per-cluster override would arrive too late to record the
+    // connection it belongs to.
+    let base = loader.resolve("", "").config;
+    start_logging(&base.logging, &mut config_warnings);
+
+    // `sofka info` (and the deprecated `--info`): report and exit.
+    if let Some(info) = info_request(&args) {
+        let result = run_info(&info, &args, &loader, &mut config_warnings).await;
+        applog::shutdown();
+        return result;
     }
 
     // Connect before taking over the terminal so errors are readable. An
@@ -149,6 +176,7 @@ async fn run_main(args: Args) -> Result<()> {
         Ok(c) => (c, None),
         Err(e) if args.check || args.snapshot => {
             eprintln!("\x1b[31merror:\x1b[0m {e:#}");
+            applog::shutdown();
             std::process::exit(1);
         }
         Err(e) => {
@@ -200,6 +228,7 @@ async fn run_main(args: Args) -> Result<()> {
             Ok(ns) => println!("  namespaces: {}", ns.len()),
             Err(e) => println!("  namespaces: error: {e}"),
         }
+        applog::shutdown();
         return Ok(());
     }
 
@@ -357,7 +386,9 @@ async fn run_main(args: Args) -> Result<()> {
     }
 
     if args.snapshot {
-        return snapshot(&mut app, &mut rx).await;
+        let result = snapshot(&mut app, &mut rx).await;
+        applog::shutdown();
+        return result;
     }
 
     let mouse = cfg.mouse.unwrap_or(true);
@@ -374,6 +405,8 @@ async fn run_main(args: Args) -> Result<()> {
     // `restore()` leaves the alternate screen but never re-shows the cursor
     // that `draw` hid, so without this the user's shell prompt has no cursor.
     let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+    sofka::log_info!("shutdown", quit = app.should_quit);
+    applog::shutdown();
     result
 }
 
@@ -474,6 +507,9 @@ async fn snapshot(app: &mut App, rx: &mut mpsc::Receiver<store::Msg>) -> Result<
                 app.mode = app::Mode::Diff;
             }
         }
+        // Built last so the latency table has the session's real requests in
+        // it — the numbers are half of what this view is for.
+        Ok("info") => app.open_info(),
         Ok("palette") => {
             app.command = "de".into();
             app.cmd_suggestions = [
@@ -561,67 +597,268 @@ fn suspend_and_run(terminal: &mut ratatui::DefaultTerminal, argv: &[String], cap
     let _ = terminal.clear();
 }
 
-/// `--info`: print static runtime diagnostics (no cluster connection). Emits
-/// only identifiers and paths — never credentials, tokens, or Secret values.
-fn print_info(loader: &config::ConfigLoader, warnings: &[String]) {
-    println!("sofka v{}", diagnostics::VERSION);
-    println!("  build: {}", diagnostics::build_line());
-
-    let (context, cluster, server) = k8s::current_context_info()
-        .unwrap_or_else(|| ("(none)".into(), String::new(), String::new()));
-    println!();
-    println!("Kubeconfig");
-    println!("  current context: {context}");
-    println!(
-        "  cluster:         {}",
-        if cluster.is_empty() {
-            "(unknown)"
-        } else {
-            &cluster
-        }
-    );
-    println!(
-        "  api server:      {}",
-        if server.is_empty() {
-            "(unknown)"
-        } else {
-            &server
-        }
-    );
-
-    println!();
-    println!("Config sources");
-    match loader.base_path() {
-        Some(path) => {
-            let state = if loader.has_base() {
-                "loaded"
-            } else if path.exists() {
-                "invalid — using defaults"
-            } else {
-                "absent — using defaults"
-            };
-            println!("  {} ({state})", path.display());
-        }
-        None => println!("  no config directory — using defaults"),
+/// Which diagnostics report the CLI asked for, if any. The `--info` flag is
+/// the deprecated spelling and keeps its documented contract: no connection.
+fn info_request(args: &Args) -> Option<InfoArgs> {
+    match &args.command {
+        Some(Command::Info(info)) => Some(info.clone()),
+        None if args.info => Some(InfoArgs { offline: true }),
+        None => None,
     }
-    for path in loader.override_paths(&context, &cluster) {
-        println!("  {} ({})", path.display(), config::file_state(&path));
+}
+
+/// Start the structured log, turning a failure into a warning rather than a
+/// failed launch: a log sofka cannot write is not a reason to refuse to run.
+fn start_logging(cfg: &config::LoggingConfig, warnings: &mut Vec<String>) {
+    for w in config::logging_warnings(cfg) {
+        eprintln!("warning: {w}");
+        warnings.push(w);
     }
+    let (level, env_warning) = applog::resolve_level(&cfg.level);
+    if let Some(w) = env_warning {
+        eprintln!("warning: {w}");
+        warnings.push(w);
+    }
+    if let Err(e) = applog::init(level, cfg.path(), cfg.max_bytes()) {
+        eprintln!("warning: {e}");
+        warnings.push(e);
+        return;
+    }
+    sofka::log_info!(
+        "startup",
+        version = diagnostics::VERSION,
+        build = diagnostics::build_line(),
+        logging = level.as_str()
+    );
+}
 
-    println!();
-    println!("Directories");
-    println!("  state:     {}", diagnostics::state_dir().display());
-    println!("  snapshots: {}", snapshot::snapshots_dir().display());
-    println!("  bundles:   {}", std::env::temp_dir().display());
-
-    if warnings.is_empty() {
-        println!("\nNo config validation warnings.");
+/// `sofka info`: runtime diagnostics to stdout.
+///
+/// Connects briefly unless `--offline`, because discovery and Metrics API
+/// status are the half of this report you cannot get from disk. A failed
+/// connection is reported and the rest of the report still prints — the
+/// command's job is to explain a broken setup, not to fail with it.
+///
+/// Emits identifiers, paths, and counts only; every value that could carry a
+/// credential is redacted first.
+async fn run_info(
+    info: &InfoArgs,
+    args: &Args,
+    loader: &config::ConfigLoader,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let cluster = if info.offline {
+        None
     } else {
-        println!("\nWarnings [{}]", warnings.len());
-        for w in warnings {
-            println!("  • {w}");
+        eprintln!("Connecting to cluster…");
+        match args.context.as_deref() {
+            Some(name) => Cluster::connect_context(name).await,
+            None => Cluster::connect().await,
         }
+        .inspect_err(|e| eprintln!("\x1b[33mwarning:\x1b[0m {e:#}"))
+        .ok()
+    };
+
+    // Identity comes from the live connection when there is one, and from the
+    // kubeconfig otherwise, so the config-source section resolves the same
+    // per-cluster overrides the TUI would.
+    let (context, cluster_name, server) = match &cluster {
+        Some(c) => (
+            c.context.clone(),
+            c.cluster_name.clone(),
+            c.cluster_url.clone(),
+        ),
+        None => k8s::current_context_info()
+            .unwrap_or_else(|| ("(none)".into(), String::new(), String::new())),
+    };
+
+    let resolved = loader.resolve(&context, &cluster_name);
+    warnings.extend(resolved.warnings.clone());
+    let cfg = resolved.config;
+
+    // Exactly what a launch with these flags would open, so the probe below
+    // exercises the view the user would actually land on.
+    let resource = args
+        .resource
+        .clone()
+        .or_else(|| cfg.default_resource.clone())
+        .unwrap_or_else(|| "pods".into());
+    let namespace = starting_namespace(
+        args,
+        &cfg,
+        &context,
+        cluster
+            .as_ref()
+            .map(|c| c.default_namespace.clone())
+            .or_else(|| k8s::context_namespace(&context)),
+    );
+
+    let mut lines = diagnostics::version_lines();
+
+    lines.push(String::new());
+    lines.push("Cluster".into());
+    lines.push(format!(
+        "  connected:   {}",
+        match &cluster {
+            Some(_) => "yes",
+            None if info.offline => "not attempted (--offline)",
+            None => "no",
+        }
+    ));
+    lines.push(format!(
+        "  context:     {}",
+        diagnostics::safe_or(&context, "(none)")
+    ));
+    lines.push(format!(
+        "  cluster:     {}",
+        diagnostics::safe_or(&cluster_name, "(unknown)")
+    ));
+    lines.push(format!(
+        "  api server:  {}",
+        diagnostics::safe_or(&server, "(unknown)")
+    ));
+    if let Some(cluster) = &cluster {
+        lines.push(format!(
+            "  k8s rev:     {}",
+            diagnostics::safe_or(&cluster.server_version, "(unknown)")
+        ));
+        lines.push(format!(
+            "  discovery:   {} resource kinds",
+            cluster.catalog.len()
+        ));
+        lines.push(format!(
+            "  metrics API: {}",
+            if cluster.resolve("pods.metrics.k8s.io").is_some() {
+                "discovered (metrics.k8s.io)"
+            } else {
+                "not installed"
+            }
+        ));
     }
+    lines.push(format!(
+        "  namespace:   {}",
+        if namespace.is_empty() {
+            "(all)"
+        } else {
+            &namespace
+        }
+    ));
+
+    // Section order matches `:info` so the two reports can be read against
+    // each other. A headless report has no session to count watches over, so
+    // it runs one instead: the same watch a launch would open, which is the
+    // failure this command exists to explain.
+    lines.push(String::new());
+    lines.push("Watch health".into());
+    match &cluster {
+        Some(cluster) => {
+            lines.push(format!(
+                "  probe:       {resource} in {}",
+                if namespace.is_empty() {
+                    "all namespaces"
+                } else {
+                    &namespace
+                }
+            ));
+            let probe = cluster
+                .probe_watch(&resource, &namespace, diagnostics::WATCH_PROBE_TIMEOUT)
+                .await;
+            lines.extend(diagnostics::watch_probe_lines(
+                &probe,
+                &resource,
+                diagnostics::WATCH_PROBE_TIMEOUT,
+            ));
+        }
+        None if info.offline => lines.push("  not probed (--offline)".into()),
+        None => lines.push("  not probed — no connection".into()),
+    }
+
+    let latency = diagnostics::latency_lines();
+    if !latency.is_empty() {
+        lines.push(String::new());
+        lines.extend(latency);
+    }
+
+    lines.push(String::new());
+    lines.extend(diagnostics::config_source_lines(
+        loader,
+        &context,
+        &cluster_name,
+    ));
+
+    lines.push(String::new());
+    lines.push("Active config".into());
+    lines.push(format!(
+        "  skin:       {}",
+        cfg.skin.name.as_deref().unwrap_or("auto")
+    ));
+    lines.push(format!("  readonly:   {}", cfg.readonly));
+    lines.push(format!("  aliases:    {}", cfg.aliases.len()));
+    lines.push(diagnostics::named_line(
+        "plugins",
+        cfg.plugins.iter().map(|p| p.name.as_str()),
+        cfg.plugins.len(),
+    ));
+    lines.push(diagnostics::named_line(
+        "views",
+        cfg.views.keys().map(String::as_str),
+        cfg.views.len(),
+    ));
+    lines.push(format!("  bookmarks:  {}", cfg.bookmarks.len()));
+    lines.push(format!("  guardrails: {}", cfg.guardrails.len()));
+
+    lines.push(String::new());
+    lines.extend(diagnostics::logging_lines());
+
+    lines.push(String::new());
+    lines.extend(diagnostics::directory_lines());
+
+    warnings.extend(
+        config::plugin_warnings(&cfg.plugins)
+            .into_iter()
+            .chain(config::bookmark_warnings(&cfg.bookmarks))
+            .chain(config::workspace_warnings(&cfg.workspaces))
+            .chain(config::guardrail_warnings(&cfg.guardrails))
+            .chain(config::forward_warnings(&cfg.forwards))
+            .chain(config::notify_warnings(&cfg.notify)),
+    );
+    lines.push(String::new());
+    lines.extend(diagnostics::warning_lines(warnings));
+
+    for line in lines {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The namespace a launch with these flags would start in, resolved the same
+/// way the TUI resolves it (flags, then remembered, then config, then
+/// kubeconfig) — a report that disagreed with the app would be worse than
+/// none. Empty means all namespaces.
+fn starting_namespace(
+    args: &Args,
+    cfg: &config::Config,
+    context: &str,
+    kubeconfig_default: Option<String>,
+) -> String {
+    if args.all_namespaces {
+        return String::new();
+    }
+    if let Some(ns) = &args.namespace {
+        return ns.clone();
+    }
+    if let Some(ns) =
+        nsmem::NamespaceMemory::load(&nsmem::NamespaceMemory::default_path()).get(context)
+    {
+        return ns;
+    }
+    if let Some(ns) = &cfg.default_namespace {
+        return ns.clone();
+    }
+    // Kubernetes' own fallback when nothing pins one.
+    kubeconfig_default
+        .filter(|ns| !ns.is_empty())
+        .unwrap_or_else(|| "default".into())
 }
 
 /// Feed keys to the app and redraw. Returns whether anything was dispatched,

@@ -9681,25 +9681,86 @@ async fn info_view_reports_version_cluster_and_watch_health() {
     let (mut app, _rx) = test_app();
     app.cluster.server_version = "v1.36.2-eks-bca9cf6".into();
     app.watch_errors = 3;
+    app.watch_reconnects = 2;
     app.last_error = Some("connection refused".into());
+    app.plugins = vec![crate::config::Plugin {
+        name: "argocd-sync".into(),
+        ..Default::default()
+    }];
     assert!(app.run_palette_command("info"));
     assert_eq!(app.mode, Mode::Detail);
-    let text = app
-        .detail
-        .lines
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = info_text(&app);
     assert!(text.contains(&format!("sofka v{}", crate::diagnostics::VERSION)));
     assert!(text.contains("Cluster"), "{text}");
     assert!(text.contains("api server:"), "{text}");
     assert!(text.contains("k8s rev:     v1.36.2-eks-bca9cf6"), "{text}");
-    assert!(text.contains("errors: 3"), "{text}");
+    assert!(text.contains("errors:     3"), "{text}");
+    assert!(text.contains("reconnects: 2"), "{text}");
     assert!(text.contains("connection refused"), "{text}");
+    // Loaded plugins and views are named, not just counted.
+    assert!(text.contains("plugins:    1  (argocd-sync)"), "{text}");
+    assert!(text.contains("Logging"), "{text}");
+    assert!(text.contains("level: off"), "{text}");
     assert!(text.contains("Directories"), "{text}");
+    assert!(text.contains("logs:"), "{text}");
     // Never leaks credentials — the report is identifiers and counts only.
     assert!(!text.to_lowercase().contains("bearer"), "{text}");
+}
+
+#[tokio::test]
+async fn info_view_redacts_credentials_in_cluster_identity() {
+    let (mut app, _rx) = test_app();
+    // A kubeconfig can put basic-auth userinfo in the server URL, and an error
+    // string can echo a request header back at us. Neither reaches the screen.
+    app.cluster.cluster_url = "https://admin:hunter2@api.example.com:6443".into();
+    app.last_error = Some("401 Unauthorized for authorization: Bearer abc.def.ghi".into());
+    app.metrics_error = Some("token=s3cr3t rejected".into());
+    assert!(app.run_palette_command("info"));
+    let text = info_text(&app);
+    assert!(!text.contains("hunter2"), "{text}");
+    assert!(!text.contains("abc.def.ghi"), "{text}");
+    assert!(!text.contains("s3cr3t"), "{text}");
+    assert!(text.contains("api.example.com:6443"), "{text}");
+    assert!(text.contains(crate::redact::REDACTED), "{text}");
+}
+
+#[tokio::test]
+async fn watch_relist_after_sync_counts_as_a_reconnect() {
+    let (mut app, _rx) = test_app();
+    let generation = app.generation;
+    // Initial list: reset, rows, sync. Nothing has reconnected yet.
+    app.handle_msg(Msg::Reset { generation });
+    apply(
+        &mut app,
+        json!({"metadata": {"name": "a", "namespace": "default"}}),
+    );
+    app.handle_msg(Msg::Synced { generation });
+    assert!(app.run_palette_command("info"));
+    assert!(
+        info_text(&app).contains("reconnects: 0"),
+        "{}",
+        info_text(&app)
+    );
+
+    // The watcher heals a desync by re-listing: reset again after a sync.
+    app.handle_msg(Msg::Reset { generation });
+    app.handle_msg(Msg::Synced { generation });
+    assert_eq!(app.watch_reconnects, 1);
+    assert!(app.run_palette_command("info"));
+    assert!(
+        info_text(&app).contains("reconnects: 1"),
+        "{}",
+        info_text(&app)
+    );
+}
+
+fn info_text(app: &App) -> String {
+    app.detail
+        .lines
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[tokio::test]
@@ -10794,6 +10855,42 @@ async fn plugin_result(rx: &mut Receiver<Msg>) -> Msg {
     })
     .await
     .expect("plugin did not finish")
+}
+
+/// The action journal is the only thing the structured log records for a
+/// plugin run, so what it holds is exactly what can reach the log file. A
+/// plugin input is arbitrary user text — an API token, a password — and must
+/// never be part of it.
+#[tokio::test]
+async fn plugin_secret_inputs_never_reach_the_journal_or_diagnostics() {
+    let (mut app, _rx) = app_with_pod();
+    let mut plugin = named_plugin("echo", &["${input.token}"]);
+    plugin.inputs = toml::from_str(
+        r#"
+        [token]
+        type = "string"
+        default = ""
+    "#,
+    )
+    .unwrap();
+    app.plugins = vec![plugin];
+
+    plugin_command(&mut app, "example-plugin token=hunter2-s3cr3t");
+    let Some(Suspend::Shell(argv)) = app.pending.take() else {
+        panic!("plugin not invoked");
+    };
+    // The value reaches the subprocess, and nowhere else.
+    assert_eq!(argv, ["echo", "hunter2-s3cr3t"]);
+
+    let journal = app.journal.lines().join("\n");
+    assert!(journal.contains("plugin: Example"), "{journal}");
+    assert!(journal.contains("1 target"), "{journal}");
+    assert!(!journal.contains("hunter2-s3cr3t"), "{journal}");
+
+    assert!(app.run_palette_command("info"));
+    let info = info_text(&app);
+    assert!(info.contains("plugins:    1  (Example)"), "{info}");
+    assert!(!info.contains("hunter2-s3cr3t"), "{info}");
 }
 
 #[tokio::test]

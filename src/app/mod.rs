@@ -1706,6 +1706,11 @@ pub struct App {
     pub journal: crate::journal::Journal,
     /// Count of watch/stream errors seen this session, for `:info` diagnostics.
     pub watch_errors: u64,
+    /// Times a watch re-listed after a completed sync this session. Routine in
+    /// small numbers (the API server ages resource versions out); a climbing
+    /// count next to a flat error count is the signature of a flaky connection
+    /// rather than a broken one, which is why `:info` reports them apart.
+    pub watch_reconnects: u64,
     /// The most recent error message, for `:info` diagnostics.
     pub last_error: Option<String>,
     /// The most recent failure to persist a small UI-state file (namespace,
@@ -1994,6 +1999,7 @@ impl App {
             pending_bundle: None,
             journal: crate::journal::Journal::default(),
             watch_errors: 0,
+            watch_reconnects: 0,
             last_error: None,
             last_state_write_error: None,
             metrics_seen: false,

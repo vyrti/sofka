@@ -101,6 +101,8 @@ pub struct Config {
     /// Command-palette completion key rebinds — see [`KeysConfig`]. Compiled
     /// and validated by [`compile_palette_keys`].
     pub keys: KeysConfig,
+    /// Structured application logging — see [`LoggingConfig`].
+    pub logging: LoggingConfig,
 }
 
 /// Delivery for `:notify` events, besides the status-line flash.
@@ -398,6 +400,73 @@ impl Default for LogsConfig {
             fullscreen: false,
         }
     }
+}
+
+/// Structured application logging — sofka's own diagnostics, not pod logs
+/// (those are [`LogsConfig`]).
+///
+/// ```toml
+/// [logging]
+/// level = "info"           # off (default) | error | warn | info | debug | trace
+/// # file = "/tmp/sofka.log"  # default: <state-dir>/logs/sofka.log
+/// max_size_mb = 8          # rotate to <file>.1 past this size
+/// ```
+///
+/// `SOFKA_LOG=debug` overrides `level` for one run, which is how you turn
+/// logging on for a session without editing config. Every value written is
+/// redacted first (see [`crate::redact`]), so the log can be attached to a bug
+/// report as-is.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LoggingConfig {
+    /// `off` | `error` | `warn` | `info` | `debug` | `trace`.
+    pub level: String,
+    /// Log file. Defaults to `<state-dir>/logs/sofka.log`.
+    pub file: Option<PathBuf>,
+    /// Size at which the log rotates to `<file>.1`.
+    pub max_size_mb: u64,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: "off".into(),
+            file: None,
+            max_size_mb: 8,
+        }
+    }
+}
+
+impl LoggingConfig {
+    /// Where the log goes, config first and the state directory otherwise.
+    pub fn path(&self) -> PathBuf {
+        self.file
+            .clone()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(crate::diagnostics::default_log_path)
+    }
+
+    /// Rotation threshold in bytes, floored at 64KiB — a smaller cap would
+    /// rotate faster than a session can be read back.
+    pub fn max_bytes(&self) -> u64 {
+        self.max_size_mb.saturating_mul(1024 * 1024).max(64 * 1024)
+    }
+}
+
+/// Validate `[logging]`: an unparseable level (in config or `SOFKA_LOG`) warns
+/// and leaves logging off rather than guessing at a verbosity.
+pub fn logging_warnings(cfg: &LoggingConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if crate::applog::Level::parse(&cfg.level).is_none() {
+        warnings.push(format!(
+            "logging: level '{}' is not off/error/warn/info/debug/trace; logging disabled",
+            cfg.level
+        ));
+    }
+    if cfg.file.as_ref().is_some_and(|p| p.as_os_str().is_empty()) {
+        warnings.push("logging: file is empty; using the default log path".into());
+    }
+    warnings
 }
 
 /// Options for the `:bundle` diagnostic-bundle export.
@@ -1580,6 +1649,46 @@ mod tests {
         assert!(cfg.plugins.is_empty());
         assert!(cfg.default_resource.is_none());
         assert!(cfg.providers.logs.is_none());
+    }
+
+    #[test]
+    fn logging_defaults_to_off_under_the_state_dir() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.logging.level, "off");
+        assert!(logging_warnings(&cfg.logging).is_empty());
+        assert_eq!(cfg.logging.path(), crate::diagnostics::default_log_path());
+        assert_eq!(cfg.logging.max_bytes(), 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parses_logging_section() {
+        let toml = r#"
+            [logging]
+            level = "debug"
+            file = "/tmp/sofka-test.log"
+            max_size_mb = 2
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.logging.level, "debug");
+        assert_eq!(cfg.logging.path(), PathBuf::from("/tmp/sofka-test.log"));
+        assert_eq!(cfg.logging.max_bytes(), 2 * 1024 * 1024);
+        assert!(logging_warnings(&cfg.logging).is_empty());
+    }
+
+    #[test]
+    fn logging_bad_level_warns_and_empty_file_falls_back() {
+        let cfg: Config = toml::from_str("[logging]\nlevel = \"chatty\"\nfile = \"\"\n").unwrap();
+        let warnings = logging_warnings(&cfg.logging);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("chatty"), "{warnings:?}");
+        assert!(warnings[1].contains("file is empty"), "{warnings:?}");
+        assert_eq!(cfg.logging.path(), crate::diagnostics::default_log_path());
+    }
+
+    #[test]
+    fn logging_rotation_floor_survives_a_zero() {
+        let cfg: Config = toml::from_str("[logging]\nmax_size_mb = 0\n").unwrap();
+        assert_eq!(cfg.logging.max_bytes(), 64 * 1024);
     }
 
     #[test]

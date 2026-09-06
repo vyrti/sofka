@@ -11,22 +11,7 @@
 use kube::core::DynamicObject;
 use serde_json::Value;
 
-/// Placeholder substituted for any redacted value.
-pub const REDACTED: &str = "«redacted»";
-
-/// Annotation-key substrings that mark a value as credential-like. Matched
-/// case-insensitively against the whole key.
-const CREDENTIAL_HINTS: &[&str] = &[
-    "token",
-    "password",
-    "passwd",
-    "secret",
-    "apikey",
-    "api-key",
-    "credential",
-    "private-key",
-    "privatekey",
-];
+pub use crate::redact::REDACTED;
 
 /// Redact one object's JSON in place, returning human-readable notes of what
 /// was removed (for the bundle manifest). Deterministic and side-effect free.
@@ -43,11 +28,10 @@ pub fn redact_object(kind: &str, v: &mut Value) -> Vec<String> {
         md.remove("managedFields");
         if let Some(ann) = md.get_mut("annotations").and_then(Value::as_object_mut) {
             for (k, val) in ann.iter_mut() {
-                let kl = k.to_lowercase();
                 if k == "kubectl.kubernetes.io/last-applied-configuration" {
                     *val = Value::String(REDACTED.into());
                     notes.push("annotation last-applied-configuration".into());
-                } else if CREDENTIAL_HINTS.iter().any(|h| kl.contains(h)) {
+                } else if crate::redact::is_credential_key(k) {
                     *val = Value::String(REDACTED.into());
                     notes.push(format!("annotation {k}"));
                 }

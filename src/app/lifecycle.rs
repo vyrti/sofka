@@ -795,6 +795,12 @@ impl App {
     pub fn handle_msg(&mut self, msg: Msg) {
         match msg {
             Msg::Reset { generation } if generation == self.generation => {
+                // A reset after the view already synced is the watcher healing
+                // a desync by re-listing — the one place a reconnect is
+                // observable from here.
+                if self.store.synced {
+                    self.watch_reconnects = self.watch_reconnects.saturating_add(1);
+                }
                 // With rows on screen (cached snapshot or established watch)
                 // the store buffers the relist and keeps showing them; only a
                 // genuine clear invalidates what's rendered.
@@ -843,10 +849,12 @@ impl App {
             Msg::Error { generation, error } if generation == self.generation => {
                 self.watch_errors = self.watch_errors.saturating_add(1);
                 self.last_error = Some(error.clone());
+                crate::log_warn!("view.error", kind = self.kind_plural, error = error);
                 self.borrow_status(format!("error: {error}"), true);
             }
             Msg::StateWriteFailed { id, error } => {
                 self.last_state_write_error = Some(error.clone());
+                crate::log_error!("state.write.failed", error = error);
                 self.borrow_status(format!("state not saved: {error}"), true);
                 if let Some(writer) = &self.state_writer {
                     writer.acknowledge_failure(id);
@@ -861,6 +869,7 @@ impl App {
                 self.set_claimed_status(claim, message, err);
             }
             Msg::Panic(error) => {
+                crate::log_error!("task.panic", error = error);
                 self.last_error = Some(error.clone());
                 self.borrow_status(format!("internal error: {error}"), true);
             }

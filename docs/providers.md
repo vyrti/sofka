@@ -81,7 +81,7 @@ contexts = ["prod-eu", "prod-us", "staging"]
 You can also build or edit the fleet from inside the TUI: in the `:ctx`
 switcher, `space` toggles the highlighted context in or out of the fleet
 (members show a `✓`). These marks are saved to `<state-dir>/fleet.toml`
-(`~/.local/state/sofka/fleet.toml` by default; see `sofka --info`) and overlay
+(`~/.local/state/sofka/fleet.toml` by default; see `sofka info`) and overlay
 the `[fleet] contexts` list on every start - sofka never rewrites your config
 file, so the config stays the hand-edited base list and marks can both add to
 it and mask entries out.

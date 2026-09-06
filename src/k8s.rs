@@ -2,9 +2,12 @@
 //! resolution, and async watch streams that feed the in-memory store.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::Duration;
+use std::task::{Context as TaskContext, Poll};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -17,6 +20,7 @@ use kube::{Client, Config, ResourceExt};
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 
+use crate::diagnostics::Op;
 use crate::store::{Msg, row_key};
 
 pub(crate) fn build_client(config: Config) -> Result<Client, kube::Error> {
@@ -37,7 +41,126 @@ pub(crate) fn build_client(config: Config) -> Result<Client, kube::Error> {
         });
     Ok(kube::client::ClientBuilder::try_from(config)?
         .with_layer(&layer)
+        // Outermost, so the measurement covers the whole stack — auth refresh,
+        // TLS, redirects — which is what "the cluster feels slow" means.
+        .with_layer(&MeterLayer)
         .build())
+}
+
+/// Times every Kubernetes API request into [`crate::diagnostics`] and, at
+/// `debug`, logs one line per request.
+///
+/// Latency is measured to response *headers*, not to the end of the body: a
+/// watch's body stays open for the life of the view, and a list's decode time
+/// belongs to us rather than to the API server.
+#[derive(Clone, Copy)]
+struct MeterLayer;
+
+impl<S> tower::Layer<S> for MeterLayer {
+    type Service = Meter<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        Meter { inner }
+    }
+}
+
+#[derive(Clone)]
+struct Meter<S> {
+    inner: S,
+}
+
+impl<S, B> tower::Service<http::Request<kube::client::Body>> for Meter<S>
+where
+    S: tower::Service<http::Request<kube::client::Body>, Response = http::Response<B>>,
+    S::Error: std::fmt::Display,
+    // kube's default stack is a `BoxService`, whose future is already pinned on
+    // the heap. Requiring `Unpin` inherits that and lets the wrapper project
+    // safely, so metering adds no allocation of its own.
+    S::Future: Unpin,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Metered<S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: http::Request<kube::client::Body>) -> Self::Future {
+        let uri = request.uri();
+        let path = uri.path();
+        let op = Op::classify(request.method(), path, uri.query());
+        crate::log_debug!(
+            "request.start",
+            op = op.as_str(),
+            method = request.method(),
+            path = path
+        );
+        Metered {
+            inner: self.inner.call(request),
+            op,
+            start: Instant::now(),
+        }
+    }
+}
+
+/// The in-flight half of [`Meter`]: records the elapsed time once, when the
+/// response (or the error) arrives.
+struct Metered<F> {
+    inner: F,
+    op: Op,
+    start: Instant,
+}
+
+impl<F, B, E> Future for Metered<F>
+where
+    F: Future<Output = Result<http::Response<B>, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        // Safe projection: every field is `Unpin`, so `Self` is too.
+        let this = self.get_mut();
+        let result = match Pin::new(&mut this.inner).poll(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(result) => result,
+        };
+        let elapsed = this.start.elapsed();
+        let ok = result
+            .as_ref()
+            .is_ok_and(|response| !response.status().is_server_error());
+        crate::diagnostics::record(this.op, elapsed, ok);
+        match &result {
+            Ok(response) => crate::log_debug!(
+                "request.done",
+                op = this.op.as_str(),
+                status = response.status().as_u16(),
+                ms = elapsed.as_millis()
+            ),
+            Err(e) => crate::log_warn!(
+                "request.failed",
+                op = this.op.as_str(),
+                ms = elapsed.as_millis(),
+                error = e
+            ),
+        }
+        Poll::Ready(result)
+    }
+}
+
+/// Outcome of [`Cluster::probe_watch`].
+pub enum WatchProbe {
+    /// The resource is not in this cluster's discovery.
+    Unresolved,
+    Ran {
+        /// Time to the initial sync; `None` means it never synced.
+        synced: Option<Duration>,
+        /// Objects in the initial list.
+        objects: usize,
+        errors: usize,
+        last_error: Option<String>,
+    },
 }
 
 /// A resolvable Kubernetes resource type.
@@ -174,10 +297,25 @@ impl Cluster {
         // keep the cluster usable if an unusual API proxy rejects `/version`.
         let version = tokio::time::timeout(VERSION_TIMEOUT, version_client.apiserver_version());
         let (discovery, version) = tokio::join!(cluster.discover(), version);
+        if let Err(e) = &discovery {
+            crate::log_error!(
+                "cluster.connect.failed",
+                context = cluster.context,
+                error = format!("{e:#}")
+            );
+        }
         discovery?;
         if let Ok(Ok(info)) = version {
             cluster.server_version = sanitize_server_version(&info.git_version);
         }
+        crate::log_info!(
+            "cluster.connected",
+            context = cluster.context,
+            cluster = cluster.cluster_name,
+            server = cluster.cluster_url,
+            k8s = cluster.server_version,
+            kinds = cluster.catalog.len()
+        );
         Ok(cluster)
     }
 
@@ -378,6 +516,10 @@ impl Cluster {
             let mut using_streaming =
                 streaming_lists.load(Ordering::Acquire) != STREAMING_UNSUPPORTED;
             let mut initializing = true;
+            // Distinct from `initializing`, which drives the streaming-list
+            // fallback and must keep its current lifetime: this only records
+            // that a full sync has happened, so a later re-list is a reconnect.
+            let mut synced_once = false;
             let mut stream = watcher(
                 api.clone(),
                 if using_streaming {
@@ -388,6 +530,12 @@ impl Cluster {
             )
             .modify(|obj| obj.managed_fields_mut().clear())
             .boxed();
+            crate::log_info!(
+                "watch.start",
+                kind = ar.plural,
+                ns = if ns.is_empty() { "*" } else { ns.as_str() },
+                generation = generation
+            );
             if tx.send(Msg::Reset { generation }).await.is_err() {
                 return;
             }
@@ -416,9 +564,22 @@ impl Cluster {
                         generation,
                         key: row_key(&obj),
                     },
-                    Ok(watcher::Event::Init) => Msg::Reset { generation },
+                    Ok(watcher::Event::Init) => {
+                        if synced_once {
+                            // The watcher healed a desync by re-listing. The
+                            // UI counts this as a reconnect off the same
+                            // message, so nothing extra crosses the channel.
+                            crate::log_info!(
+                                "watch.relist",
+                                kind = ar.plural,
+                                generation = generation
+                            );
+                        }
+                        Msg::Reset { generation }
+                    }
                     Ok(watcher::Event::InitDone) => {
                         initializing = false;
+                        synced_once = true;
                         if using_streaming {
                             // Unsupported is sticky if two startup watches
                             // negotiate concurrently and only one endpoint
@@ -436,17 +597,78 @@ impl Cluster {
                     // (the stream continues with Init/…/InitDone), so the
                     // "too old resource version: Expired" error is routine —
                     // the sync dot already shows the re-list. No error flash.
-                    Err(e) if watch_error_is_benign(&e) => continue,
-                    Err(e) => Msg::Error {
-                        generation,
-                        error: e.to_string(),
-                    },
+                    Err(e) if watch_error_is_benign(&e) => {
+                        crate::log_debug!("watch.desync", kind = ar.plural, error = e);
+                        continue;
+                    }
+                    Err(e) => {
+                        crate::log_warn!("watch.error", kind = ar.plural, error = e);
+                        Msg::Error {
+                            generation,
+                            error: e.to_string(),
+                        }
+                    }
                 };
                 if tx.send(msg).await.is_err() {
                     break; // UI gone
                 }
             }
         })
+    }
+
+    /// Open the watch a launch would open, wait for its initial sync, and
+    /// report what happened. For `sofka info`, which has no session to count
+    /// watches over and so runs one instead.
+    ///
+    /// Discovery working says nothing about whether watches do: a proxy or
+    /// load balancer that closes long-lived connections passes every other
+    /// check and still leaves the TUI with an empty, never-syncing table.
+    pub async fn probe_watch(
+        &self,
+        resource: &str,
+        namespace: &str,
+        timeout: Duration,
+    ) -> WatchProbe {
+        let Some(kind) = self.resolve(resource) else {
+            return WatchProbe::Unresolved;
+        };
+        let ns = if kind.namespaced { namespace } else { "" };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+        let started = std::time::Instant::now();
+        let task = self.spawn_watch(&kind, ns, None, None, 1, tx);
+
+        let mut probe = WatchProbe::Ran {
+            synced: None,
+            objects: 0,
+            errors: 0,
+            last_error: None,
+        };
+        let WatchProbe::Ran {
+            synced,
+            objects,
+            errors,
+            last_error,
+        } = &mut probe
+        else {
+            unreachable!("just constructed")
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        while synced.is_none() {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(Msg::Applied { .. })) => *objects += 1,
+                Ok(Some(Msg::Synced { .. })) => *synced = Some(started.elapsed()),
+                Ok(Some(Msg::Error { error, .. })) => {
+                    *errors += 1;
+                    *last_error = Some(error);
+                }
+                Ok(Some(_)) => {}
+                // The watch task ended without syncing, or the deadline passed.
+                Ok(None) | Err(_) => break,
+            }
+        }
+        // Nothing consumes this stream after the report; don't leave it open.
+        task.abort();
+        probe
     }
 
     /// List namespaces for the namespace switcher.
@@ -531,6 +753,21 @@ pub fn current_context_info() -> Option<(String, String, String)> {
         .and_then(|c| c.server.clone())
         .unwrap_or_default();
     Some((context, cluster_name, server))
+}
+
+/// The namespace a kubeconfig context pins, if any. For the offline
+/// diagnostics report, which has no live client to ask.
+pub fn context_namespace(context: &str) -> Option<String> {
+    let kubeconfig = kube::config::Kubeconfig::read().ok()?;
+    kubeconfig
+        .contexts
+        .iter()
+        .find(|c| c.name == context)?
+        .context
+        .as_ref()?
+        .namespace
+        .clone()
+        .filter(|ns| !ns.is_empty())
 }
 
 /// Public wrapper over [`cluster_name_for`] for resolving per-context config

@@ -27,6 +27,13 @@ timeline.rs  Session-local per-object state-change history diffed from the
 ui.rs        All ratatui rendering: header, table, scrollable views, popups,
              status bar.
 theme.rs     Palette + semantic styles, skin resolution.
+diagnostics.rs Build stamp, state/log/snapshot/bundle directories, the
+             process-wide API request-latency histogram, and the report
+             sections `sofka info` and `:info` both render.
+applog.rs    Structured logging: levels, logfmt rendering, and a bounded queue
+             feeding one writer thread so a stalled disk never stalls the UI.
+redact.rs    What counts as a credential, and how it is stripped from text.
+             Shared by the log, the diagnostics reports, and `bundle.rs`.
 ```
 
 ## Data flow

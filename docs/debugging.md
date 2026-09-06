@@ -153,6 +153,80 @@ capture-and-review workflow.
 
 `:info` shows the version and build, config sources, live context/cluster/API
 server and Kubernetes revision, discovery and Metrics API status, watch error
-counts, and the state/snapshot/bundle directories. `sofka --info` prints the
-static subset without connecting to a cluster. Identifiers and counts only,
-never credentials, tokens, or Secret values.
+and reconnect counts, API request latency, the logging destination, and the
+state/log/snapshot/bundle directories. It also names the active skin and the
+plugins and custom views that loaded.
+
+`sofka info` prints the same report headlessly. It connects briefly - discovery
+and Metrics API status are the half of the report that is not on disk - and
+still prints everything else if the connection fails:
+
+```sh
+sofka info              # connect, report, exit
+sofka info --offline    # no connection: build, config, logging, directories
+```
+
+`:info` reports the running session's watch error and reconnect counts. A
+headless report has no session to count, so it opens one watch instead - the
+same resource and namespace a launch would - and reports whether it establishes,
+how long the initial sync took, and how many objects it returned. Discovery
+working says nothing about whether watches do: a proxy that closes long-lived
+connections passes every other check in this report and still leaves the TUI
+with an empty table. The probe gives up after 5s, which is itself the answer
+when a first view is too slow to be usable.
+
+Identifiers, paths, and counts only, never credentials, tokens, decoded Secret
+values, or plugin inputs. Values that could carry a credential - an API server
+URL with userinfo, an error string echoing a request header - are redacted
+before they are printed.
+
+### Request latency
+
+Every Kubernetes API request is timed and bucketed by class, so "the cluster
+feels slow" becomes a number:
+
+```
+API request latency
+  CLASS        COUNT  ERRORS       AVG       P50       P90       MAX
+  discovery        4       0     182ms     262ms     524ms     341ms
+  watch           12       0      41.2ms    65.5ms   131ms     118ms
+  read            37       1      12.8ms    16.4ms    32.8ms    91.2ms
+```
+
+`watch` is time to response headers - the stream itself stays open for the life
+of the view. Percentiles are bucket upper bounds (powers of two), so read them
+as "at most"; `AVG` and `MAX` are exact.
+
+### Structured logging
+
+Off by default. Turn it on for one run with `SOFKA_LOG`, or in config:
+
+```toml
+[logging]
+level       = "info"   # off (default) | error | warn | info | debug | trace
+# file      = "/tmp/sofka.log"   # default: <state-dir>/logs/sofka.log
+max_size_mb = 8        # rotate to <file>.1 past this size
+```
+
+```sh
+SOFKA_LOG=debug sofka pods    # overrides [logging] level for one run
+tail -f ~/.local/state/sofka/logs/sofka.log
+```
+
+Each event is one logfmt line:
+
+```
+ts=2026-09-06T18:54:31.845Z level=info event=cluster.connected context=prod cluster=eu-1 kinds=214
+ts=2026-09-06T18:54:32.001Z level=info event=watch.start kind=pods ns=default generation=1
+ts=2026-09-06T18:54:38.774Z level=warn event=watch.error kind=pods error="too old resource version"
+```
+
+`info` covers the session shape - startup, connects, watch starts and re-lists.
+`debug` adds one line per API request. `warn` and `error` carry watch failures,
+failed requests, state-write failures, and background-task panics.
+
+Every value is redacted on the way in - bearer tokens, kubeconfig credentials,
+`key=value` pairs whose key looks like a credential, and URL userinfo - so the
+log can be attached to a bug report as it is. Writing happens on its own thread
+behind a bounded queue: a stalled filesystem drops lines (counted in `:info`)
+rather than stalling the UI.

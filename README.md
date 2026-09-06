@@ -106,7 +106,8 @@ Headless modes need no TTY and double as CI smoke tests:
 sofka --check                # connect, run discovery, print a summary, exit
 sofka pods --snapshot        # render one frame of a resource view to stdout
 sofka dp -A --snapshot       # deployments, all namespaces
-sofka --info                 # version/build, config sources, dirs, kubeconfig context
+sofka info                   # runtime diagnostics: build, config, discovery, latency, dirs
+sofka info --offline         # the same report without connecting to a cluster
 ```
 
 ### Keys
@@ -128,7 +129,7 @@ The essentials. `?` in the app shows everything, or see the
 | `X` / `T`            | explain why it's unhealthy / state-change timeline                                                |
 | `s` / `e` / `a`      | shell or scale / edit in `$EDITOR` / attach                                                       |
 | `f`                  | port-forward, in the background (`:pf` manages them)                                              |
-| `t`                  | Flux/ArgoCD menu · CronJob trigger · pod file transfer                                                   |
+| `t`                  | Flux/ArgoCD menu · CronJob trigger · pod file transfer                                            |
 | `r` / `i`            | rollout restart / set container image                                                             |
 | `ctrl-d` / `ctrl-k`  | delete / force-delete (marked rows, or current)                                                   |
 | `S` / `w` / `ctrl-e` | sort picker / wide columns / compact mode                                                         |

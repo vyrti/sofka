@@ -34,11 +34,18 @@ impl Journal {
     /// Record an action. Callers pass only identifiers — never secret input or
     /// decoded Secret values.
     pub fn record(&mut self, context: &str, action: impl Into<String>, target: impl Into<String>) {
+        let (action, target) = (action.into(), target.into());
+        crate::log_info!(
+            "action",
+            context = context,
+            action = action,
+            target = target
+        );
         self.entries.push_back(Entry {
             at: Timestamp::now().as_second(),
             context: context.to_string(),
-            action: action.into(),
-            target: target.into(),
+            action,
+            target,
         });
         while self.entries.len() > MAX_ENTRIES {
             self.entries.pop_front();
