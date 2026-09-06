@@ -9384,6 +9384,33 @@ async fn unsupported_fields_remain_scoped_and_show_api_error() {
     assert!(row_names(&app).is_empty());
 }
 
+/// Column comparisons read the same per-row cell cache the fuzzy path fills,
+/// so a row whose cell changed must not be answered from the previous
+/// rendering.
+#[tokio::test]
+async fn column_comparisons_see_updated_cells_not_cached_ones() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let pod = |state: serde_json::Value| {
+        json!({"apiVersion":"v1","kind":"Pod",
+        "metadata":{"name":"api","namespace":"prod","resourceVersion":"1"},
+        "status":{"phase":"Running","containerStatuses":[
+            {"name":"api","ready":true,"restartCount":0,"state":state}]}})
+    };
+    apply(&mut app, pod(json!({"running":{}})));
+    type_filter(&mut app, "status=Running");
+    assert_eq!(row_names(&app), ["api"]);
+
+    // Same object, new state. A cell answered from the cache would keep it.
+    apply(
+        &mut app,
+        pod(json!({"waiting":{"reason":"CrashLoopBackOff"}})),
+    );
+    assert_eq!(row_names(&app), Vec::<String>::new());
+    retype_filter(&mut app, "status=CrashLoopBackOff");
+    assert_eq!(row_names(&app), ["api"]);
+}
+
 #[tokio::test]
 async fn boolean_groups_short_circuit_and_match_operational_queries() {
     let (mut app, _rx) = test_app();

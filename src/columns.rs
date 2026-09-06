@@ -519,10 +519,9 @@ impl ViewSpec {
             .position(|c| c.header.eq_ignore_ascii_case(header))
     }
 
-    /// The single cell at `idx` for one object. Filter comparisons read one
-    /// column of every object — extracting the full row per object per
-    /// rebuild is what this avoids. Curated JSON/name cells borrow from
-    /// `obj`; user columns and computed curated cells remain owned.
+    /// The single cell at `idx` for one object, without rendering the rest
+    /// of the row. Curated JSON/name cells borrow from `obj`; user columns
+    /// and computed curated cells remain owned.
     pub fn cell_at<'a>(
         &self,
         obj: &'a DynamicObject,
