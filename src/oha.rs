@@ -102,6 +102,8 @@ fn is_executable(path: &Path) -> bool {
 pub struct Options {
     pub duration: Duration,
     pub connections: u32,
+    /// Which declared port to benchmark. `None` picks one (see [`choose_port`]).
+    pub port: Option<u16>,
 }
 
 impl Default for Options {
@@ -109,6 +111,7 @@ impl Default for Options {
         Self {
             duration: DEFAULT_DURATION,
             connections: DEFAULT_CONNECTIONS,
+            port: None,
         }
     }
 }
@@ -124,19 +127,35 @@ impl Options {
 /// every failure is reported before a process is spawned.
 pub fn parse_options(args: &str) -> Result<Options, String> {
     let mut options = Options::default();
-    let mut parts = args.split_whitespace();
-    if let Some(raw) = parts.next() {
+    // `port=` is named rather than positional so it can be given alone, and
+    // so a bare number is never ambiguous between a duration and a port.
+    let mut positional = Vec::new();
+    for token in args.split_whitespace() {
+        match token.strip_prefix("port=") {
+            Some(raw) => options.port = Some(parse_port(raw)?),
+            None => positional.push(token),
+        }
+    }
+    let mut positional = positional.into_iter();
+    if let Some(raw) = positional.next() {
         options.duration = parse_duration(raw)?;
     }
-    if let Some(raw) = parts.next() {
+    if let Some(raw) = positional.next() {
         options.connections = parse_connections(raw)?;
     }
-    if let Some(extra) = parts.next() {
+    if let Some(extra) = positional.next() {
         return Err(format!(
-            "unexpected argument '{extra}' — usage: :oha [duration] [connections]"
+            "unexpected argument '{extra}' — usage: :oha [duration] [connections] [port=N]"
         ));
     }
     Ok(options)
+}
+
+fn parse_port(raw: &str) -> Result<u16, String> {
+    raw.parse()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| format!("invalid port '{raw}'"))
 }
 
 fn parse_duration(raw: &str) -> Result<Duration, String> {
@@ -247,16 +266,62 @@ impl Route {
 
 /// Resolve what to benchmark for the selected object. Returns the address the
 /// object advertises (if any) plus the forward that can reach it regardless.
-pub fn plan(kind_plural: &str, name: &str, data: &Value) -> Result<Plan, String> {
+pub fn plan(
+    kind_plural: &str,
+    name: &str,
+    data: &Value,
+    port: Option<u16>,
+) -> Result<Plan, String> {
     match kind_plural {
-        "ingresses" => ingress_plan(data),
-        "services" => service_plan(name, data),
-        "pods" => pod_plan(name, data),
+        "ingresses" => ingress_plan(data, port),
+        "services" => service_plan(name, data, port),
+        "pods" => pod_plan(name, data, port),
         _ => Err("benchmark applies to ingresses/services/pods".into()),
     }
 }
 
-fn ingress_plan(data: &Value) -> Result<Plan, String> {
+/// Read a port number out of one `ports[]` entry.
+fn port_number(spec: &Value, key: &str) -> Option<u16> {
+    spec.get(key)
+        .and_then(Value::as_i64)
+        .and_then(|port| u16::try_from(port).ok())
+}
+
+/// Whether this entry says it speaks HTTP, by `appProtocol` or by the
+/// conventional port name.
+fn declares_http(spec: &Value) -> bool {
+    let declared = spec
+        .get("appProtocol")
+        .and_then(Value::as_str)
+        .or_else(|| spec.get("name").and_then(Value::as_str))
+        .unwrap_or_default();
+    declared.eq_ignore_ascii_case("http") || declared.eq_ignore_ascii_case("https")
+}
+
+/// Choose the port to benchmark. An explicit `port=N` wins and must exist,
+/// so a typo fails loudly instead of forwarding to nothing. Otherwise prefer
+/// a port that declares HTTP — a service exposing `grpc` before `http` would
+/// otherwise be benchmarked on the wrong one, and a TCP probe cannot tell the
+/// difference — and fall back to the first declared port.
+fn choose_port<'a>(ports: &'a [Value], key: &str, wanted: Option<u16>) -> Option<&'a Value> {
+    match wanted {
+        Some(wanted) => ports.iter().find(|p| port_number(p, key) == Some(wanted)),
+        None => ports
+            .iter()
+            .find(|p| declares_http(p))
+            .or_else(|| ports.first()),
+    }
+}
+
+/// The declared ports of `data` at `pointer`, as a slice.
+fn declared_ports<'a>(data: &'a Value, pointer: &str) -> &'a [Value] {
+    data.pointer(pointer)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+fn ingress_plan(data: &Value, port: Option<u16>) -> Result<Plan, String> {
     let rule = data.pointer("/spec/rules/0");
     let host = rule
         .and_then(|r| r.get("host"))
@@ -273,7 +338,7 @@ fn ingress_plan(data: &Value) -> Result<Plan, String> {
         direct: Some(Target {
             scheme: if secure { "https" } else { "http" },
             host,
-            port: if secure { 443 } else { 80 },
+            port: port.unwrap_or(if secure { 443 } else { 80 }),
             path: normalize_path(path),
         }),
         // An ingress is fronted by a controller, not by one forwardable pod.
@@ -317,15 +382,18 @@ fn load_balancer_host(data: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn service_plan(name: &str, data: &Value) -> Result<Plan, String> {
-    let spec_port = data
-        .pointer("/spec/ports/0")
-        .ok_or("service exposes no ports")?;
-    let port = spec_port
-        .get("port")
-        .and_then(Value::as_i64)
-        .and_then(|p| u16::try_from(p).ok())
-        .ok_or("service port is not a valid port number")?;
+fn service_plan(name: &str, data: &Value, wanted: Option<u16>) -> Result<Plan, String> {
+    let ports = declared_ports(data, "/spec/ports");
+    if ports.is_empty() {
+        return Err("service exposes no ports".into());
+    }
+    let spec_port = choose_port(ports, "port", wanted).ok_or_else(|| {
+        format!(
+            "port {} is not declared by this service",
+            wanted.unwrap_or_default()
+        )
+    })?;
+    let port = port_number(spec_port, "port").ok_or("service port is not a valid port number")?;
     let scheme = port_scheme(port, spec_port);
     let path = "/".to_string();
     // A load-balancer address is externally routable; a cluster IP may be too
@@ -353,18 +421,23 @@ fn service_plan(name: &str, data: &Value) -> Result<Plan, String> {
     })
 }
 
-fn pod_plan(name: &str, data: &Value) -> Result<Plan, String> {
-    let container_port = data
-        .pointer("/spec/containers")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find_map(|c| c.pointer("/ports/0"))
-        .ok_or("pod declares no container ports")?;
-    let port = container_port
-        .get("containerPort")
-        .and_then(Value::as_i64)
-        .and_then(|p| u16::try_from(p).ok())
+fn pod_plan(name: &str, data: &Value, wanted: Option<u16>) -> Result<Plan, String> {
+    // Every container's ports are candidates, not just the first container's.
+    let ports: Vec<Value> = declared_ports(data, "/spec/containers")
+        .iter()
+        .flat_map(|c| declared_ports(c, "/ports"))
+        .cloned()
+        .collect();
+    if ports.is_empty() {
+        return Err("pod declares no container ports".into());
+    }
+    let container_port = choose_port(&ports, "containerPort", wanted).ok_or_else(|| {
+        format!(
+            "port {} is not declared by this pod",
+            wanted.unwrap_or_default()
+        )
+    })?;
+    let port = port_number(container_port, "containerPort")
         .ok_or("container port is not a valid port number")?;
     let scheme = port_scheme(port, container_port);
     let path = "/".to_string();
@@ -1185,6 +1258,7 @@ mod tests {
             Options {
                 duration: Duration::from_secs(30),
                 connections: 20,
+                port: None,
             }
         );
         assert_eq!(
@@ -1192,6 +1266,7 @@ mod tests {
             Options {
                 duration: Duration::from_secs(120),
                 connections: 100,
+                port: None,
             }
         );
         // A bare number is seconds.
@@ -1226,7 +1301,7 @@ mod tests {
                 }]
             }
         });
-        let plan = plan("ingresses", "web", &obj).unwrap();
+        let plan = plan("ingresses", "web", &obj, None).unwrap();
         let direct = plan.direct.unwrap();
         assert_eq!(direct.url(), "https://app.example.com:443/api");
         // An ingress is fronted by a controller, not one forwardable pod.
@@ -1236,7 +1311,10 @@ mod tests {
     #[test]
     fn ingress_without_tls_falls_back_to_http_and_root() {
         let obj = json!({"spec": {"rules": [{"host": "app.example.com"}]}});
-        let direct = plan("ingresses", "web", &obj).unwrap().direct.unwrap();
+        let direct = plan("ingresses", "web", &obj, None)
+            .unwrap()
+            .direct
+            .unwrap();
         assert_eq!(direct.url(), "http://app.example.com:80/");
     }
 
@@ -1246,7 +1324,10 @@ mod tests {
             "spec": {"rules": [{"http": {"paths": [{"path": "/"}]}}]},
             "status": {"loadBalancer": {"ingress": [{"ip": "10.0.0.5"}]}}
         });
-        let direct = plan("ingresses", "web", &obj).unwrap().direct.unwrap();
+        let direct = plan("ingresses", "web", &obj, None)
+            .unwrap()
+            .direct
+            .unwrap();
         assert_eq!(direct.host, "10.0.0.5");
     }
 
@@ -1273,7 +1354,7 @@ mod tests {
             "spec": {"type": "LoadBalancer", "clusterIP": "10.96.0.12", "ports": [{"port": 80}]},
             "status": {"loadBalancer": {"ingress": [{"hostname": "lb.example.com"}]}}
         });
-        let plan = plan("services", "web", &obj).unwrap();
+        let plan = plan("services", "web", &obj, None).unwrap();
         assert_eq!(plan.direct.unwrap().url(), "http://lb.example.com:80/");
         let forward = plan.forward.unwrap();
         assert_eq!(forward.arg, "svc/web");
@@ -1284,7 +1365,7 @@ mod tests {
     fn cluster_ip_is_still_worth_probing_but_headless_is_not() {
         let routable = json!({"spec": {"clusterIP": "10.96.0.12", "ports": [{"port": 8080}]}});
         assert_eq!(
-            plan("services", "web", &routable)
+            plan("services", "web", &routable, None)
                 .unwrap()
                 .direct
                 .unwrap()
@@ -1292,7 +1373,7 @@ mod tests {
             "10.96.0.12"
         );
         let headless = json!({"spec": {"clusterIP": "None", "ports": [{"port": 8080}]}});
-        let plan = plan("services", "web", &headless).unwrap();
+        let plan = plan("services", "web", &headless, None).unwrap();
         assert!(plan.direct.is_none());
         // No address of its own, but the forward still reaches it.
         assert!(plan.forward.is_some());
@@ -1302,7 +1383,7 @@ mod tests {
     fn https_is_inferred_from_app_protocol_name_or_well_known_port() {
         let by_protocol = json!({"spec": {"clusterIP": "10.0.0.1", "ports": [{"port": 8080, "appProtocol": "https"}]}});
         assert_eq!(
-            plan("services", "s", &by_protocol)
+            plan("services", "s", &by_protocol, None)
                 .unwrap()
                 .direct
                 .unwrap()
@@ -1312,7 +1393,7 @@ mod tests {
         let by_name =
             json!({"spec": {"clusterIP": "10.0.0.1", "ports": [{"port": 9000, "name": "https"}]}});
         assert_eq!(
-            plan("services", "s", &by_name)
+            plan("services", "s", &by_name, None)
                 .unwrap()
                 .direct
                 .unwrap()
@@ -1321,7 +1402,7 @@ mod tests {
         );
         let by_port = json!({"spec": {"clusterIP": "10.0.0.1", "ports": [{"port": 443}]}});
         assert_eq!(
-            plan("services", "s", &by_port)
+            plan("services", "s", &by_port, None)
                 .unwrap()
                 .direct
                 .unwrap()
@@ -1330,7 +1411,7 @@ mod tests {
         );
         let plain = json!({"spec": {"clusterIP": "10.0.0.1", "ports": [{"port": 80}]}});
         assert_eq!(
-            plan("services", "s", &plain)
+            plan("services", "s", &plain, None)
                 .unwrap()
                 .direct
                 .unwrap()
@@ -1340,12 +1421,120 @@ mod tests {
     }
 
     #[test]
+    fn a_multi_port_service_is_benchmarked_on_the_port_that_declares_http() {
+        // grpc is declared first; a TCP probe cannot tell it is the wrong one.
+        let obj = json!({
+            "spec": {
+                "clusterIP": "10.96.0.12",
+                "ports": [
+                    {"name": "grpc", "port": 9000},
+                    {"name": "http", "port": 8080}
+                ]
+            }
+        });
+        let plan = plan("services", "web", &obj, None).unwrap();
+        assert_eq!(plan.direct.unwrap().port, 8080);
+        assert_eq!(plan.forward.unwrap().remote_port, 8080);
+    }
+
+    #[test]
+    fn app_protocol_also_identifies_the_http_port() {
+        let obj = json!({
+            "spec": {
+                "clusterIP": "10.96.0.12",
+                "ports": [
+                    {"name": "metrics", "port": 9090},
+                    {"appProtocol": "https", "port": 8443}
+                ]
+            }
+        });
+        let direct = plan("services", "web", &obj, None).unwrap().direct.unwrap();
+        assert_eq!(direct.port, 8443);
+        assert_eq!(direct.scheme, "https");
+    }
+
+    #[test]
+    fn without_any_http_hint_the_first_declared_port_is_used() {
+        let obj = json!({
+            "spec": {
+                "clusterIP": "10.96.0.12",
+                "ports": [{"port": 9000}, {"port": 8080}]
+            }
+        });
+        let direct = plan("services", "web", &obj, None).unwrap().direct.unwrap();
+        assert_eq!(direct.port, 9000);
+    }
+
+    #[test]
+    fn an_explicit_port_overrides_the_choice_and_must_exist() {
+        let obj = json!({
+            "spec": {
+                "clusterIP": "10.96.0.12",
+                "ports": [{"name": "http", "port": 8080}, {"name": "admin", "port": 9000}]
+            }
+        });
+        let plan_admin = plan("services", "web", &obj, Some(9000)).unwrap();
+        assert_eq!(plan_admin.direct.unwrap().port, 9000);
+        assert_eq!(plan_admin.forward.unwrap().remote_port, 9000);
+        // A port the object does not declare fails loudly rather than
+        // forwarding to something that cannot answer.
+        let error = plan("services", "web", &obj, Some(1234)).unwrap_err();
+        assert!(error.contains("not declared by this service"), "{error}");
+    }
+
+    #[test]
+    fn a_pods_http_port_is_found_across_all_containers() {
+        let obj = json!({
+            "spec": {"containers": [
+                {"name": "sidecar", "ports": [{"name": "grpc", "containerPort": 9000}]},
+                {"name": "app", "ports": [{"name": "http", "containerPort": 8080}]}
+            ]},
+            "status": {"podIP": "10.244.1.7"}
+        });
+        let chosen = plan("pods", "api-0", &obj, None).unwrap();
+        assert_eq!(chosen.direct.unwrap().port, 8080);
+        let error = plan("pods", "api-0", &obj, Some(1234)).unwrap_err();
+        assert!(error.contains("not declared by this pod"), "{error}");
+    }
+
+    #[test]
+    fn an_explicit_ingress_port_replaces_the_scheme_default() {
+        let obj = json!({"spec": {"rules": [{"host": "app.example.com"}]}});
+        let direct = plan("ingresses", "web", &obj, Some(8080))
+            .unwrap()
+            .direct
+            .unwrap();
+        assert_eq!(direct.url(), "http://app.example.com:8080/");
+    }
+
+    #[test]
+    fn a_named_port_argument_is_position_independent() {
+        assert_eq!(parse_options("port=8080").unwrap().port, Some(8080));
+        assert_eq!(
+            parse_options("30s 100 port=8080").unwrap(),
+            Options {
+                duration: Duration::from_secs(30),
+                connections: 100,
+                port: Some(8080),
+            }
+        );
+        // Named, so a bare number is never ambiguous with a duration.
+        assert_eq!(
+            parse_options("port=8080 30s").unwrap().duration,
+            Duration::from_secs(30)
+        );
+        assert!(parse_options("port=0").is_err());
+        assert!(parse_options("port=nope").is_err());
+        assert!(parse_options("port=99999").is_err());
+    }
+
+    #[test]
     fn pod_uses_its_ip_and_first_container_port() {
         let obj = json!({
             "spec": {"containers": [{"ports": [{"containerPort": 8080}]}]},
             "status": {"podIP": "10.244.1.7"}
         });
-        let plan = plan("pods", "api-0", &obj).unwrap();
+        let plan = plan("pods", "api-0", &obj, None).unwrap();
         assert_eq!(plan.direct.unwrap().url(), "http://10.244.1.7:8080/");
         assert_eq!(plan.forward.unwrap().arg, "pod/api-0");
     }
@@ -1363,9 +1552,9 @@ mod tests {
 
     #[test]
     fn unsupported_kinds_and_portless_objects_are_refused() {
-        assert!(plan("deployments", "web", &json!({})).is_err());
-        assert!(plan("services", "web", &json!({"spec": {}})).is_err());
-        assert!(plan("pods", "web", &json!({"spec": {"containers": []}})).is_err());
+        assert!(plan("deployments", "web", &json!({}), None).is_err());
+        assert!(plan("services", "web", &json!({"spec": {}}), None).is_err());
+        assert!(plan("pods", "web", &json!({"spec": {"containers": []}}), None).is_err());
     }
 
     #[test]
@@ -1377,6 +1566,7 @@ mod tests {
             Options {
                 duration: Duration::from_secs(30),
                 connections: 100,
+                port: None,
             },
         );
         let args = command.as_std().get_args().collect::<Vec<_>>();
@@ -1532,6 +1722,7 @@ mod tests {
             options: Options {
                 duration: Duration::from_secs(2),
                 connections: 5,
+                port: None,
             },
             existing_local_port: None,
             forward_argv: Vec::new(),

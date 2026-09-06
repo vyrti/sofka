@@ -20,7 +20,7 @@ impl App {
         let selection = self.selected_ref().map(|obj| {
             let name = obj.metadata.name.clone().unwrap_or_default();
             let namespace = obj.metadata.namespace.clone().unwrap_or_default();
-            let plan = crate::oha::plan(&self.kind_plural, &name, &obj.data);
+            let plan = crate::oha::plan(&self.kind_plural, &name, &obj.data, options.port);
             (name, namespace, plan)
         });
         let Some((name, namespace, plan)) = selection else {

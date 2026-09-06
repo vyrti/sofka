@@ -2139,7 +2139,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         lines.insert(
             10,
             bind(
-                ":oha [dur] [conns]",
+                ":oha [dur] [conns] [port=N]",
                 "benchmark the selected ingress/service/pod (optional oha CLI)",
             ),
         );

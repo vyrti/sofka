@@ -67,7 +67,7 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 
 ## Metrics and health
 
-- **HTTP benchmarking** (`:oha [duration] [connections]`) - when `oha` is
+- **HTTP benchmarking** (`:oha [duration] [connections] [port=N]`) - when `oha` is
   executable on `PATH`, load-test the selected ingress, service or pod and show
   the parsed JSON report in a searchable document view. The address the object
   advertises (ingress host, load-balancer address, cluster IP, pod IP) is probed
@@ -75,7 +75,10 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   nothing answers does sofka reuse a running `f` port-forward, or open a
   temporary one that is torn down with the run. Defaults to a deliberately gentle
   10s / 20 connections, capped at 5m and 200k connections, and validated before
-  any process starts. Availability is checked at startup and rescanned by
+  any process starts. On a multi-port object the port that declares HTTP (by
+  `appProtocol` or the conventional port name) is preferred over the first
+  declared one; `port=N` overrides that, and must name a port the object
+  actually declares. Availability is checked at startup and rescanned by
   `:reload`.
 - **Live CPU and MEM columns** for pods and nodes from the metrics API, colored
   on unusual values. Nodes also get **%CPU and %MEM of allocatable**
