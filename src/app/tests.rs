@@ -11445,3 +11445,118 @@ async fn faults_filter_combines_with_text_and_tracks_watch_updates() {
     app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
     assert!(app.faults_only);
 }
+
+#[tokio::test]
+async fn configured_ctrl_z_actions_take_precedence_over_faults() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    app.bookmarks = vec![crate::config::Bookmark {
+        key: Some("ctrl-z".into()),
+        name: "services".into(),
+        resource: "services".into(),
+        ..Default::default()
+    }];
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.kind_plural, "services");
+    assert!(!app.faults_only);
+
+    app.bookmarks.clear();
+    app.switch_kind("pods");
+    app.workspaces = vec![crate::config::Workspace {
+        key: Some("ctrl-z".into()),
+        name: "ops".into(),
+        context: None,
+        views: vec![crate::config::WorkspaceView {
+            name: "services".into(),
+            resource: "services".into(),
+            ..Default::default()
+        }],
+    }];
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.kind_plural, "services");
+    assert!(!app.faults_only);
+
+    app.workspaces.clear();
+    app.switch_kind("pods");
+    app.readonly = true;
+    app.plugins = vec![crate::config::Plugin {
+        key: "ctrl-z".into(),
+        name: "custom".into(),
+        command: "true".into(),
+        scopes: vec!["pods".into()],
+        ..Default::default()
+    }];
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert!(app.flash.contains("read-only"));
+    assert!(!app.faults_only);
+    app.plugins[0].scopes = vec!["services".into()];
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert!(app.faults_only);
+}
+
+#[tokio::test]
+async fn faults_watch_changes_preserve_pod_identity_or_clear_selection() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for name in ["b", "c", "d"] {
+        let mut pod = faults_test_pod(name);
+        pod["metadata"]["uid"] = json!(name);
+        pod["status"]["phase"] = json!("Pending");
+        apply(&mut app, pod);
+    }
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    assert_eq!(
+        app.selected_ref().unwrap().metadata.name.as_deref(),
+        Some("c")
+    );
+
+    let mut earlier = faults_test_pod("a");
+    earlier["status"]["phase"] = json!("Pending");
+    apply(&mut app, earlier);
+    assert_eq!(app.table_state.selected(), Some(2));
+    assert_eq!(
+        app.selected_ref().unwrap().metadata.name.as_deref(),
+        Some("c")
+    );
+
+    let mut recovered = faults_test_pod("b");
+    recovered["metadata"]["uid"] = json!("b");
+    recovered["metadata"]["resourceVersion"] = json!("2");
+    apply(&mut app, recovered);
+    assert_eq!(app.table_state.selected(), Some(1));
+    assert_eq!(
+        app.selected_ref().unwrap().metadata.name.as_deref(),
+        Some("c")
+    );
+
+    let mut recovered = faults_test_pod("c");
+    recovered["metadata"]["uid"] = json!("c");
+    recovered["metadata"]["resourceVersion"] = json!("2");
+    apply(&mut app, recovered);
+    assert!(app.selected_ref().is_none());
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.table_state.selected(), None);
+    app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+    assert_ne!(app.mode, Mode::Confirm);
+
+    app.handle_key(press(KeyCode::End)).unwrap();
+    assert_eq!(
+        app.selected_ref().unwrap().metadata.name.as_deref(),
+        Some("d")
+    );
+    let mut replacement = faults_test_pod("d");
+    replacement["metadata"]["uid"] = json!("replacement");
+    replacement["metadata"]["resourceVersion"] = json!("2");
+    replacement["status"]["phase"] = json!("Pending");
+    apply(&mut app, replacement);
+    assert_eq!(app.table_state.selected(), None);
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    let key = row_key(app.selected_ref().unwrap());
+    app.handle_msg(Msg::Deleted {
+        generation: app.generation,
+        key,
+    });
+    assert_eq!(app.table_state.selected(), None);
+}

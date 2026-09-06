@@ -64,6 +64,12 @@ impl App {
                         && self.kind_plural == "pods"
                         && key.modifiers == KeyModifiers::CONTROL =>
                 {
+                    if self.try_bookmark_key(key)
+                        || self.try_workspace_key(key)
+                        || self.try_plugin_key(key)
+                    {
+                        return Ok(());
+                    }
                     self.faults_only = !self.faults_only;
                     self.invalidate_rows();
                     self.table_state.select(Some(0));

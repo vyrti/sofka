@@ -21,7 +21,7 @@ pickers keep both characters available as input.
 | `ctrl-e`                                      | compact mode: collapse the header + footer (for tiled/multiplexed panes)                                                                                      |
 | `space`                                       | mark/unmark row for bulk actions                                                                                                                              |
 | `/`                                           | filter: fuzzy text · `!inverse` · `-l`/`-f` selectors (server-side on ⏎) · `status=X` `cpu>500m` `age<2h`                                                     |
-| `Ctrl+Z`                                      | toggle faults filter in pod views; combine with `/`; press again to turn off                                                                                  |
+| `Ctrl+Z`                                      | toggle faults filter in pod views; configured actions take precedence; combine with `/`; press again to turn off                                              |
 | `n` / `0`                                     | namespace switcher / all namespaces                                                                                                                           |
 | `shift-j`                                     | jump to owner/controller                                                                                                                                      |
 | `o`                                           | show the node the selected row names (pods built in; other kinds via `[views."…"].node`)                                                                      |
