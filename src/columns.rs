@@ -512,10 +512,14 @@ impl ViewSpec {
     }
 
     /// Whether column `idx` can render a different value for the *same* object
-    /// revision — the elapsed-time cells [`volatile_cell`] recomputes, and user
-    /// `time` columns. Object-independent (and deliberately conservative about
+    /// revision: every extractor that reads the clock, plus user `time`
+    /// columns. Object-independent (and deliberately conservative about
     /// `jobs`/DURATION, which depends on the object), so a caller can decide
     /// once per view whether a cached cell may be reused.
+    ///
+    /// Wider than [`volatile_cell`]: helm UPDATED is elapsed time too, but it
+    /// is recomputed by re-running the extractor (which decodes the release
+    /// payload) rather than by the per-frame cheap path.
     pub fn volatile_column(&self, plural: &str, idx: usize) -> bool {
         let Some(col) = self.columns.get(idx) else {
             return false;
@@ -524,7 +528,11 @@ impl ViewSpec {
             SpecSource::User(uc) => uc.kind == crate::views::ColumnKind::Time,
             SpecSource::Curated(_) => matches!(
                 (plural, col.header.as_str()),
-                (_, "AGE") | ("jobs", "DURATION") | ("cronjobs", "LAST-SCHEDULE")
+                (_, "AGE")
+                    | ("jobs", "DURATION")
+                    | ("cronjobs", "LAST-SCHEDULE")
+                    | ("helm", "UPDATED")
+                    | ("helmhistory", "UPDATED")
             ),
         }
     }

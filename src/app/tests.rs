@@ -6890,6 +6890,45 @@ async fn header_click_in_a_narrow_terminal_sorts_the_column_it_hits() {
     );
 }
 
+/// helm UPDATED is elapsed time, so a comparison filter has to read it live.
+/// Classifying it as cacheable let the filter compare against whatever the
+/// cell cache held when it was warmed, and a release the filter should now
+/// admit stayed hidden until the Secret changed revision.
+#[tokio::test]
+async fn helm_updated_filter_reads_the_live_elapsed_value() {
+    let (mut app, _rx) = test_app();
+    app.open_helm_releases();
+    let deployed = k8s_openapi::jiff::Timestamp::now().to_string();
+    apply(
+        &mut app,
+        helm_release_secret_deployed_at("myapp", "default", 1, "deployed", &deployed),
+    );
+
+    // Warms the cell cache with UPDATED as it reads now, and the release is
+    // genuinely outside the filter at this instant.
+    type_filter(&mut app, "updated>1");
+    assert!(
+        row_names(&app).is_empty(),
+        "just-deployed release is not older than 1s yet"
+    );
+
+    // Time passes. The Secret does not change, so the cached cell survives.
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    type_filter(&mut app, "updated>1");
+
+    let releases: Vec<&str> = app
+        .rows()
+        .iter()
+        .filter_map(|o| crate::helm::release_name(o))
+        .collect();
+    assert_eq!(
+        releases,
+        vec!["myapp"],
+        "UPDATED must be compared live, not against the warmed cell"
+    );
+}
+
 #[tokio::test]
 async fn helm_filter_matches_release_name_not_secret_name() {
     let (mut app, _rx) = test_app();
