@@ -14,8 +14,10 @@ pub const MAX_BYTES: usize = 1 << 20;
 pub const MAX_LINES: usize = 5_000;
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Input {
+    /// Inline configuration ignores unknown fields. Package validation rejects them.
+    #[serde(flatten)]
+    unknown_fields: BTreeMap<String, toml::Value>,
     #[serde(rename = "type")]
     pub kind: String,
     pub default: Option<String>,
@@ -236,6 +238,9 @@ pub fn validate_plugin(plugin: &Plugin) -> Result<(), String> {
         return Err("packages must use an executable adapter, not shell = true".into());
     }
     for (name, spec) in &plugin.inputs {
+        if let Some(field) = spec.unknown_fields.keys().next() {
+            return Err(format!("unknown field {field:?} in plugin input {name:?}"));
+        }
         if name.is_empty()
             || !name
                 .bytes()
@@ -653,6 +658,12 @@ mod tests {
                 .unwrap_err()
                 .contains("unknown field")
         );
+        let nested_error = package(&format!(
+            "{valid}[plugin.inputs.count]\ntype = 'integer'\ndefault = '2'\nobsolete_option = true\n"
+        ))
+        .unwrap_err();
+        assert!(nested_error.contains("unknown field \"obsolete_option\""));
+        assert!(nested_error.contains("plugin input \"count\""));
         assert!(
             package(&valid.replace("palette = 'demo'", "palette = 'ctx'"))
                 .unwrap_err()

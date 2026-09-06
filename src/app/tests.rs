@@ -10322,9 +10322,18 @@ async fn plugin_timeout_is_visible_through_the_command_path() {
 
 #[tokio::test]
 async fn unknown_inline_plugin_fields_preserve_base_and_override_settings() {
+    check_unknown_inline_fields("plugin").await;
+}
+
+#[tokio::test]
+async fn unknown_inline_input_fields_preserve_base_and_override_settings() {
+    check_unknown_inline_fields("input").await;
+}
+
+async fn check_unknown_inline_fields(location: &str) {
     for layer in ["base", "cluster", "context"] {
         let dir = std::env::temp_dir().join(format!(
-            "sofka-inline-plugin-compat-{}-{layer}",
+            "sofka-inline-plugin-compat-{}-{layer}-{location}",
             std::process::id()
         ));
         write_config(&dir, "readonly = false\n");
@@ -10335,7 +10344,7 @@ async fn unknown_inline_plugin_fields_preserve_base_and_override_settings() {
         };
         write_config(
             &config_dir,
-            r#"
+            &r#"
             readonly = true
             favorite_namespaces = ["safe"]
             [aliases]
@@ -10344,14 +10353,37 @@ async fn unknown_inline_plugin_fields_preserve_base_and_override_settings() {
             name = "Compatible plugin"
             palette = "compatible-plugin"
             command = "echo"
+            args = ["${input.count}"]
             mutating = false
-            obsolete_option = true
+            PLUGIN_EXTRA
+            [plugins.inputs.count]
+            type = "integer"
+            default = "2"
+            min = 1
+            max = 5
+            INPUT_EXTRA
             [[plugins]]
             name = "Other plugin"
             key = "ctrl-g"
             command = "echo"
             mutating = false
-        "#,
+        "#
+            .replace(
+                "PLUGIN_EXTRA",
+                if location == "plugin" {
+                    "obsolete_option = true"
+                } else {
+                    ""
+                },
+            )
+            .replace(
+                "INPUT_EXTRA",
+                if location == "input" {
+                    "obsolete_option = true"
+                } else {
+                    ""
+                },
+            ),
         );
         let (mut app, _rx) = app_with_pod();
         app.cluster.cluster_name = "test-cluster".into();
@@ -10375,10 +10407,16 @@ async fn unknown_inline_plugin_fields_preserve_base_and_override_settings() {
             app.config_warnings
         );
         plugin_command(&mut app, "compatible-plugin");
+        let Some(Suspend::Shell(argv)) = app.pending.take() else {
+            panic!("{layer}: inline plugin did not run");
+        };
+        assert_eq!(argv, ["echo", "2"]);
+        plugin_command(&mut app, "compatible-plugin count=6");
         assert!(
-            matches!(app.pending, Some(Suspend::Shell(_))),
-            "{layer}: inline plugin did not run"
+            app.pending.is_none(),
+            "{layer}: input limits must still apply"
         );
+        assert!(app.flash.contains("outside range"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

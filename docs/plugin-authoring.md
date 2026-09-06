@@ -63,8 +63,8 @@ It does not run adapters during package discovery.
 It checks package directories in name order.
 An invalid package does not stop other packages.
 The `:config` view shows package errors.
-Package manifests reject unknown fields.
-Inline plugin entries ignore unknown fields to preserve compatibility with existing configurations.
+Package manifests reject unknown fields, including fields in input definitions.
+Inline plugin entries and their input definitions ignore unknown fields to preserve existing configuration.
 
 An inline `[[plugins]]` entry has priority over a package with the same name or command.
 The first package has priority over a later duplicate.
