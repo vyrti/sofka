@@ -167,6 +167,7 @@ const NODE_COLUMNS: &[Column] = &[
     column("ROLES", col_node_roles),
     column("TAINTS", col_node_taints),
     column("VERSION", col_node_version),
+    wide_column("LABELS", col_node_labels),
     column("AGE", col_age),
 ];
 
@@ -899,6 +900,25 @@ fn col_node_taints<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
 
 fn col_node_version<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     Cow::Borrowed(sget(ctx.data, &["status", "nodeInfo", "kubeletVersion"]).unwrap_or_default())
+}
+
+fn col_node_labels<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    let Some(labels) = ctx
+        .obj
+        .metadata
+        .labels
+        .as_ref()
+        .filter(|labels| !labels.is_empty())
+    else {
+        return Cow::Borrowed("<none>");
+    };
+    Cow::Owned(
+        labels
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
 }
 
 fn col_namespace_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {

@@ -21,7 +21,8 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   scrolling does not move the columns.
 - **Custom views** - define columns for any resource in the config file. An
   unknown custom resource picks up its CRD `additionalPrinterColumns`
-  automatically. `w` toggles wide-only columns (kubectl `-o wide`). See
+  automatically. `w` toggles wide-only columns (kubectl `-o wide`), including
+  node labels. See
   [Views and thresholds](views.md).
 - **Drill-down navigation** with a breadcrumb stack: workload/service → pods,
   cronjob → its jobs, node → its pods, pod → containers, namespace → re-scope,

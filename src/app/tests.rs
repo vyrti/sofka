@@ -8741,6 +8741,73 @@ async fn user_view_adds_provider_label_columns_to_curated_nodes() {
 }
 
 #[tokio::test]
+async fn node_wide_labels_render_filter_and_refresh() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("nodes");
+    let narrow_headers = app.display_headers().to_vec();
+    assert!(!narrow_headers.iter().any(|header| header == "LABELS"));
+    for (name, labels) in [
+        (
+            "worker-1",
+            json!({"zone": "west", "karpenter.sh/nodepool": "general", "empty": ""}),
+        ),
+        ("worker-2", json!({})),
+        ("worker-3", Value::Null),
+    ] {
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1", "kind": "Node",
+                "metadata": {"name": name, "resourceVersion": "1", "labels": labels}
+            }),
+        );
+    }
+
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    let labels_index = app
+        .display_headers()
+        .iter()
+        .position(|h| *h == "LABELS")
+        .unwrap();
+    {
+        let rows = app.rows();
+        app.ensure_table_cell_cache(&rows);
+        let cache = app.table_cell_cache();
+        for row in rows {
+            let (cells, _) = cache.get(&row_key(row)).unwrap();
+            let expected = if row.metadata.name.as_deref() == Some("worker-1") {
+                "empty=,karpenter.sh/nodepool=general,zone=west"
+            } else {
+                "<none>"
+            };
+            assert_eq!(cells[labels_index], expected);
+        }
+    }
+
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "general".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.rows().len(), 1);
+    assert_eq!(app.rows()[0].metadata.name.as_deref(), Some("worker-1"));
+
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "worker-1", "resourceVersion": "2",
+                         "labels": {"karpenter.sh/nodepool": "batch"}}
+        }),
+    );
+    assert!(app.rows().is_empty());
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.rows().len(), 3);
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.display_headers().to_vec(), narrow_headers);
+}
+
+#[tokio::test]
 async fn user_view_replace_swaps_out_curated_columns() {
     let (mut app, _rx) = test_app();
     install_views(
