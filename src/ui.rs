@@ -2010,7 +2010,10 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             "page tables and documents forward/back (also PgDn/PgUp)",
         ),
         bind("S · I", "sort by column (fuzzy picker) · invert direction"),
-        bind("w", "toggle wide columns (kubectl -o wide)"),
+        bind(
+            "w",
+            "toggle wide columns (kubectl -o wide), including node labels",
+        ),
         bind(
             "ctrl-e",
             "compact mode: collapse header + footer (for tiled panes)",

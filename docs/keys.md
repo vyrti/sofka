@@ -56,7 +56,7 @@ pickers keep both characters available as input.
 | `t`                                           | Flux: suspend/resume/reconcile menu · ArgoCD App/AppSet: suspend/resume (App: + sync) · CronJobs: trigger/suspend/resume · pods: file transfer (`kubectl cp`) |
 | `C` / `U` / `D`                               | nodes: cordon / uncordon / drain                                                                                                                              |
 | `ctrl-d` / `ctrl-k`                           | delete / force-delete (marked rows, or current); in confirm: `f` toggles force, `c` cycles cascade (background → foreground → orphan)                         |
-| `w`                                           | toggle wide-only columns (kubectl `-o wide`)                                                                                                                  |
+| `w`                                           | toggle wide-only columns (kubectl `-o wide`), including node labels                                                                                           |
 | `←` / `→`                                     | scroll columns horizontally (NAMESPACE/NAME stay anchored) — for narrow panes                                                                                 |
 | `:q`, `ctrl-c`                                | quit                                                                                                                                                          |
 | `?`                                           | help                                                                                                                                                          |
