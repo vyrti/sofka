@@ -1118,15 +1118,9 @@ fn format_report(envelope: Envelope, header: &Header) -> ReportView {
     render_distribution(&mut lines, "Status codes", envelope.status_codes);
     render_distribution(&mut lines, "Errors", envelope.errors);
 
-    // Not one HTTP response is the shape a wrong port takes. Reachability
-    // proves only that something is listening, never that it speaks HTTP, so
-    // on a multi-port object this is the likeliest explanation — and the one
-    // the reader cannot infer from a report full of connection errors.
     if responded == 0 {
         lines.push_static("Hint");
-        lines.push_static("  Nothing answered HTTP. If this object exposes more than one port,");
-        lines.push_static("  the one benchmarked may not be its HTTP endpoint — name it with");
-        lines.push_static("  `:oha port=N`.");
+        lines.push_static("  Nothing answered HTTP. Try :oha port=N");
     }
 
     let truncated = lines.truncated;
