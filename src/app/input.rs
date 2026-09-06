@@ -59,6 +59,16 @@ impl App {
                     self.start_watch();
                     return Ok(());
                 }
+                KeyCode::Char('z')
+                    if self.mode == Mode::Table
+                        && self.kind_plural == "pods"
+                        && key.modifiers == KeyModifiers::CONTROL =>
+                {
+                    self.faults_only = !self.faults_only;
+                    self.invalidate_rows();
+                    self.table_state.select(Some(0));
+                    return Ok(());
+                }
                 KeyCode::Char('f')
                     if self.mode == Mode::Table && key.modifiers == KeyModifiers::CONTROL =>
                 {

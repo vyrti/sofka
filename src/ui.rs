@@ -853,6 +853,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
         Span::styled(format!(" {kind_label} "), theme::title()),
         Span::styled(format!("[{count}]"), Style::default().fg(theme::counter())),
     ];
+    if app.faults_filter_active() {
+        title.push(Span::styled(" [faults]", Style::default().fg(theme::red())));
+    }
     // Horizontal scroll indicator: how many columns are hidden off the left.
     if col_offset > 0 {
         title.push(Span::styled(format!(" ‹{col_offset}"), theme::dim()));
@@ -2028,6 +2031,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         ),
         bind("n · 0", "namespace switcher · 0 = all namespaces"),
         bind("ctrl-r", "refresh watch"),
+        bind("ctrl-z", "toggle faults filter (pods only)"),
         Line::from(""),
         Line::from(Span::styled("  Inspect", theme::title())),
         bind("y · d", "view YAML · describe (kubectl)"),

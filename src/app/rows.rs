@@ -32,6 +32,7 @@ impl App {
         cache.column_widths = None;
         cache.sort_keys.remove(key);
         if !self.filter.is_empty()
+            || self.faults_filter_active()
             || self.sort_column.is_some()
             || self.owner.is_some()
             || self.kind_plural == "helm"
@@ -67,10 +68,17 @@ impl App {
         cells: &mut crate::store::FastMap<RowKey, CellCacheEntry>,
         now: i64,
     ) -> bool {
+        if self.faults_filter_active() && !pod_has_faults(o) {
+            return false;
+        }
         if self.filter.is_empty() {
             return true;
         }
         self.eval_filter(o, key, parsed, cells, now)
+    }
+
+    pub fn faults_filter_active(&self) -> bool {
+        self.faults_only && self.kind_plural == "pods"
     }
 
     fn eval_filter(
@@ -1053,4 +1061,82 @@ impl App {
         let page = self.table_page_rows.max(1) as i32;
         self.move_selection(pages.saturating_mul(page));
     }
+}
+
+fn pod_has_faults(o: &DynamicObject) -> bool {
+    if o.metadata.deletion_timestamp.is_some() {
+        return true;
+    }
+    let d = &o.data;
+    match d.pointer("/status/phase").and_then(Value::as_str) {
+        Some("Succeeded") => return false,
+        Some("Running") => {}
+        _ => return true,
+    }
+    let condition_ready = |kind: &str| {
+        d.pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .is_some_and(|conditions| {
+                conditions.iter().any(|c| {
+                    c.get("type").and_then(Value::as_str) == Some(kind)
+                        && c.get("status").and_then(Value::as_str) == Some("True")
+                })
+            })
+    };
+    if !condition_ready("Ready") {
+        return true;
+    }
+    if d.pointer("/spec/readinessGates")
+        .and_then(Value::as_array)
+        .is_some_and(|gates| {
+            gates.iter().any(|gate| {
+                gate.get("conditionType")
+                    .and_then(Value::as_str)
+                    .is_none_or(|kind| !condition_ready(kind))
+            })
+        })
+    {
+        return true;
+    }
+    let Some(statuses) = d
+        .pointer("/status/containerStatuses")
+        .and_then(Value::as_array)
+    else {
+        return true;
+    };
+    if statuses.is_empty()
+        || statuses.iter().any(|c| {
+            c.get("ready").and_then(Value::as_bool) != Some(true)
+                || c.pointer("/state/running").is_none()
+        })
+        || d.pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .is_some_and(|containers| containers.len() != statuses.len())
+    {
+        return true;
+    }
+    d.pointer("/spec/initContainers")
+        .and_then(Value::as_array)
+        .is_some_and(|containers| {
+            containers.iter().any(|container| {
+                let status = d
+                    .pointer("/status/initContainerStatuses")
+                    .and_then(Value::as_array)
+                    .and_then(|statuses| {
+                        statuses
+                            .iter()
+                            .find(|s| s.get("name") == container.get("name"))
+                    });
+                status.is_none_or(|s| {
+                    if container.get("restartPolicy").and_then(Value::as_str) == Some("Always") {
+                        s.get("ready").and_then(Value::as_bool) != Some(true)
+                            || s.pointer("/state/running").is_none()
+                    } else {
+                        s.pointer("/state/terminated/exitCode")
+                            .and_then(Value::as_i64)
+                            != Some(0)
+                    }
+                })
+            })
+        })
 }
