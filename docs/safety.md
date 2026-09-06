@@ -71,3 +71,13 @@ incomplete rule reviews. The API still enforces access when you open the kind.
 action you took - the action, the target, the context, the time - newest first.
 It records identifiers only, never secret input or decoded values, and never
 writes to disk.
+
+## Plugin actions
+
+Guardrails match plugin actions with `plugin:<palette>`.
+If a plugin has no palette command, use `plugin:<name>`.
+The pattern `plugin:*` matches all plugins.
+
+Read-only mode blocks mutating plugins and plugins with `network_load = true`.
+Network-load plugins require confirmation, even when they do not change Kubernetes resources.
+See [Plugin safety controls](plugin-authoring.md#safety-controls).

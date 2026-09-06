@@ -27,6 +27,17 @@ impl App {
         targets: &[(String, String)],
         base: ConfirmLevel,
     ) -> Option<ConfirmLevel> {
+        self.guard_scope(action, plural, targets, base, false)
+    }
+
+    pub(super) fn guard_scope(
+        &mut self,
+        action: &str,
+        plural: &str,
+        targets: &[(String, String)],
+        base: ConfirmLevel,
+        all_namespaces: bool,
+    ) -> Option<ConfirmLevel> {
         let ctx = self.cluster.context.clone();
         let mut level = base;
         let mut deny: Option<String> = None;
@@ -40,7 +51,8 @@ impl App {
                 continue;
             }
             // A namespace filter matches if any target is in a listed namespace.
-            if !g.namespaces.is_empty()
+            if !all_namespaces
+                && !g.namespaces.is_empty()
                 && !targets
                     .iter()
                     .any(|(_, ns)| list_matches(&g.namespaces, ns))

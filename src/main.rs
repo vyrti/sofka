@@ -20,6 +20,11 @@ use sofka::{
 
 const EVENT_CHANNEL_CAP: usize = 4096;
 
+/// Messages one drain pass may handle before yielding to input and rendering.
+/// Large enough that an ordinary burst still costs a single frame, small
+/// enough that a sustained producer cannot starve the event loop.
+const MSG_DRAIN_BUDGET: usize = 256;
+
 /// sofka: navigate, observe, and inspect your Kubernetes clusters.
 #[derive(Parser, Debug)]
 #[command(name = "sofka", version, about)]
@@ -66,6 +71,14 @@ struct Args {
     #[arg(long)]
     snapshot: bool,
 
+    /// Validate a plugin package without executing it or connecting to a cluster.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["check", "snapshot", "info", "validate_plugin_report"])]
+    validate_plugin: Option<PathBuf>,
+
+    /// Validate and render a versioned plugin JSON report without a cluster.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["check", "snapshot", "info"])]
+    validate_plugin_report: Option<PathBuf>,
+
     /// Print version/build, config sources, directories, and the current
     /// kubeconfig context, then exit (no cluster connection). For live
     /// discovery/metrics/watch status, use `:info` inside the TUI.
@@ -102,6 +115,24 @@ fn main() -> Result<()> {
 }
 
 async fn run_main(args: Args) -> Result<()> {
+    if let Some(dir) = &args.validate_plugin {
+        let plugin = sofka::plugins::read_package(dir).map_err(anyhow::Error::msg)?;
+        sofka::plugins::available(&plugin).map_err(anyhow::Error::msg)?;
+        println!("valid plugin: {}", plugin.name);
+        return Ok(());
+    }
+    if let Some(path) = &args.validate_plugin_report {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take((sofka::plugins::MAX_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        for line in sofka::plugins::render_report(&bytes).map_err(anyhow::Error::msg)? {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+
     let (loader, mut config_warnings) = config::ConfigLoader::load();
 
     // `--info`: print static diagnostics (no cluster connection) and exit.
@@ -199,6 +230,13 @@ async fn run_main(args: Args) -> Result<()> {
     let (tx, mut rx) = mpsc::channel(EVENT_CHANNEL_CAP);
     let panic_tx = tx.clone();
     let mut app = App::new(cluster, tx);
+    match sofka::state_writer::StateWriter::new(app.tx.clone()) {
+        Ok(writer) => app.state_writer = Some(writer),
+        Err(e) => {
+            eprintln!("warning: {e}; state writes will run synchronously");
+            config_warnings.push(e);
+        }
+    }
     // Fleet marks (`space` in `:ctx`) persist under the state dir, overlaying
     // the `[fleet] contexts` config list across restarts.
     let fleet_marks_path = fleet::FleetMarks::default_path();
@@ -381,12 +419,40 @@ async fn snapshot(app: &mut App, rx: &mut mpsc::Receiver<store::Msg>) -> Result<
         _ => {}
     }
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
-            Ok(Some(msg)) => app.handle_msg(msg),
+    // Wait for the frame's sources rather than for the clock: a `--snapshot`
+    // that has its initial list (and its metrics, and its dashboard) has
+    // nothing left to render, and sitting out the rest of the window is time
+    // every CI run and every local smoke check pays for nothing. The deadline
+    // stays as the fallback for a cluster that never syncs; a quiet window
+    // before finishing keeps a burst of watch events from cutting the wait
+    // short mid-list.
+    const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(3);
+    const SNAPSHOT_QUIET: Duration = Duration::from_millis(250);
+    let deadline = tokio::time::Instant::now() + SNAPSHOT_DEADLINE;
+    // Whether the metrics poll has reported at all — success or failure, empty
+    // map or full one. Read from the messages themselves rather than inferred
+    // from `app.metrics` being nonempty: a namespace with no usage data yet
+    // reports an empty map, and a broken metrics API reports an error and
+    // never fills it, and neither is a reason to sit out the whole window.
+    let mut metrics_reported = false;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match tokio::time::timeout(SNAPSHOT_QUIET.min(deadline - now), rx.recv()).await {
+            Ok(Some(msg)) => {
+                metrics_reported |= matches!(
+                    msg,
+                    store::Msg::Metrics { .. } | store::Msg::MetricsError { .. }
+                );
+                app.handle_msg(msg);
+            }
             Ok(None) => break,
-            Err(_) => {} // keep polling until the deadline (let metrics arrive)
+            // A whole quiet window with nothing arriving: stop if what the
+            // frame shows has landed, otherwise keep waiting for it.
+            Err(_) if snapshot_ready(app, metrics_reported) => break,
+            Err(_) => {}
         }
     }
 
@@ -482,6 +548,41 @@ async fn snapshot(app: &mut App, rx: &mut mpsc::Receiver<store::Msg>) -> Result<
         println!("{}", line.trim_end());
     }
     Ok(())
+}
+
+/// Whether a headless snapshot has everything it is going to draw: the watch's
+/// initial list, a report from the metrics poll when the CPU/MEM columns are
+/// shown (pods/nodes only), the pod counts behind the nodes view's PODS
+/// column, and the dashboard `PUP_DEMO` asked for. Deliberately narrow —
+/// anything not rendered by the frame must not hold the snapshot open.
+fn snapshot_ready(app: &App, metrics_reported: bool) -> bool {
+    if !app.store.synced {
+        return false;
+    }
+    // Waiting for the poll to *report* is the most this can promise. It cannot
+    // promise a metrics row for every object: the poll runs every 5s, so a
+    // second snapshot can never arrive inside this 3s window, and an object
+    // metrics-server has not reported yet renders here exactly as the live
+    // table renders it at the same moment.
+    if app.metrics_columns() && !metrics_reported {
+        return false;
+    }
+    // PODS is fed by its own watcher, which holds its counts back until
+    // `InitDone` and then publishes on a one-second ticker — strictly later
+    // than the sync and the metrics report it races. Leaving it out let the
+    // quiet window close first and drew "-" in every PODS cell, which the old
+    // fixed three-second wait had been hiding. No flag to thread through here:
+    // `node_pods` is `None` until that first publication, so the field already
+    // is the "has reported" state, and it is the same `None` the cell renders
+    // from.
+    if app.node_capacity_columns() && app.node_pods.is_none() {
+        return false;
+    }
+    match app.mode {
+        app::Mode::Pulse => app.pulse.nodes_total + app.pulse.pods_total > 0,
+        app::Mode::Xray => !app.xray_items.is_empty(),
+        _ => true,
+    }
 }
 
 /// Emit the configured bell + desktop-notification sequences for a `:notify`
@@ -694,9 +795,18 @@ async fn run(
             }
             Some(msg) = rx.recv() => {
                 app.handle_msg(msg);
-                // Batch any other queued updates before the next redraw.
-                while let Ok(m) = rx.try_recv() {
+                // Batch any other queued updates before the next redraw — but
+                // only a bounded number of them. Producers refill the channel
+                // while it drains, so "until empty" is not a bound at all
+                // under a watch or log storm: the loop can stay in this branch
+                // indefinitely, and every message it handles there is one the
+                // key reader and the frame timer do not get. What is left over
+                // stays queued, in order, for the next pass.
+                let mut budget = MSG_DRAIN_BUDGET;
+                while budget > 0 {
+                    let Ok(m) = rx.try_recv() else { break };
                     app.handle_msg(m);
+                    budget -= 1;
                 }
                 if let Some(text) = app.take_notification() {
                     app.run_notify_command(&text);
@@ -709,9 +819,12 @@ async fn run(
                 dirty = false;
             }
             _ = tick.tick() => {
-                app.reap_port_forwards(); // age columns + drop dead forwards
-                app.expire_flash();
-                dirty = true;
+                // age columns + drop dead forwards
+                let changed = app.reap_port_forwards() | app.expire_flash();
+                // A document view has nothing that moves with the clock, so a
+                // tick there is not a reason to redraw it — only an actual
+                // change is. Every other view can be showing an elapsed time.
+                dirty = dirty || changed || !app.static_between_events();
             }
             // A held Esc was a real keypress after all, not the head of a
             // split escape sequence: act on it.

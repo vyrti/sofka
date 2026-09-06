@@ -1,13 +1,42 @@
 use super::*;
-use futures_util::StreamExt;
 
 impl App {
     // ----- key handling --------------------------------------------------
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        let before = match self.mode {
+            Mode::Command => self.palette_return,
+            Mode::Help => self.help_return,
+            Mode::Filter | Mode::Confirm | Mode::Prompt | Mode::SortPicker | Mode::CopyPicker => {
+                Mode::Table
+            }
+            other => other,
+        };
+        let run = self.plugin_run;
+        let result = self.handle_key_inner(key);
+        let overlay = matches!(
+            self.mode,
+            Mode::Command
+                | Mode::Help
+                | Mode::Filter
+                | Mode::DocFilter
+                | Mode::LogFilter
+                | Mode::Confirm
+                | Mode::Prompt
+                | Mode::SortPicker
+                | Mode::CopyPicker
+        );
+        if self.should_quit || (self.plugin_run == run && self.mode != before && !overlay) {
+            self.stop_plugins();
+        }
+        result
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent) -> Result<()> {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => {
+                    self.stop_plugins();
                     self.should_quit = true;
                     return Ok(());
                 }
@@ -229,12 +258,12 @@ impl App {
             // Browser-style view history: [ back, ] forward.
             KeyCode::Char('[') => self.history_back(),
             KeyCode::Char(']') => self.history_forward(),
-            // Cycle the active workspace's views (no-op when none is open).
+            // Cycle workspace views, or the default resources in this namespace.
             KeyCode::Tab => {
-                self.cycle_workspace(true);
+                self.cycle_views(true);
             }
             KeyCode::BackTab => {
-                self.cycle_workspace(false);
+                self.cycle_views(false);
             }
             // k9s: 0 = all namespaces.
             KeyCode::Char('0') => {
@@ -286,221 +315,6 @@ impl App {
                 }
             }
         }
-    }
-
-    /// Run a config-defined plugin bound to `c` if it applies to the current
-    /// kind. Blocked in read-only mode: plugins shell out to arbitrary
-    /// commands, so we can't know they won't mutate the cluster. Returns
-    /// whether a plugin matched (so the caller can stop treating the event as
-    /// an unhandled key).
-    pub(super) fn try_plugin_key(&mut self, key: KeyEvent) -> bool {
-        let Some(plugin) = self
-            .plugins
-            .iter()
-            .find(|p| {
-                crate::keys::KeyChord::parse(&p.key).is_ok_and(|chord| chord.matches(&key))
-                    && (p.scopes.is_empty() || p.scopes.iter().any(|s| s == &self.kind_plural))
-            })
-            .cloned()
-        else {
-            return false;
-        };
-        self.run_plugin(plugin);
-        true
-    }
-
-    /// Resolve placeholders, then run the plugin — after a confirmation prompt
-    /// when it's marked `confirm`/`dangerous`.
-    fn run_plugin(&mut self, plugin: crate::config::Plugin) {
-        // A mutating plugin (the default) is blocked in read-only mode; one
-        // explicitly declared read-only stays available.
-        if plugin.mutating.unwrap_or(true) && self.readonly {
-            self.flash_warn(&format!(
-                "read-only mode — plugin '{}' may mutate (set mutating = false to allow)",
-                plugin.name
-            ));
-            return;
-        }
-        let mode = match plugin.output.as_deref() {
-            Some("popup") => PluginMode::Popup,
-            Some("background") => PluginMode::Background,
-            _ => PluginMode::Terminal,
-        };
-        let timeout = plugin
-            .timeout
-            .as_deref()
-            .and_then(|t| crate::providers::parse_lookback(t).ok())
-            .unwrap_or(30)
-            .max(1) as u64;
-
-        // Marked rows drive a bulk run; otherwise the single selection.
-        let targets = self.action_targets();
-        if targets.is_empty() {
-            self.flash_warn("no selection for plugin");
-            return;
-        }
-        // An interactive terminal command can't compose over a marked set:
-        // refuse rather than surprise the user by running on just one row.
-        if mode == PluginMode::Terminal && targets.len() > 1 {
-            self.flash_warn(&format!(
-                "'{}': a marked set needs output = popup or background",
-                plugin.name
-            ));
-            return;
-        }
-
-        let ctx = self.cluster.context.clone();
-        let cluster = self.cluster.cluster_name.clone();
-        let res = self.kind_plural.clone();
-        let filter = self.filter.clone();
-        let (group, version, kind) = self
-            .kind
-            .as_ref()
-            .map(|k| (k.ar.group.clone(), k.ar.version.clone(), k.ar.kind.clone()))
-            .unwrap_or_default();
-
-        // One (label, argv) job per target. Placeholders are substituted as
-        // whole arguments — never spliced into a shell string. `$NAMESPACE`
-        // before `$NS`/`$NAME` so the longer token wins.
-        let jobs: Vec<(String, Vec<String>)> = targets
-            .iter()
-            .map(|(name, ns)| {
-                let subst = |s: &str| {
-                    s.replace("$NAMESPACE", ns)
-                        .replace("$NS", ns)
-                        .replace("$NAME", name)
-                        .replace("$CONTEXT", &ctx)
-                        .replace("$CLUSTER", &cluster)
-                        .replace("$RESOURCE", &res)
-                        .replace("$GROUP", &group)
-                        .replace("$VERSION", &version)
-                        .replace("$KIND", &kind)
-                        .replace("$FILTER", &filter)
-                };
-                // `shell = true` opts into `sh -c`, still passing the args as
-                // positional parameters ($1, $2, …), not interpolated.
-                let mut argv = if plugin.shell {
-                    vec![
-                        "sh".into(),
-                        "-c".into(),
-                        subst(&plugin.command),
-                        "sofka".into(),
-                    ]
-                } else {
-                    vec![subst(&plugin.command)]
-                };
-                argv.extend(plugin.args.iter().map(|a| subst(a)));
-                (name.clone(), argv)
-            })
-            .collect();
-
-        if plugin.confirm || plugin.dangerous {
-            let cmd = truncate_cmd(&jobs[0].1);
-            let head = if jobs.len() > 1 {
-                format!("Run plugin '{}' on {} resources?", plugin.name, jobs.len())
-            } else {
-                format!("Run plugin '{}'?", plugin.name)
-            };
-            self.confirm_label = if plugin.dangerous {
-                format!("⚠ {head} (dangerous)  {cmd}")
-            } else {
-                format!("{head}  {cmd}")
-            };
-            self.confirm_action = Some(ConfirmAction::Plugin {
-                jobs,
-                name: plugin.name.clone(),
-                mode,
-                timeout,
-            });
-            self.mode = Mode::Confirm;
-            return;
-        }
-        self.launch_plugin(jobs, plugin.name.clone(), mode, timeout);
-    }
-
-    /// Dispatch resolved plugin jobs (one per target) by output mode.
-    pub(super) fn launch_plugin(
-        &mut self,
-        jobs: Vec<(String, Vec<String>)>,
-        name: String,
-        mode: PluginMode,
-        timeout: u64,
-    ) {
-        if jobs.is_empty() {
-            return;
-        }
-        let n = jobs.len();
-        self.note_action(
-            format!("plugin: {name}"),
-            if n == 1 {
-                "1 target".to_string()
-            } else {
-                format!("{n} targets")
-            },
-        );
-        match mode {
-            PluginMode::Terminal => {
-                // Terminal runs are single (enforced in run_plugin).
-                let argv = jobs.into_iter().next().map(|(_, a)| a).unwrap_or_default();
-                if argv.is_empty() {
-                    return;
-                }
-                self.flash = format!("plugin: {name}");
-                self.flash_err = false;
-                self.pending = Some(Suspend::Shell(argv));
-            }
-            PluginMode::Popup => {
-                // Mirror describe: stay put, swap to the doc view when output
-                // lands, so a view switch mid-run cleanly drops the result.
-                self.set_return_mode();
-                let claim = self.claim_status(plugin_flash(&name, n, ""));
-                self.spawn_plugin(jobs, format!("{name} — output"), mode, timeout, claim);
-            }
-            PluginMode::Background => {
-                let claim = self.claim_status(plugin_flash(&name, n, " (background)"));
-                self.spawn_plugin(jobs, name, mode, timeout, claim);
-            }
-        }
-    }
-
-    /// Run every job off-thread with a per-job timeout, bounded output capture,
-    /// and bounded concurrency, then report back via [`Msg`]. A hung command
-    /// can't freeze the UI — the timeout aborts it — and the aggregated result
-    /// is generation-gated like every other stream. For a bulk run this is
-    /// where partial failures are counted.
-    fn spawn_plugin(
-        &mut self,
-        jobs: Vec<(String, Vec<String>)>,
-        title: String,
-        mode: PluginMode,
-        timeout: u64,
-        claim: StatusClaim,
-    ) {
-        let tx = self.tx.clone();
-        let genr = self.generation;
-        tokio::spawn(async move {
-            let dur = Duration::from_secs(timeout);
-            // Bounded concurrency, results in the marked order.
-            let results: Vec<(String, SpawnOutcome)> =
-                futures_util::stream::iter(jobs.into_iter().map(|(label, argv)| async move {
-                    let out = tokio::time::timeout(
-                        dur,
-                        tokio::process::Command::new(&argv[0])
-                            .args(&argv[1..])
-                            .output(),
-                    )
-                    .await;
-                    (label, out)
-                }))
-                .buffered(8)
-                .collect()
-                .await;
-            let msg = match mode {
-                PluginMode::Popup => plugin_popup_msg(genr, claim, title, timeout, results),
-                _ => plugin_bulk_msg(genr, claim, title, timeout, results),
-            };
-            let _ = tx.send(msg).await;
-        });
     }
 
     pub(super) fn key_command(&mut self, key: KeyEvent) {
@@ -611,7 +425,19 @@ impl App {
                 } else if let Some(s) = picked {
                     match s.kind {
                         SuggestKind::Command => {
-                            self.run_palette_command(&s.label);
+                            if self
+                                .plugins
+                                .iter()
+                                .any(|p| p.palette.as_deref() == Some(&s.label))
+                            {
+                                let args = typed
+                                    .split_once(char::is_whitespace)
+                                    .map(|(_, args)| args)
+                                    .unwrap_or("");
+                                self.run_palette_command(&format!("{} {args}", s.label));
+                            } else {
+                                self.run_palette_command(&s.label);
+                            }
                         }
                         SuggestKind::Resource => self.switch_kind_ns(&s.label, ns_arg),
                         // Handled by the outer match arms above.
@@ -640,6 +466,7 @@ impl App {
 
     /// Run a built-in palette action.
     pub(super) fn run_action(&mut self, action: PaletteAction) {
+        self.stop_plugins();
         match action {
             PaletteAction::Quit => self.should_quit = true,
             PaletteAction::Ctx => self.open_contexts(),
@@ -743,7 +570,33 @@ impl App {
                 self.run_action(a);
                 true
             }
-            None => false,
+            None => {
+                let (name, args) = cmd.split_once(char::is_whitespace).unwrap_or((cmd, ""));
+                if name == "plugin-cancel" {
+                    self.stop_plugins();
+                    self.flash_warn("plugin cancelled");
+                    return true;
+                }
+                if self.cluster.resolve(name).is_some() || crate::app::plugin_command_reserved(name)
+                {
+                    return false;
+                }
+                let plugin = self
+                    .plugins
+                    .iter()
+                    .find(|p| p.palette.as_deref() == Some(name))
+                    .cloned();
+                if let Some(plugin) = plugin {
+                    if !plugin.scopes.is_empty() && !plugin.scopes.contains(&self.kind_plural) {
+                        self.flash_warn("plugin does not apply to this resource kind");
+                    } else {
+                        self.run_plugin(plugin, args);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 
@@ -783,13 +636,38 @@ impl App {
                 let best = c
                     .names
                     .iter()
-                    .filter_map(|n| self.matcher.fuzzy_match(n, q))
+                    .filter_map(|n| self.matcher.score(n, q))
                     .max();
                 if let Some(score) = best {
                     scored.push((
                         score,
                         Suggestion {
                             label: c.names[0].to_string(),
+                            kind: SuggestKind::Command,
+                        },
+                    ));
+                }
+            }
+        }
+
+        if !q.is_empty() {
+            for name in self
+                .plugins
+                .iter()
+                .filter(|p| p.scopes.is_empty() || p.scopes.contains(&self.kind_plural))
+                .filter_map(|p| p.palette.as_deref())
+                .chain(std::iter::once("plugin-cancel"))
+            {
+                if PALETTE_COMMANDS.iter().any(|c| c.names.contains(&name))
+                    || self.cluster.resolve(name).is_some()
+                {
+                    continue;
+                }
+                if let Some(score) = self.matcher.score(name, q) {
+                    scored.push((
+                        score,
+                        Suggestion {
+                            label: name.into(),
                             kind: SuggestKind::Command,
                         },
                     ));
@@ -804,7 +682,7 @@ impl App {
             let score = if q.is_empty() {
                 Some(i64::MAX)
             } else {
-                self.matcher.fuzzy_match(&b.name, q).map(|s| s + 1_000)
+                self.matcher.score(&b.name, q).map(|s| s + 1_000)
             };
             if let Some(score) = score {
                 scored.push((
@@ -822,7 +700,7 @@ impl App {
             let score = if q.is_empty() {
                 Some(i64::MAX)
             } else {
-                self.matcher.fuzzy_match(&w.name, q).map(|s| s + 1_000)
+                self.matcher.score(&w.name, q).map(|s| s + 1_000)
             };
             if let Some(score) = score {
                 scored.push((
@@ -859,7 +737,7 @@ impl App {
                 continue;
             }
             if let Some(group) = group {
-                let bare_matches = q.is_empty() || self.matcher.fuzzy_match(plural, q).is_some();
+                let bare_matches = q.is_empty() || self.matcher.score(plural, q).is_some();
                 let same_kind = self
                     .cluster
                     .resolve(plural)
@@ -875,7 +753,7 @@ impl App {
             {
                 Some(i64::MAX)
             } else {
-                self.matcher.fuzzy_match(c, q)
+                self.matcher.score(c, q)
             };
             if let Some(score) = score {
                 scored.push((
@@ -910,7 +788,7 @@ impl App {
         for n in names {
             let score = if arg.is_empty() {
                 0
-            } else if let Some(s) = self.matcher.fuzzy_match(&n, arg) {
+            } else if let Some(s) = self.matcher.score(&n, arg) {
                 s
             } else {
                 continue;
@@ -936,7 +814,7 @@ impl App {
         for c in &self.all_contexts {
             let score = if arg.is_empty() {
                 0
-            } else if let Some(s) = self.matcher.fuzzy_match(c, arg) {
+            } else if let Some(s) = self.matcher.score(c, arg) {
                 s
             } else {
                 continue;
@@ -1047,9 +925,7 @@ impl App {
                 target.scroll = 0;
                 target.hscroll = 0;
             }
-            KeyCode::Char('G') | KeyCode::End => {
-                target.scroll = target.lines.len().saturating_sub(1)
-            }
+            KeyCode::Char('G') | KeyCode::End => target.scroll_to_bottom(),
             // k9s: `w` toggles line wrap; folding long lines is the other way to
             // read content that runs past the right edge.
             KeyCode::Char('w') => {
@@ -1308,166 +1184,6 @@ fn is_ctx_command(head: &str) -> bool {
     PALETTE_COMMANDS
         .iter()
         .any(|c| matches!(c.action, PaletteAction::Ctx) && c.names.contains(&head))
-}
-
-/// Bound the number of captured output lines and total bytes from a
-/// popup/background plugin, so a chatty command can't balloon memory or the
-/// redraw. Mirrors the log view's tail-buffer discipline.
-const PLUGIN_MAX_LINES: usize = 5_000;
-const PLUGIN_MAX_BYTES: usize = 1 << 20; // 1 MiB
-
-/// A short, single-line preview of an argv for the confirmation dialog.
-fn truncate_cmd(argv: &[String]) -> String {
-    let joined = argv.join(" ");
-    if joined.chars().count() > 120 {
-        let mut s: String = joined.chars().take(119).collect();
-        s.push('…');
-        s
-    } else {
-        joined
-    }
-}
-
-type SpawnOutcome = Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed>;
-
-/// Split captured bytes into bounded display lines.
-fn bounded_lines(bytes: &[u8]) -> Vec<String> {
-    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(PLUGIN_MAX_BYTES)]);
-    let mut lines: Vec<String> = text
-        .lines()
-        .take(PLUGIN_MAX_LINES)
-        .map(str::to_string)
-        .collect();
-    if text.lines().count() > PLUGIN_MAX_LINES {
-        lines.push(format!("… output truncated at {PLUGIN_MAX_LINES} lines"));
-    }
-    lines
-}
-
-/// First non-empty line of stderr, for a compact failure summary.
-fn stderr_summary(stderr: &[u8]) -> String {
-    String::from_utf8_lossy(stderr)
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("failed")
-        .chars()
-        .take(160)
-        .collect()
-}
-
-/// Reduce one job's outcome to `(ok, stdout lines, short failure reason)`.
-fn reduce_outcome(timeout: u64, outcome: SpawnOutcome) -> (bool, Vec<String>, String) {
-    match outcome {
-        Err(_) => {
-            let r = format!("timed out after {timeout}s");
-            (false, vec![r.clone()], r)
-        }
-        Ok(Err(e)) => {
-            let r = format!("failed to start: {e}");
-            (false, vec![format!("failed to run: {e}")], r)
-        }
-        Ok(Ok(out)) => {
-            let mut lines = bounded_lines(&out.stdout);
-            if out.status.success() {
-                if lines.is_empty() {
-                    lines.push("(no output)".into());
-                }
-                (true, lines, String::new())
-            } else {
-                let err = stderr_summary(&out.stderr);
-                let reason = if err.is_empty() {
-                    format!("exited {}", exit_label(&out.status))
-                } else {
-                    lines.push(String::new());
-                    lines.push(format!("[stderr] {err}"));
-                    format!("exited {} — {err}", exit_label(&out.status))
-                };
-                (false, lines, reason)
-            }
-        }
-    }
-}
-
-/// Build [`Msg::PluginOutput`] for a finished popup run, aggregating one block
-/// per job (with a `== label ==` header when there's more than one).
-fn plugin_popup_msg(
-    generation: u64,
-    claim: StatusClaim,
-    title: String,
-    timeout: u64,
-    results: Vec<(String, SpawnOutcome)>,
-) -> Msg {
-    let total = results.len();
-    let multi = total > 1;
-    let mut lines = Vec::new();
-    let mut failed = 0;
-    for (i, (label, outcome)) in results.into_iter().enumerate() {
-        let (ok, block, _) = reduce_outcome(timeout, outcome);
-        if !ok {
-            failed += 1;
-        }
-        if multi {
-            if i > 0 {
-                lines.push(String::new());
-            }
-            lines.push(format!("== {label} =="));
-        }
-        lines.extend(block);
-    }
-    let warn = (failed > 0).then(|| format!("{failed} of {total} failed"));
-    Msg::PluginOutput {
-        generation,
-        claim,
-        title,
-        lines,
-        warn,
-    }
-}
-
-/// Build [`Msg::PluginBulkDone`] for a finished background run, counting
-/// successes and listing the failures (target label + reason).
-fn plugin_bulk_msg(
-    generation: u64,
-    claim: StatusClaim,
-    name: String,
-    timeout: u64,
-    results: Vec<(String, SpawnOutcome)>,
-) -> Msg {
-    let mut ok = 0;
-    let mut failed = Vec::new();
-    for (label, outcome) in results {
-        let (success, _, reason) = reduce_outcome(timeout, outcome);
-        if success {
-            ok += 1;
-        } else {
-            failed.push(format!("{label}: {reason}"));
-        }
-    }
-    Msg::PluginBulkDone {
-        generation,
-        claim,
-        name,
-        ok,
-        failed,
-    }
-}
-
-fn exit_label(status: &std::process::ExitStatus) -> String {
-    match status.code() {
-        Some(c) => format!("code {c}"),
-        None => "by signal".into(),
-    }
-}
-
-/// Flash text for a launched popup/background run, noting the count on a bulk
-/// run.
-fn plugin_flash(name: &str, n: usize, suffix: &str) -> String {
-    if n > 1 {
-        format!("plugin: {name} ×{n}{suffix}…")
-    } else {
-        format!("plugin: {name}{suffix}…")
-    }
 }
 
 /// Order scored palette completions: score descending, then label length,

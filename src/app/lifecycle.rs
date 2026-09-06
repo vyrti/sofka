@@ -267,6 +267,7 @@ impl App {
         self.applied_filter_labels = filter_labels;
         self.applied_filter_fields = filter_fields;
         self.clear_progress_flash();
+        self.stop_plugins();
         self.generation += 1;
         self.gen_flag.store(self.generation, Ordering::SeqCst);
         for t in self.tasks.drain(..) {
@@ -783,6 +784,7 @@ impl App {
     pub(super) fn bump_generation(&mut self) {
         self.stop_event_stream();
         self.clear_progress_flash();
+        self.stop_plugins();
         self.generation += 1;
         self.gen_flag.store(self.generation, Ordering::SeqCst);
         for t in self.tasks.drain(..) {
@@ -842,6 +844,13 @@ impl App {
                 self.watch_errors = self.watch_errors.saturating_add(1);
                 self.last_error = Some(error.clone());
                 self.borrow_status(format!("error: {error}"), true);
+            }
+            Msg::StateWriteFailed { id, error } => {
+                self.last_state_write_error = Some(error.clone());
+                self.borrow_status(format!("state not saved: {error}"), true);
+                if let Some(writer) = &self.state_writer {
+                    writer.acknowledge_failure(id);
+                }
             }
             Msg::Flash {
                 generation,
@@ -1022,12 +1031,15 @@ impl App {
                 self.clear_claimed_status(claim);
             }
             Msg::PluginOutput {
+                run,
                 generation,
                 claim,
                 title,
                 lines,
                 warn,
-            } if generation == self.generation => {
+            } if generation == self.generation && run == self.plugin_run => {
+                self.plugin_task = None;
+                self.plugin_claim = None;
                 self.detail = Scrollable {
                     title,
                     lines: lines.into(),
@@ -1040,12 +1052,15 @@ impl App {
                 }
             }
             Msg::PluginBulkDone {
+                run,
                 generation,
                 claim,
                 name,
                 ok,
                 failed,
-            } if generation == self.generation => {
+            } if generation == self.generation && run == self.plugin_run => {
+                self.plugin_task = None;
+                self.plugin_claim = None;
                 if failed.is_empty() {
                     self.set_claimed_status(claim, format!("plugin {name}: {ok} ok"), false);
                 } else {
@@ -1169,10 +1184,6 @@ impl App {
                 // one it replaces, which would otherwise leave a stale
                 // search-match cache behind.
                 self.detail.replace_lines(lines.into());
-                self.detail.scroll = self
-                    .detail
-                    .scroll
-                    .min(self.detail.lines.len().saturating_sub(1));
             }
             Msg::TransferDone {
                 generation,

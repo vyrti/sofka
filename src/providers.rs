@@ -421,7 +421,9 @@ pub async fn discover(client: kube::Client, base: &LogProvider) -> Result<LogPro
 /// `http` win, then literal 9428 (the VictoriaLogs default), then the first
 /// declared port.
 fn pick_service(services: &[Service]) -> Option<(String, String, i32)> {
-    let candidates: Vec<(&Service, i32)> = services
+    // Consume the filtered iterator directly: `min_by_key` is O(n), and no
+    // temporary candidates allocation is needed for the one selected item.
+    let (svc, port) = services
         .iter()
         .filter_map(|s| {
             let ports = s.spec.as_ref()?.ports.as_ref()?;
@@ -432,20 +434,16 @@ fn pick_service(services: &[Service]) -> Option<(String, String, i32)> {
                 .or_else(|| ports.first())?;
             Some((s, port.port))
         })
-        .collect();
-    // Only the first candidate is used, so pick the minimum directly rather
-    // than sorting the whole list — and compare borrowed, instead of cloning
-    // two `String`s per comparison.
-    let (svc, port) = candidates.iter().min_by_key(|(s, _)| {
-        (
-            s.metadata.namespace.as_deref().unwrap_or_default(),
-            s.metadata.name.as_deref().unwrap_or_default(),
-        )
-    })?;
+        .min_by_key(|(s, _)| {
+            (
+                s.metadata.namespace.as_deref().unwrap_or_default(),
+                s.metadata.name.as_deref().unwrap_or_default(),
+            )
+        })?;
     Some((
         svc.metadata.namespace.clone().unwrap_or_default(),
         svc.metadata.name.clone().unwrap_or_default(),
-        *port,
+        port,
     ))
 }
 
@@ -645,7 +643,7 @@ impl LogProvider {
                 }
                 TailSource::Http {
                     body: resp.into_body(),
-                    buf: Vec::new(),
+                    buf: LineBuf::default(),
                 }
             }
             Transport::ServiceProxy { client, .. } => {
@@ -809,7 +807,7 @@ enum TailSource {
     /// Direct transport: raw hyper body, split into lines here.
     Http {
         body: hyper::body::Incoming,
-        buf: Vec<u8>,
+        buf: LineBuf,
     },
     /// API-server proxy transport: the kube client already yields a buffered
     /// reader over the response body.
@@ -828,23 +826,31 @@ impl LogTail {
             if let Some(e) = self.pending.pop_front() {
                 return Ok(Some(e));
             }
-            match &mut self.source {
+            // Split borrows: the framer writes into `pending` while it holds
+            // the buffer, so neither has to be copied out first.
+            let Self {
+                source,
+                pending,
+                fields,
+                ..
+            } = self;
+            match source {
                 TailSource::Http { body, buf } => match body.frame().await {
                     None => {
-                        let rest = std::mem::take(buf);
+                        let rest = buf.take();
                         return Ok(std::str::from_utf8(&rest)
                             .ok()
-                            .and_then(|l| parse_entry(l.trim(), &self.fields)));
+                            .and_then(|l| parse_entry(l.trim(), fields)));
                     }
                     Some(Err(e)) => return Err(e.to_string()),
                     Some(Ok(frame)) => {
                         if let Some(data) = frame.data_ref() {
-                            buf.extend_from_slice(data);
-                            self.pending.extend(
-                                drain_lines(buf)
-                                    .iter()
-                                    .filter_map(|l| parse_entry(l, &self.fields)),
-                            );
+                            buf.extend(data);
+                            buf.drain_lines(|line| {
+                                if let Some(entry) = parse_entry(line, fields) {
+                                    pending.push_back(entry);
+                                }
+                            });
                         }
                     }
                 },
@@ -852,8 +858,8 @@ impl LogTail {
                     None => return Ok(None),
                     Some(Err(e)) => return Err(e.to_string()),
                     Some(Ok(line)) => {
-                        if let Some(e) = parse_entry(&line, &self.fields) {
-                            self.pending.push_back(e);
+                        if let Some(e) = parse_entry(&line, fields) {
+                            pending.push_back(e);
                         }
                     }
                 },
@@ -862,44 +868,324 @@ impl LogTail {
     }
 }
 
-/// Split complete `\n`-terminated lines out of `buf`, leaving any trailing
-/// partial line in place for the next chunk.
-fn drain_lines(buf: &mut Vec<u8>) -> Vec<String> {
-    let Some(last_nl) = buf.iter().rposition(|&b| b == b'\n') else {
-        return Vec::new();
-    };
-    let complete: Vec<u8> = buf.drain(..=last_nl).collect();
-    String::from_utf8_lossy(&complete)
-        .lines()
-        .map(str::to_string)
-        .filter(|l| !l.trim().is_empty())
-        .collect()
+/// The tail's receive buffer: bytes that have arrived, plus how far they have
+/// already been searched for a line ending.
+#[derive(Default)]
+struct LineBuf {
+    bytes: Vec<u8>,
+    /// Length of the prefix already known to hold no newline. Re-scanning it
+    /// on every chunk is what makes framing one long record quadratic in its
+    /// length: a 512 KB record arriving in 4 KB pieces searched ~64 MB.
+    scanned: usize,
+}
+
+impl LineBuf {
+    fn extend(&mut self, data: &[u8]) {
+        self.bytes.extend_from_slice(data);
+    }
+
+    /// Everything received but not yet framed, leaving the buffer empty.
+    fn take(&mut self) -> Vec<u8> {
+        self.scanned = 0;
+        std::mem::take(&mut self.bytes)
+    }
+
+    /// Hand every complete `\n`-terminated line to `f`, then drop them and
+    /// keep the partial tail for the next chunk.
+    ///
+    /// Lines are borrowed out of the buffer rather than collected into owned
+    /// `String`s: the caller parses each one and keeps only a few of its
+    /// fields, so the copy was pure overhead — as was draining the complete
+    /// bytes into a second `Vec` before reading them.
+    fn drain_lines(&mut self, mut f: impl FnMut(&str)) {
+        let from = self.scanned.min(self.bytes.len());
+        let Some(rel) = memchr::memrchr(b'\n', &self.bytes[from..]) else {
+            self.scanned = self.bytes.len();
+            return;
+        };
+        let last_nl = from + rel;
+        let complete = &self.bytes[..=last_nl];
+        // Validate the whole complete region once, then hand out borrowed
+        // slices of it. Validating per line instead cost more than the
+        // per-line `String`s it saved; the lossy path is kept for the
+        // malformed case it exists for.
+        match std::str::from_utf8(complete) {
+            Ok(text) => {
+                for line in text.split('\n') {
+                    let line = line.trim();
+                    if !line.is_empty() {
+                        f(line);
+                    }
+                }
+            }
+            Err(_) => {
+                let text = String::from_utf8_lossy(complete);
+                for line in text.split('\n') {
+                    let line = line.trim();
+                    if !line.is_empty() {
+                        f(line);
+                    }
+                }
+            }
+        }
+        self.bytes.drain(..=last_nl);
+        // What is left starts after the last newline, so it is already known
+        // to contain none.
+        self.scanned = self.bytes.len();
+    }
+}
+
+/// Frame, parse and render one received chunk exactly as the tail loop does:
+/// the ingest cost of a provider log burst. Exposed for `benches/` only.
+#[cfg(feature = "bench")]
+pub fn bench_ingest_chunk(chunk: &[u8]) -> usize {
+    let fields = Fields::default();
+    let mut buf = LineBuf::default();
+    buf.extend(chunk);
+    let mut rendered = 0usize;
+    buf.drain_lines(|line| {
+        if let Some(entry) = parse_entry(line, &fields) {
+            rendered += entry.lines(Prefix::PodContainer, true).len();
+        }
+    });
+    rendered
+}
+
+/// One long record arriving in small chunks, framed the way the tail does it —
+/// the shape that makes the incomplete-buffer rescan quadratic.
+#[cfg(feature = "bench")]
+pub fn bench_ingest_fragmented(record: &[u8], chunk: usize) -> usize {
+    let mut buf = LineBuf::default();
+    let mut framed = 0usize;
+    for part in record.chunks(chunk) {
+        buf.extend(part);
+        buf.drain_lines(|_| framed += 1);
+    }
+    framed
+}
+
+/// The record fields a [`LogEntry`] keeps that are not configurable — every
+/// backend this speaks to names them this way.
+const MSG_FIELD: &str = "_msg";
+const TIME_FIELD: &str = "_time";
+
+/// One record through the production parse, with the default field mapping —
+/// the benches compare this against the `Value` DOM it replaced.
+#[cfg(feature = "bench")]
+pub fn bench_parse_entry(line: &str) -> Option<LogEntry> {
+    parse_entry(line, &Fields::default())
 }
 
 /// Parse one JSON-line record into a [`LogEntry`] using the configured field
 /// names. Records without a `_msg` (e.g. keep-alives) are dropped.
 fn parse_entry(line: &str, fields: &Fields) -> Option<LogEntry> {
-    let v: Value = serde_json::from_str(line).ok()?;
-    let msg = v.get("_msg")?.as_str()?.trim_end_matches('\n').to_string();
-    let time = v
-        .get("_time")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let nanos = time.parse::<Timestamp>().ok().map(|t| t.as_nanosecond());
-    let field = |name: &str| {
-        v.get(name)
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    };
-    Some(LogEntry {
-        nanos,
-        msg,
-        pod: field(&fields.pod),
-        container: field(&fields.container),
-        time,
-    })
+    use serde::de::DeserializeSeed;
+
+    let mut de = serde_json::Deserializer::from_str(line);
+    let entry = EntrySeed(fields).deserialize(&mut de).ok()??;
+    // A record with trailing content is malformed; `from_str` rejected it too.
+    de.end().ok()?;
+    Some(entry)
+}
+
+/// Deserializes a record straight into a [`LogEntry`], keeping only the four
+/// fields the entry retains and skipping every other one without building it.
+///
+/// The `serde_json::Value` DOM this replaces allocated a map entry, a key
+/// `String` and a `Value` for every field the backend sent — ingestion
+/// pipelines routinely send dozens — and then copied out the four that
+/// survive. Two of the four names come from the runtime [`Fields`] config, so
+/// this is a `DeserializeSeed` carrying them rather than a derived
+/// `Deserialize` with fixed names.
+struct EntrySeed<'a>(&'a Fields);
+
+impl<'de> serde::de::DeserializeSeed<'de> for EntrySeed<'_> {
+    /// `None` for a well-formed record that carries no `_msg`. A record that
+    /// is not a JSON object fails to deserialize and is dropped by the caller.
+    type Value = Option<LogEntry>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(EntryVisitor(self.0))
+    }
+}
+
+struct EntryVisitor<'a>(&'a Fields);
+
+impl<'de> serde::de::Visitor<'de> for EntryVisitor<'_> {
+    type Value = Option<LogEntry>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a log record object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let (mut msg, mut time, mut pod, mut container) = (None, None, None, None);
+
+        while let Some(key) = map.next_key::<RecordKey<'_>>()? {
+            let key = key.0.as_ref();
+            // Tested independently rather than as an `else if` chain: a config
+            // that points two fields at one record field must fill both, which
+            // is what indexing the DOM once per field used to do. Last
+            // occurrence of a repeated key wins, as it did in the DOM.
+            let (is_msg, is_time) = (key == MSG_FIELD, key == TIME_FIELD);
+            let (is_pod, is_container) = (key == self.0.pod, key == self.0.container);
+            if !(is_msg || is_time || is_pod || is_container) {
+                map.next_value::<serde::de::IgnoredAny>()?;
+                continue;
+            }
+            let value = map.next_value::<StringValue<'_>>()?.0;
+            if is_msg {
+                msg = value.clone();
+            }
+            if is_time {
+                time = value.clone();
+            }
+            if is_pod {
+                pod = value.clone();
+            }
+            if is_container {
+                container = value;
+            }
+        }
+
+        // No `_msg`, or a `_msg` that wasn't a string: not a log line.
+        let Some(msg) = msg else {
+            return Ok(None);
+        };
+        let time = time.map(std::borrow::Cow::into_owned).unwrap_or_default();
+        let nanos = time.parse::<Timestamp>().ok().map(|t| t.as_nanosecond());
+        Ok(Some(LogEntry {
+            nanos,
+            msg: msg.trim_end_matches('\n').to_string(),
+            pod: pod.map(std::borrow::Cow::into_owned).unwrap_or_default(),
+            container: container
+                .map(std::borrow::Cow::into_owned)
+                .unwrap_or_default(),
+            time,
+        }))
+    }
+}
+
+/// A record field name, borrowed from the input when it carries no escapes.
+struct RecordKey<'a>(std::borrow::Cow<'a, str>);
+
+impl<'de> serde::Deserialize<'de> for RecordKey<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_str(RecordKeyVisitor)
+    }
+}
+
+struct RecordKeyVisitor;
+
+impl<'de> serde::de::Visitor<'de> for RecordKeyVisitor {
+    type Value = RecordKey<'de>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a field name")
+    }
+
+    fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E> {
+        Ok(RecordKey(std::borrow::Cow::Borrowed(v)))
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(RecordKey(std::borrow::Cow::Owned(v.to_string())))
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+        Ok(RecordKey(std::borrow::Cow::Owned(v)))
+    }
+}
+
+/// A field value, kept only when it is a JSON string and borrowed from the
+/// input when it carries no escapes. Every other JSON type reads as absent —
+/// the same conclusion `Value::as_str()` reached, without building the value
+/// to reach it.
+struct StringValue<'a>(Option<std::borrow::Cow<'a, str>>);
+
+impl<'de> serde::Deserialize<'de> for StringValue<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StringValueVisitor)
+    }
+}
+
+struct StringValueVisitor;
+
+impl<'de> serde::de::Visitor<'de> for StringValueVisitor {
+    type Value = StringValue<'de>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E> {
+        Ok(StringValue(Some(std::borrow::Cow::Borrowed(v))))
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(StringValue(Some(std::borrow::Cow::Owned(v.to_string()))))
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+        Ok(StringValue(Some(std::borrow::Cow::Owned(v))))
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(StringValue(None))
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(StringValue(None))
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(StringValue(None))
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(StringValue(None))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(StringValue(None))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(StringValue(None))
+    }
+
+    // Nested containers still have to be walked to reach the next key, but
+    // nothing inside them is built.
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(StringValue(None))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        while map
+            .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+            .is_some()
+        {}
+        Ok(StringValue(None))
+    }
 }
 
 // ===== metrics provider (right-sizing) =====================================
@@ -1051,7 +1337,8 @@ pub async fn discover_metrics(
 /// First (by namespace/name) service with a usable port, preferring `http`,
 /// then the well-known query ports (Prometheus 9090, VM single 8428/8429).
 fn pick_metrics_service(services: &[Service]) -> Option<(String, String, i32)> {
-    let candidates: Vec<(&Service, i32)> = services
+    // As above, select in one pass without materializing every candidate.
+    let (svc, port) = services
         .iter()
         .filter_map(|s| {
             let ports = s.spec.as_ref()?.ports.as_ref()?;
@@ -1062,21 +1349,27 @@ fn pick_metrics_service(services: &[Service]) -> Option<(String, String, i32)> {
                 .or_else(|| ports.first())?;
             Some((s, port.port))
         })
-        .collect();
-    // Only the first candidate is used, so pick the minimum directly rather
-    // than sorting the whole list — and compare borrowed, instead of cloning
-    // two `String`s per comparison.
-    let (svc, port) = candidates.iter().min_by_key(|(s, _)| {
-        (
-            s.metadata.namespace.as_deref().unwrap_or_default(),
-            s.metadata.name.as_deref().unwrap_or_default(),
-        )
-    })?;
+        .min_by_key(|(s, _)| {
+            (
+                s.metadata.namespace.as_deref().unwrap_or_default(),
+                s.metadata.name.as_deref().unwrap_or_default(),
+            )
+        })?;
     Some((
         svc.metadata.namespace.clone().unwrap_or_default(),
         svc.metadata.name.clone().unwrap_or_default(),
-        *port,
+        port,
     ))
+}
+
+#[cfg(feature = "bench")]
+pub fn bench_pick_log_service(services: &[Service]) -> Option<(String, String, i32)> {
+    pick_service(services)
+}
+
+#[cfg(feature = "bench")]
+pub fn bench_pick_metrics_service(services: &[Service]) -> Option<(String, String, i32)> {
+    pick_metrics_service(services)
 }
 
 impl MetricsProvider {
@@ -1358,6 +1651,33 @@ mod tests {
         assert_eq!(pick_service(&[]), None);
     }
 
+    #[test]
+    fn pick_metrics_service_is_deterministic_and_prefers_query_ports() {
+        let ordinary = svc("z-monitoring", "prom", serde_json::json!([{"port": 8080}]));
+        let query = svc(
+            "a-monitoring",
+            "victoria-metrics",
+            serde_json::json!([{"port": 8080}, {"port": 8428}]),
+        );
+        assert_eq!(
+            pick_metrics_service(&[ordinary, query]),
+            Some(("a-monitoring".into(), "victoria-metrics".into(), 8428))
+        );
+
+        let named = svc(
+            "monitoring",
+            "prometheus",
+            serde_json::json!([
+                {"port": 9090},
+                {"name": "http", "port": 8081}
+            ]),
+        );
+        assert_eq!(
+            pick_metrics_service(&[named]),
+            Some(("monitoring".into(), "prometheus".into(), 8081))
+        );
+    }
+
     #[tokio::test]
     async fn proxy_request_targets_the_service_proxy() {
         let mut p = provider();
@@ -1484,6 +1804,131 @@ mod tests {
         assert!(parse_entry("not json", &fields()).is_none());
     }
 
+    /// The `serde_json::Value` implementation the selective visitor replaced,
+    /// kept as the reference the visitor is checked against.
+    fn parse_entry_via_dom(line: &str, fields: &Fields) -> Option<LogEntry> {
+        let v: Value = serde_json::from_str(line).ok()?;
+        let msg = v.get("_msg")?.as_str()?.trim_end_matches('\n').to_string();
+        let time = v
+            .get("_time")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let nanos = time.parse::<Timestamp>().ok().map(|t| t.as_nanosecond());
+        let field = |name: &str| {
+            v.get(name)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        Some(LogEntry {
+            nanos,
+            msg,
+            pod: field(&fields.pod),
+            container: field(&fields.container),
+            time,
+        })
+    }
+
+    /// The visitor must reach the same answer as the DOM for every record
+    /// shape a backend can emit — that equivalence is the whole licence for
+    /// skipping the DOM.
+    #[test]
+    fn selective_visitor_matches_the_dom_it_replaced() {
+        let cases = [
+            // Ordinary record.
+            r#"{"_time":"2026-07-13T06:41:47Z","_msg":"hello","kubernetes.pod_name":"api-1","kubernetes.container_name":"app"}"#,
+            // Unknown extra fields, including nested containers, are skipped.
+            r#"{"_msg":"hi","_stream_id":"0000","extra":{"a":[1,2,{"b":null}]},"n":3,"kubernetes.pod_name":"p"}"#,
+            // Fields the entry keeps, arriving after a large ignored one.
+            r#"{"junk":[1,2,3,4,5],"_msg":"after","_time":"2026-07-13T06:41:47Z"}"#,
+            // Missing _msg (keep-alive) and a non-string _msg are both dropped.
+            r#"{"_time":"2026-07-13T06:41:47Z"}"#,
+            r#"{"_msg":42}"#,
+            r#"{"_msg":null}"#,
+            r#"{"_msg":["a"]}"#,
+            r#"{"_msg":{"nested":"x"}}"#,
+            // Non-string optional fields fall back to empty, they do not drop.
+            r#"{"_msg":"m","_time":7,"kubernetes.pod_name":null,"kubernetes.container_name":{"x":1}}"#,
+            // An unparseable _time keeps the raw text and no nanos.
+            r#"{"_msg":"m","_time":"not-a-timestamp"}"#,
+            // Trailing newlines are trimmed off the message, all of them.
+            r#"{"_msg":"line\n"}"#,
+            r#"{"_msg":"line\n\n\n"}"#,
+            r#"{"_msg":"keep\nthe middle\n"}"#,
+            // Escapes force owned keys and values.
+            r#"{"_ms\u0067":"escaped key","kubernetes.pod_name":"p\u00e9"}"#,
+            // A repeated key: the last occurrence wins.
+            r#"{"_msg":"first","_msg":"second"}"#,
+            r#"{"_msg":"first","_msg":9}"#,
+            // Empty and non-object documents.
+            r#"{}"#,
+            r#"[]"#,
+            r#""bare string""#,
+            r#"null"#,
+            "not json",
+            "",
+            // Trailing content after a complete object is malformed.
+            r#"{"_msg":"m"} trailing"#,
+        ];
+
+        for line in cases {
+            let want = parse_entry_via_dom(line, &fields());
+            let got = parse_entry(line, &fields());
+            let shape = |e: &Option<LogEntry>| {
+                e.as_ref().map(|e| {
+                    (
+                        e.msg.clone(),
+                        e.pod.clone(),
+                        e.container.clone(),
+                        e.time.clone(),
+                        e.nanos,
+                    )
+                })
+            };
+            assert_eq!(shape(&got), shape(&want), "record {line}");
+        }
+    }
+
+    /// Field names come from config, so the visitor must read the configured
+    /// names and not the defaults it was written against.
+    #[test]
+    fn selective_visitor_honours_configured_field_names() {
+        let custom = Fields {
+            namespace: "ns".into(),
+            pod: "workload".into(),
+            container: "ctr".into(),
+        };
+        let line = r#"{"_msg":"m","workload":"api-1","ctr":"app","kubernetes.pod_name":"ignored"}"#;
+        let e = parse_entry(line, &custom).unwrap();
+        assert_eq!(e.pod, "api-1");
+        assert_eq!(e.container, "app");
+        assert_eq!(
+            parse_entry(line, &custom),
+            parse_entry_via_dom(line, &custom)
+        );
+
+        // A config that points two entry fields at one record field fills both.
+        let doubled = Fields {
+            namespace: "ns".into(),
+            pod: "who".into(),
+            container: "who".into(),
+        };
+        let line = r#"{"_msg":"m","who":"same"}"#;
+        let e = parse_entry(line, &doubled).unwrap();
+        assert_eq!((e.pod.as_str(), e.container.as_str()), ("same", "same"));
+
+        // A config that aims a field at `_msg` reads it, as the DOM did.
+        let overlap = Fields {
+            namespace: "ns".into(),
+            pod: "_msg".into(),
+            container: "ctr".into(),
+        };
+        let line = r#"{"_msg":"shared"}"#;
+        let e = parse_entry(line, &overlap).unwrap();
+        assert_eq!((e.msg.as_str(), e.pod.as_str()), ("shared", "shared"));
+    }
+
     #[test]
     fn entry_lines_prefix_and_timestamps() {
         let e = LogEntry {
@@ -1519,14 +1964,21 @@ mod tests {
 
     #[test]
     fn drain_lines_keeps_partial_tail() {
-        let mut buf = b"{\"a\":1}\n{\"b\":2}\n{\"part".to_vec();
-        assert_eq!(drain_lines(&mut buf), vec!["{\"a\":1}", "{\"b\":2}"]);
-        assert_eq!(buf, b"{\"part");
-        // No newline yet — nothing complete.
-        assert!(drain_lines(&mut buf).is_empty());
-        buf.extend_from_slice(b"\":3}\n");
-        assert_eq!(drain_lines(&mut buf), vec!["{\"part\":3}"]);
-        assert!(buf.is_empty());
+        let framed = |buf: &mut LineBuf| {
+            let mut out: Vec<String> = Vec::new();
+            buf.drain_lines(|l| out.push(l.to_string()));
+            out
+        };
+        let mut buf = LineBuf::default();
+        buf.extend(b"{\"a\":1}\n{\"b\":2}\n{\"part");
+        assert_eq!(framed(&mut buf), vec!["{\"a\":1}", "{\"b\":2}"]);
+        assert_eq!(buf.bytes, b"{\"part");
+        // No newline yet — nothing complete, and the tail is not re-scanned.
+        assert!(framed(&mut buf).is_empty());
+        assert_eq!(buf.scanned, buf.bytes.len());
+        buf.extend(b"\":3}\n");
+        assert_eq!(framed(&mut buf), vec!["{\"part\":3}"]);
+        assert!(buf.bytes.is_empty());
     }
 
     /// Live test against a real VictoriaLogs — opt-in:

@@ -22,14 +22,16 @@ Use the `Justfile`; it matches CI exactly.
 ```sh
 just check          # fmt-check + clippy (-D warnings) + cargo test
 just fmt            # cargo fmt --all
-just clippy         # cargo clippy --all-targets -- -D warnings
-just test           # cargo test
+just clippy         # cargo clippy --locked --all-targets -- -D warnings
+just test           # cargo test --locked
 just run <resource> # cargo run -- <resource> against the current kube context
 just smoke          # headless connectivity check (cargo run -- --check)
 ```
 
-CI runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`,
-and `cargo test`. All three must pass before a PR is ready.
+CI runs `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`,
+and `cargo test --locked`. All three must pass before a PR is ready.
+The locked checks reject dependency changes without a matching `Cargo.lock`
+update. Regenerate the lockfile with Cargo and commit it with the manifest change.
 
 ## Code
 

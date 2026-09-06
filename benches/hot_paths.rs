@@ -11,6 +11,7 @@
 //! - `metadata`    -> 3.3 (typed field lookup vs whole-meta serialization)
 //! - `log_filter`  -> 4.1 (O(n*m) substring scan)
 //! - `log_wrap`    -> 2.3 / 4.2 (full-buffer re-measure per frame)
+//! - `cell_extract` / `provider_selection` -> Tier 2/3 follow-up baselines
 
 use std::hint::black_box;
 
@@ -74,10 +75,11 @@ fn cells(c: &mut Criterion) {
 
     let pods: Vec<_> = (0..256).map(bs::pod).collect();
     let pod_spec = columns::build_spec("pods", None, None, false);
+    let now = columns::now_secs();
     g.bench_function("pods_256", |b| {
         b.iter(|| {
             for o in &pods {
-                black_box(pod_spec.cells(o));
+                black_box(pod_spec.cells(o, now));
             }
         });
     });
@@ -88,7 +90,7 @@ fn cells(c: &mut Criterion) {
     g.bench_function("helm_16", |b| {
         b.iter(|| {
             for o in &helm {
-                black_box(helm_spec.cells(o));
+                black_box(helm_spec.cells(o, now));
             }
         });
     });
@@ -285,14 +287,515 @@ fn helm_decode(c: &mut Criterion) {
             black_box(v)
         });
     });
+    // The double base64 decode Helm's payload needs, SIMD against scalar.
+    {
+        let wire = secret
+            .data
+            .pointer("/data/release")
+            .and_then(serde_json::Value::as_str)
+            .expect("fixture payload")
+            .to_string();
+        let scalar = base64::engine::general_purpose::STANDARD;
+        let simd = base64::engine::Simd::standard(Default::default());
+        fn twice<E: base64::Engine>(e: &E, wire: &str) -> Vec<u8> {
+            let inner = e.decode(wire).expect("outer base64");
+            e.decode(inner).expect("inner base64")
+        }
+        g.bench_function("base64_scalar", |b| {
+            b.iter(|| black_box(twice(&scalar, black_box(&wire))));
+        });
+        g.bench_function("base64_simd", |b| {
+            b.iter(|| black_box(twice(&simd, black_box(&wire))));
+        });
+    }
     g.bench_function("parse_typed", |b| {
         b.iter(|| black_box(sofka::helm::parse_release_json(black_box(&json))));
     });
     g.finish();
 }
 
+/// Tier 3 — targeted structured-filter extraction. The baseline forces the
+/// borrowed JSON string into an owned `String`, matching the old `sget ->
+/// String` contract; production consumes the `Cow::Borrowed` directly.
+fn cell_extract(c: &mut Criterion) {
+    let mut g = c.benchmark_group("cell_extract");
+    let pods: Vec<_> = (0..2_000).map(bs::pod).collect();
+    let spec = columns::build_spec("pods", None, None, true);
+
+    g.bench_function("borrowed_ip_2000", |b| {
+        b.iter(|| {
+            for pod in &pods {
+                black_box(
+                    spec.cell_at(black_box(pod), 4, columns::now_secs())
+                        .unwrap(),
+                );
+            }
+        });
+    });
+    g.bench_function("owned_ip_baseline_2000", |b| {
+        b.iter(|| {
+            for pod in &pods {
+                black_box(
+                    spec.cell_at(black_box(pod), 4, columns::now_secs())
+                        .unwrap()
+                        .into_owned(),
+                );
+            }
+        });
+    });
+    g.finish();
+}
+
+/// The per-frame clock. `now` measures the shipped path — one reading threaded
+/// through the row — against the previous one, where each elapsed cell read the
+/// clock for itself.
+fn frame_clock(c: &mut Criterion) {
+    let mut g = c.benchmark_group("frame_clock");
+    let pods: Vec<_> = (0..2_000).map(bs::pod).collect();
+    let spec = columns::build_spec("pods", None, None, false);
+    // AGE is the elapsed cell this measures, and it is not column 0 — that is
+    // NAME, which is not volatile, so both sides would have returned `None`
+    // and timed the clock call against an empty result.
+    let age = spec
+        .header_index("AGE")
+        .expect("pods view must have an AGE column");
+    assert!(
+        spec.volatile(&pods[0], "pods", age, columns::now_secs())
+            .is_some(),
+        "AGE must render an elapsed value, or this measures nothing"
+    );
+
+    g.bench_function("one_reading_per_frame_2000", |b| {
+        b.iter(|| {
+            let now = columns::now_secs();
+            for pod in &pods {
+                black_box(spec.volatile(pod, "pods", age, now));
+            }
+        });
+    });
+    g.bench_function("one_reading_per_cell_2000", |b| {
+        b.iter(|| {
+            for pod in &pods {
+                black_box(spec.volatile(pod, "pods", age, columns::now_secs()));
+            }
+        });
+    });
+    g.finish();
+}
+
+/// Tier 2 — provider autodiscovery. Both implementations use `min_by_key`;
+/// the baseline first collects every candidate into a `Vec`, while production
+/// feeds the filtered iterator directly into the minimum selection.
+fn provider_selection(c: &mut Criterion) {
+    let mut g = c.benchmark_group("provider_selection");
+    let services = bs::services(256);
+
+    g.bench_function("logs_streaming_256", |b| {
+        b.iter(|| black_box(bs::pick_log_service(black_box(&services))));
+    });
+    g.bench_function("logs_collected_baseline_256", |b| {
+        b.iter(|| black_box(bs::pick_log_service_collected(black_box(&services))));
+    });
+    g.bench_function("metrics_streaming_256", |b| {
+        b.iter(|| black_box(bs::pick_metrics_service(black_box(&services))));
+    });
+    g.bench_function("metrics_collected_baseline_256", |b| {
+        b.iter(|| black_box(bs::pick_metrics_service_collected(black_box(&services))));
+    });
+    g.finish();
+}
+
+/// The extract-then-render path the borrowed one replaced: an owned `Value`
+/// for the whole subtree, then the same formatting. The shipped `render_cell`
+/// produces exactly this text without the clone.
+fn render_owned(obj: &kube::core::DynamicObject, pointer: &str) -> String {
+    use serde_json::Value;
+    let Some(v) = sofka::views::extract(obj, pointer) else {
+        return "<none>".into();
+    };
+    match v {
+        Value::Null => "<none>".into(),
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        ref other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// Custom-column extraction: the shipped borrowed result against the owned
+/// `Value` it replaced, over the shapes a printer column actually points at.
+fn custom_columns(c: &mut Criterion) {
+    let mut g = c.benchmark_group("custom_columns");
+    let pods: Vec<_> = (0..2_000).map(bs::pod).collect();
+    let col = |pointer: &str| sofka::views::UserColumn {
+        header: "COL".into(),
+        pointer: pointer.into(),
+        kind: sofka::views::ColumnKind::Text,
+        wide: false,
+        width: None,
+        align: None,
+        condition_field: None,
+    };
+    let now = columns::now_secs();
+
+    for (name, pointer) in [
+        ("scalar", "/status/phase"),
+        ("label", "/metadata/labels/app.kubernetes.io~1name"),
+        ("array", "/spec/containers"),
+        ("nested", "/spec/containers/0/resources"),
+    ] {
+        let column = col(pointer);
+        g.bench_with_input(BenchmarkId::new("render_2000", name), &column, |b, col| {
+            b.iter(|| {
+                for pod in &pods {
+                    black_box(sofka::views::render_cell(pod, col, now));
+                }
+            });
+        });
+        g.bench_with_input(
+            BenchmarkId::new("owned_baseline_2000", name),
+            &column,
+            |b, col| {
+                b.iter(|| {
+                    for pod in &pods {
+                        black_box(render_owned(pod, &col.pointer));
+                    }
+                });
+            },
+        );
+    }
+    g.finish();
+}
+
+/// 2.4b — just the viewport half of a frame: the row-key resolution and the
+/// cell-cache warming the renderer does for every visible row, without the
+/// terminal write. Isolates the per-row identity work from the buffer diff.
+fn viewport(c: &mut Criterion) {
+    let mut g = c.benchmark_group("viewport");
+    for n in [500usize, 2_000] {
+        let (app, _rx) = bs::pods_app_with_metrics(n);
+        black_box(app.row_count());
+        g.bench_with_input(BenchmarkId::new("warm_47", n), &n, |b, _| {
+            b.iter(|| black_box(bs::warm_viewport(&app, 0, 47)));
+        });
+    }
+    g.finish();
+}
+
+/// Provider log records: the shipped selective visitor against the
+/// `serde_json::Value` DOM it replaced, over records carrying the extra fields
+/// an ingestion pipeline attaches.
+fn provider_records(c: &mut Criterion) {
+    let mut g = c.benchmark_group("provider_records");
+
+    for extra in [0usize, 12] {
+        let fields: String = (0..extra)
+            .map(|i| format!(r#","field_{i}":"value {i}""#))
+            .collect();
+        let lines: Vec<String> = (0..10_000)
+            .map(|i| {
+                format!(
+                    r#"{{"_time":"2026-09-05T12:00:00Z","_msg":"request {i} served","kubernetes.pod_name":"api-{i}","kubernetes.container_name":"app"{fields}}}"#
+                )
+            })
+            .collect();
+
+        g.bench_with_input(
+            BenchmarkId::new("visitor_10000", extra),
+            &lines,
+            |b, lines| {
+                b.iter(|| {
+                    for l in lines {
+                        black_box(sofka::providers::bench_parse_entry(l));
+                    }
+                });
+            },
+        );
+        g.bench_with_input(
+            BenchmarkId::new("dom_baseline_10000", extra),
+            &lines,
+            |b, lines| {
+                b.iter(|| {
+                    for l in lines {
+                        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                        black_box((
+                            v.get("_msg").and_then(|v| v.as_str()).map(str::to_string),
+                            v.get("_time").and_then(|v| v.as_str()).map(str::to_string),
+                            v.get("kubernetes.pod_name")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
+                            v.get("kubernetes.container_name")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
+                        ));
+                    }
+                });
+            },
+        );
+    }
+    g.finish();
+}
+
+/// The fuzzy matcher, over the two shapes it runs in: one needle against every
+/// row of a store, and the highlight positions the renderer asks for.
+fn fuzzy(c: &mut Criterion) {
+    let mut g = c.benchmark_group("fuzzy");
+    let names: Vec<String> = (0..20_000)
+        .map(|i| format!("kube-httpcache-{i:05}"))
+        .collect();
+    let f = sofka::fuzzy::Fuzzy::new();
+
+    g.bench_function("score_20000", |b| {
+        b.iter(|| {
+            for n in &names {
+                black_box(f.score(n, "khc"));
+            }
+        });
+    });
+    g.bench_function("indices_visible_50", |b| {
+        b.iter(|| {
+            for n in names.iter().take(50) {
+                black_box(f.indices(n, "khc"));
+            }
+        });
+    });
+    g.finish();
+}
+
+/// The memoized per-frame models: headers and the picker lists. Each pair is
+/// the memo against the rebuild it replaced.
+fn frame_models(c: &mut Criterion) {
+    let mut g = c.benchmark_group("frame_models");
+    let (app, _rx) = bs::pods_app(2_000);
+
+    g.bench_function("display_headers", |b| {
+        b.iter(|| black_box(app.display_headers()));
+    });
+
+    let (ctx_app, _ctx_rx) = bs::contexts_app(2_000);
+    g.bench_function("filtered_contexts_2000", |b| {
+        b.iter(|| black_box(ctx_app.filtered_contexts()));
+    });
+    g.bench_function("filtered_sort_entries", |b| {
+        b.iter(|| black_box(app.filtered_sort_entries()));
+    });
+    g.finish();
+}
+
+/// The dependency swaps whose baseline is in `std`, each against the
+/// implementation it replaced. The fuzzy matcher is measured in `fuzzy` above;
+/// its predecessor is not carried as a dependency just to benchmark it.
+fn dependencies(c: &mut Criterion) {
+    let mut g = c.benchmark_group("dependencies");
+
+    // --- hasher: foldhash against SipHash, over real row keys ---------------
+    // The shape that matters is a filter keystroke, which looks up every key
+    // in the store once. Keys are `namespace/name`, as the store holds them.
+    for n in [2_000usize, 20_000] {
+        let keys: Vec<std::rc::Rc<str>> = (0..n)
+            .map(|i| std::rc::Rc::from(format!("namespace-{}/pod-{i:05}", i % 40).as_str()))
+            .collect();
+
+        let mut fold: sofka::store::FastMap<std::rc::Rc<str>, u32> = Default::default();
+        let mut sip: std::collections::HashMap<std::rc::Rc<str>, u32> = Default::default();
+        for (i, k) in keys.iter().enumerate() {
+            fold.insert(k.clone(), i as u32);
+            sip.insert(k.clone(), i as u32);
+        }
+
+        g.bench_with_input(BenchmarkId::new("lookup_foldhash", n), &n, |b, _| {
+            b.iter(|| {
+                for k in &keys {
+                    black_box(fold.get(k.as_ref()));
+                }
+            });
+        });
+        g.bench_with_input(BenchmarkId::new("lookup_siphash", n), &n, |b, _| {
+            b.iter(|| {
+                for k in &keys {
+                    black_box(sip.get(k.as_ref()));
+                }
+            });
+        });
+    }
+
+    g.finish();
+}
+
+/// 2.4 — one full table frame: the viewport query, cell-cache warming, the
+/// per-row widget build (volatile cells, metrics, width measurement) and the
+/// column layout + mouse geometry. This is the unit a redraw actually costs,
+/// and the one the render findings (canonical row keys, hidden columns,
+/// per-frame header/layout rebuilds) are about.
+fn frame(c: &mut Criterion) {
+    let mut g = c.benchmark_group("frame");
+
+    for n in [500usize, 2_000] {
+        let (mut app, _rx) = bs::pods_app_with_metrics(n);
+        app.table_state.select(Some(0));
+        let mut term = bs::terminal(200, 50);
+        // A fixture that renders the wrong columns measures the wrong work.
+        assert!(
+            bs::headers(&app).iter().any(|h| h == "STATUS"),
+            "pods fixture must render the real pod columns, got {:?}",
+            bs::headers(&app)
+        );
+        bs::render_frame(&mut term, &mut app);
+        g.bench_with_input(BenchmarkId::new("table", n), &n, |b, _| {
+            b.iter(|| bs::render_frame(&mut term, &mut app));
+        });
+    }
+
+    // Horizontally scrolled: three columns are off the left edge, so their
+    // cells are formatted and measured but never drawn.
+    {
+        let n = 2_000usize;
+        let (mut app, _rx) = bs::pods_app_with_metrics(n);
+        app.table_state.select(Some(0));
+        app.col_offset = 3;
+        let mut term = bs::terminal(200, 50);
+        bs::render_frame(&mut term, &mut app);
+        g.bench_with_input(BenchmarkId::new("table_scrolled", n), &n, |b, _| {
+            b.iter(|| bs::render_frame(&mut term, &mut app));
+        });
+    }
+
+    // A watch event between frames: the row it touched re-renders, the rest of
+    // the viewport comes from the cell cache.
+    {
+        let n = 2_000usize;
+        let (mut app, _rx) = bs::pods_app_with_metrics(n);
+        app.table_state.select(Some(0));
+        let mut term = bs::terminal(200, 50);
+        bs::render_frame(&mut term, &mut app);
+        g.bench_with_input(BenchmarkId::new("event_then_frame", n), &n, |b, _| {
+            let mut i = 0usize;
+            b.iter(|| {
+                bs::touch_one(&mut app, i % n);
+                i += 1;
+                bs::render_frame(&mut term, &mut app);
+            });
+        });
+    }
+
+    g.finish();
+}
+
+/// 4.x — one full frame of the logs view. Every visible line is re-parsed for
+/// severity, re-split into ANSI runs, re-highlighted and (when wrapping)
+/// re-wrapped on every redraw, so this is the number a paused or streaming log
+/// viewport actually costs.
+fn log_frame(c: &mut Criterion) {
+    let mut g = c.benchmark_group("log_frame");
+    for (label, filter, wrap) in [
+        ("plain", "", false),
+        ("wrapped", "", true),
+        ("filtered", "reconcile", false),
+    ] {
+        let (mut app, _rx) = bs::logs_app(10_000, filter, wrap);
+        let mut term = bs::terminal(200, 50);
+        bs::render_frame(&mut term, &mut app);
+        g.bench_function(label, |b| {
+            b.iter(|| bs::render_frame(&mut term, &mut app));
+        });
+    }
+
+    // One 256 KB record at the tail: the viewport shows a handful of its rows.
+    let (mut app, _rx) = bs::logs_app_huge_line(1_000, 256 * 1024);
+    let mut term = bs::terminal(200, 50);
+    bs::render_frame(&mut term, &mut app);
+    g.bench_function("huge_line", |b| {
+        b.iter(|| bs::render_frame(&mut term, &mut app));
+    });
+    g.finish();
+}
+
+/// 4.x — a static YAML document redrawn. Nothing about it changes between
+/// frames, but the syntax spans and search highlighting are rebuilt each time.
+fn doc_frame(c: &mut Criterion) {
+    let mut g = c.benchmark_group("doc_frame");
+    for (label, filter) in [("plain", ""), ("filtered", "image")] {
+        let (mut app, _rx) = bs::doc_app(5_000, filter);
+        let mut term = bs::terminal(200, 50);
+        bs::render_frame(&mut term, &mut app);
+        g.bench_function(label, |b| {
+            b.iter(|| bs::render_frame(&mut term, &mut app));
+        });
+    }
+    g.finish();
+}
+
+/// 2.7 — modal overlays. Help rebuilds every binding line (and its search
+/// text) per frame; the namespace picker re-scores and re-clones its list.
+fn overlay_frame(c: &mut Criterion) {
+    let mut g = c.benchmark_group("overlay_frame");
+    for (label, filter) in [("help", ""), ("help_search", "log")] {
+        let (mut app, _rx) = bs::help_app(filter);
+        let mut term = bs::terminal(200, 50);
+        bs::render_frame(&mut term, &mut app);
+        g.bench_function(label, |b| {
+            b.iter(|| bs::render_frame(&mut term, &mut app));
+        });
+    }
+    for (label, filter) in [("ns_browse", ""), ("ns_filtered", "team-01")] {
+        let (mut app, _rx) = bs::ns_picker_app(500, filter);
+        let mut term = bs::terminal(200, 50);
+        bs::render_frame(&mut term, &mut app);
+        g.bench_function(label, |b| {
+            b.iter(|| bs::render_frame(&mut term, &mut app));
+        });
+    }
+    g.finish();
+}
+
+/// 3.x — the table frame with a fuzzy filter active, so every visible NAME
+/// cell re-runs the fuzzy matcher and rebuilds its highlight runs.
+fn name_cells(c: &mut Criterion) {
+    let mut g = c.benchmark_group("name_cells");
+    let (mut app, _rx) = bs::pods_app(2_000);
+    app.filter = "workload".to_string();
+    app.table_state.select(Some(0));
+    black_box(app.row_count());
+    let mut term = bs::terminal(200, 50);
+    bs::render_frame(&mut term, &mut app);
+    g.bench_function("filtered_frame/2000", |b| {
+        b.iter(|| bs::render_frame(&mut term, &mut app));
+    });
+    g.finish();
+}
+
+/// 4.3 — provider log ingest: framing one received chunk, parsing each record
+/// and rendering it into display lines. `fragmented` is one long record
+/// arriving in 4 KB pieces, which re-scans the incomplete buffer each time.
+fn provider_ingest(c: &mut Criterion) {
+    let mut g = c.benchmark_group("provider_ingest");
+    for n in [256usize, 2_000] {
+        let chunk = bs::provider_chunk(n);
+        g.bench_with_input(BenchmarkId::new("chunk", n), &n, |b, _| {
+            b.iter(|| black_box(sofka::providers::bench_ingest_chunk(black_box(&chunk))));
+        });
+    }
+    let record = bs::provider_long_record(512 * 1024);
+    g.bench_function("fragmented_512k", |b| {
+        b.iter(|| {
+            black_box(sofka::providers::bench_ingest_fragmented(
+                black_box(&record),
+                4096,
+            ))
+        });
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
+    frame,
+    viewport,
+    log_frame,
+    doc_frame,
+    overlay_frame,
+    name_cells,
+    provider_ingest,
     rows_cache,
     filter,
     filter_cmp,
@@ -303,6 +806,14 @@ criterion_group!(
     metadata,
     log_filter,
     log_wrap,
-    log_viewport
+    log_viewport,
+    cell_extract,
+    provider_selection,
+    frame_clock,
+    custom_columns,
+    provider_records,
+    fuzzy,
+    frame_models,
+    dependencies
 );
 criterion_main!(benches);

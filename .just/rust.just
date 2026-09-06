@@ -17,11 +17,11 @@ fmt-check:
 
 # Run clippy with the same policy as CI.
 clippy:
-    cd "{{ root }}" && cargo clippy --all-targets -- -D warnings
+    cd "{{ root }}" && cargo clippy --locked --all-targets -- -D warnings
 
 # Run the unit test suite.
 test:
-    cd "{{ root }}" && cargo test
+    cd "{{ root }}" && cargo test --locked
 
 # Build the debug binary.
 build:

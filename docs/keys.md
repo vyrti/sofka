@@ -12,7 +12,7 @@ pickers keep both characters available as input.
 | `:<resource>`                                 | command palette - fuzzy over kinds and built-in commands                                                                                                      |
 | `:<resource> <ns>`                            | switch kind and namespace at once (`:deploy social`; `all`/`*` = all namespaces; the namespace tab-completes)                                                 |
 | `[` / `]`                                     | view history - back / forward through visited kind+namespace views                                                                                            |
-| `Tab` / `shift-Tab`                           | cycle views of the active workspace (when one is open)                                                                                                        |
+| `Tab` / `shift-Tab`                           | next / previous common resource in the current namespace; cycle workspace views when one is open                                                              |
 | `enter`                                       | drill down (workload/svc → pods, cronjob → jobs, node → pods, pod → containers, ns → re-scope, CRD → resources, or [views](views.md))                         |
 | `esc`                                         | go back / pop the view stack / clear filter / clear marks                                                                                                     |
 | `j`/`k`, `↓`/`↑`, `g`/`G`                     | navigate                                                                                                                                                      |
@@ -113,3 +113,14 @@ and `ctrl-e` (compact mode) are reserved by built-ins and can't be bound.
 Interactive actions (`e`, `s` for shell, `a`) suspend the TUI and shell out to
 `kubectl`. Delete, scale, restart, set-image, suspend, resume, reconcile, and
 port-forward go through the kube API (or a backgrounded process) directly.
+
+## Plugin commands
+
+| Command                      | Action                                                |
+| ---------------------------- | ----------------------------------------------------- |
+| `:<plugin> [name=value ...]` | Run a plugin with validated inputs.                   |
+| `:plugin-cancel`             | Stop the active plugin run and its temporary forward. |
+
+Installed packages add their commands and key chords to `?` help.
+Use `:reload` after a package change.
+See [Create a plugin package](plugin-authoring.md).
