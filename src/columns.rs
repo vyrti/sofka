@@ -4,13 +4,17 @@
 //! hand-written renderer per resource, known kinds get curated columns and
 //! everything else falls back to NAME/AGE pulled from metadata.
 
+use std::borrow::Cow;
 use std::cell::OnceCell;
 
 use k8s_openapi::jiff::Timestamp;
 use kube::core::DynamicObject;
 use serde_json::Value;
 
-type CellFn = for<'a> fn(&CellContext<'a>) -> String;
+/// Curated extractors borrow values that already live in the Kubernetes
+/// object and own only derived/formatted values. Cached full rows convert the
+/// result once; one-column filter/sort probes can consume borrowed text.
+type CellFn = for<'a> fn(&CellContext<'a>) -> Cow<'a, str>;
 
 struct Column {
     header: &'static str,
@@ -36,17 +40,22 @@ struct CellContext<'a> {
     obj: &'a DynamicObject,
     data: &'a Value,
     name: &'a str,
+    /// Wall clock for the frame this row belongs to, epoch seconds. Read by
+    /// every elapsed-time cell so one row cannot straddle a second boundary
+    /// mid-render and show AGE `59s` above DURATION measured a tick later.
+    now: i64,
     age: OnceCell<String>,
     pod: OnceCell<(String, String, String)>,
     helm: OnceCell<Option<crate::helm::Summary>>,
 }
 
 impl<'a> CellContext<'a> {
-    fn new(obj: &'a DynamicObject) -> Self {
+    fn new(obj: &'a DynamicObject, now: i64) -> Self {
         CellContext {
             obj,
             data: &obj.data,
             name: obj.metadata.name.as_deref().unwrap_or_default(),
+            now,
             age: OnceCell::new(),
             pod: OnceCell::new(),
             helm: OnceCell::new(),
@@ -54,7 +63,7 @@ impl<'a> CellContext<'a> {
     }
 
     fn age(&self) -> &str {
-        self.age.get_or_init(|| age(self.obj))
+        self.age.get_or_init(|| age(self.obj, self.now))
     }
 
     /// `(READY, STATUS, RESTARTS)` — one walk of `containerStatuses` for all
@@ -355,10 +364,13 @@ pub fn headers(plural: &str) -> Vec<&'static str> {
 /// Cells for one object, aligned with [`headers`]. The 2nd return value is the
 /// index of the column that should be colorized as a status (or None).
 #[cfg(test)]
-pub fn cells(obj: &DynamicObject, plural: &str) -> (Vec<String>, Option<usize>) {
-    let ctx = CellContext::new(obj);
+pub fn cells(obj: &DynamicObject, plural: &str, now: i64) -> (Vec<String>, Option<usize>) {
+    let ctx = CellContext::new(obj, now);
     let columns = columns_for(plural);
-    let values = columns.iter().map(|c| (c.extract)(&ctx)).collect();
+    let values = columns
+        .iter()
+        .map(|c| (c.extract)(&ctx).into_owned())
+        .collect();
     let status_idx = columns.iter().position(|c| c.is_status);
     (values, status_idx)
 }
@@ -467,14 +479,14 @@ impl ViewSpec {
 
     /// Cells for one object, aligned with [`Self::headers`], plus the index
     /// of the status column (if any).
-    pub fn cells(&self, obj: &DynamicObject) -> (Vec<String>, Option<usize>) {
-        let ctx = CellContext::new(obj);
+    pub fn cells(&self, obj: &DynamicObject, now: i64) -> (Vec<String>, Option<usize>) {
+        let ctx = CellContext::new(obj, now);
         let values = self
             .columns
             .iter()
             .map(|c| match &c.source {
-                SpecSource::Curated(extract) => extract(&ctx),
-                SpecSource::User(uc) => crate::views::render_cell(obj, uc),
+                SpecSource::Curated(extract) => extract(&ctx).into_owned(),
+                SpecSource::User(uc) => crate::views::render_cell(obj, uc, now),
             })
             .collect();
         (values, self.status_idx)
@@ -482,14 +494,46 @@ impl ViewSpec {
 
     /// See [`volatile_cell`]. User `time` columns re-render every frame too:
     /// their humanized elapsed value drifts with wall time.
-    pub fn volatile(&self, obj: &DynamicObject, plural: &str, idx: usize) -> Option<String> {
+    pub fn volatile(
+        &self,
+        obj: &DynamicObject,
+        plural: &str,
+        idx: usize,
+        now: i64,
+    ) -> Option<String> {
         let col = self.columns.get(idx)?;
         match &col.source {
             SpecSource::User(uc) if uc.kind == crate::views::ColumnKind::Time => {
-                Some(crate::views::render_cell(obj, uc))
+                Some(crate::views::render_cell(obj, uc, now))
             }
             SpecSource::User(_) => None,
-            SpecSource::Curated(_) => volatile_cell(obj, plural, &col.header),
+            SpecSource::Curated(_) => volatile_cell(obj, plural, &col.header, now),
+        }
+    }
+
+    /// Whether column `idx` can render a different value for the *same* object
+    /// revision: every extractor that reads the clock, plus user `time`
+    /// columns. Object-independent (and deliberately conservative about
+    /// `jobs`/DURATION, which depends on the object), so a caller can decide
+    /// once per view whether a cached cell may be reused.
+    ///
+    /// Wider than [`volatile_cell`]: helm UPDATED is elapsed time too, but it
+    /// is recomputed by re-running the extractor (which decodes the release
+    /// payload) rather than by the per-frame cheap path.
+    pub fn volatile_column(&self, plural: &str, idx: usize) -> bool {
+        let Some(col) = self.columns.get(idx) else {
+            return false;
+        };
+        match &col.source {
+            SpecSource::User(uc) => uc.kind == crate::views::ColumnKind::Time,
+            SpecSource::Curated(_) => matches!(
+                (plural, col.header.as_str()),
+                (_, "AGE")
+                    | ("jobs", "DURATION")
+                    | ("cronjobs", "LAST-SCHEDULE")
+                    | ("helm", "UPDATED")
+                    | ("helmhistory", "UPDATED")
+            ),
         }
     }
 
@@ -503,13 +547,19 @@ impl ViewSpec {
 
     /// The single cell at `idx` for one object. Filter comparisons read one
     /// column of every object — extracting the full row per object per
-    /// rebuild is what this avoids.
-    pub fn cell_at(&self, obj: &DynamicObject, idx: usize) -> Option<String> {
+    /// rebuild is what this avoids. Curated JSON/name cells borrow from
+    /// `obj`; user columns and computed curated cells remain owned.
+    pub fn cell_at<'a>(
+        &self,
+        obj: &'a DynamicObject,
+        idx: usize,
+        now: i64,
+    ) -> Option<Cow<'a, str>> {
         let col = self.columns.get(idx)?;
         Some(match &col.source {
-            SpecSource::User(uc) => crate::views::render_cell(obj, uc),
+            SpecSource::User(uc) => Cow::Owned(crate::views::render_cell(obj, uc, now)),
             SpecSource::Curated(extract) => {
-                let ctx = CellContext::new(obj);
+                let ctx = CellContext::new(obj, now);
                 extract(&ctx)
             }
         })
@@ -525,17 +575,22 @@ impl ViewSpec {
 
     /// Comparable value of `header`'s cell for `obj`, or `None` when the
     /// header isn't in this spec.
-    pub fn sort_value(&self, obj: &DynamicObject, header: &str) -> Option<crate::views::SortValue> {
+    pub fn sort_value(
+        &self,
+        obj: &DynamicObject,
+        header: &str,
+        now: i64,
+    ) -> Option<crate::views::SortValue> {
         let col = self.columns.iter().find(|c| c.header == header)?;
         Some(match &col.source {
-            SpecSource::User(uc) => crate::views::sort_value(obj, uc),
+            SpecSource::User(uc) => crate::views::sort_value(obj, uc, now),
             SpecSource::Curated(extract) => {
-                let ctx = CellContext::new(obj);
+                let ctx = CellContext::new(obj, now);
                 let v = extract(&ctx);
                 if is_numeric_header(&self.plural, header) {
                     crate::views::SortValue::Num(parse_leading_num(&v))
                 } else {
-                    crate::views::SortValue::Text(v.to_lowercase())
+                    crate::views::SortValue::Text(v.to_lowercase().to_string())
                 }
             }
         })
@@ -594,125 +649,137 @@ pub(crate) fn parse_leading_num(s: &str) -> f64 {
 /// Cells whose display value changes with wall time even when the Kubernetes
 /// resourceVersion is unchanged. Table rendering can override cached values
 /// with these without recomputing every curated column.
-pub fn volatile_cell(obj: &DynamicObject, plural: &str, header: &str) -> Option<String> {
+pub fn volatile_cell(obj: &DynamicObject, plural: &str, header: &str, now: i64) -> Option<String> {
     match (plural, header) {
-        (_, "AGE") => Some(age(obj)),
+        (_, "AGE") => Some(age(obj, now)),
         ("jobs", "DURATION") if sget(&obj.data, &["status", "completionTime"]).is_none() => {
-            Some(job_duration(&obj.data))
+            Some(job_duration(&obj.data, now))
         }
         ("cronjobs", "LAST-SCHEDULE") => {
-            Some(time_since(&obj.data, &["status", "lastScheduleTime"]))
+            Some(time_since(&obj.data, &["status", "lastScheduleTime"], now))
         }
         _ => None,
     }
 }
 
-fn col_name(ctx: &CellContext<'_>) -> String {
-    ctx.name.to_string()
+fn col_name<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(ctx.name)
 }
 
-fn col_age(ctx: &CellContext<'_>) -> String {
-    ctx.age().to_string()
+fn col_age<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(ctx.age().to_string())
 }
 
-fn col_pod_ready(ctx: &CellContext<'_>) -> String {
-    ctx.pod().0.clone()
+fn col_pod_ready<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(ctx.pod().0.clone())
 }
 
-fn col_pod_status(ctx: &CellContext<'_>) -> String {
-    ctx.pod().1.clone()
+fn col_pod_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(ctx.pod().1.clone())
 }
 
-fn col_pod_restarts(ctx: &CellContext<'_>) -> String {
-    ctx.pod().2.clone()
+fn col_pod_restarts<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(ctx.pod().2.clone())
 }
 
-fn col_pod_ip(ctx: &CellContext<'_>) -> String {
-    sget(ctx.data, &["status", "podIP"]).unwrap_or_else(|| "<none>".into())
+fn col_pod_ip<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["status", "podIP"]).unwrap_or("<none>"))
 }
 
-fn col_pod_node(ctx: &CellContext<'_>) -> String {
-    sget(ctx.data, &["spec", "nodeName"]).unwrap_or_else(|| "<none>".into())
+fn col_pod_node<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["spec", "nodeName"]).unwrap_or("<none>"))
 }
 
-fn col_deploy_ready(ctx: &CellContext<'_>) -> String {
-    format!(
+fn col_deploy_ready<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(format!(
         "{}/{}",
         iget(ctx.data, &["status", "readyReplicas"]),
         iget(ctx.data, &["status", "replicas"])
-    )
+    ))
 }
 
-fn col_deploy_updated(ctx: &CellContext<'_>) -> String {
-    iget(ctx.data, &["status", "updatedReplicas"]).to_string()
+fn col_deploy_updated<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(iget(ctx.data, &["status", "updatedReplicas"]).to_string())
 }
 
-fn col_deploy_available(ctx: &CellContext<'_>) -> String {
-    iget(ctx.data, &["status", "availableReplicas"]).to_string()
+fn col_deploy_available<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(iget(ctx.data, &["status", "availableReplicas"]).to_string())
 }
 
-fn col_rs_desired(ctx: &CellContext<'_>) -> String {
-    iget(ctx.data, &["spec", "replicas"]).to_string()
+fn col_rs_desired<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(iget(ctx.data, &["spec", "replicas"]).to_string())
 }
 
-fn col_rs_current(ctx: &CellContext<'_>) -> String {
-    iget(ctx.data, &["status", "replicas"]).to_string()
+fn col_rs_current<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(iget(ctx.data, &["status", "replicas"]).to_string())
 }
 
-fn col_rs_ready(ctx: &CellContext<'_>) -> String {
-    iget(ctx.data, &["status", "readyReplicas"]).to_string()
+fn col_rs_ready<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(iget(ctx.data, &["status", "readyReplicas"]).to_string())
 }
 
-fn col_sts_ready(ctx: &CellContext<'_>) -> String {
-    format!(
+fn col_sts_ready<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(format!(
         "{}/{}",
         iget(ctx.data, &["status", "readyReplicas"]),
         iget(ctx.data, &["spec", "replicas"])
-    )
+    ))
 }
 
-fn col_ds_desired(ctx: &CellContext<'_>) -> String {
-    iget(ctx.data, &["status", "desiredNumberScheduled"]).to_string()
+fn col_ds_desired<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(iget(ctx.data, &["status", "desiredNumberScheduled"]).to_string())
 }
 
-fn col_ds_current(ctx: &CellContext<'_>) -> String {
-    iget(ctx.data, &["status", "currentNumberScheduled"]).to_string()
+fn col_ds_current<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(iget(ctx.data, &["status", "currentNumberScheduled"]).to_string())
 }
 
-fn col_ds_ready(ctx: &CellContext<'_>) -> String {
-    iget(ctx.data, &["status", "numberReady"]).to_string()
+fn col_ds_ready<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(iget(ctx.data, &["status", "numberReady"]).to_string())
 }
 
-fn col_ds_available(ctx: &CellContext<'_>) -> String {
-    iget(ctx.data, &["status", "numberAvailable"]).to_string()
+fn col_ds_available<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(iget(ctx.data, &["status", "numberAvailable"]).to_string())
 }
 
-fn col_deploy_status(ctx: &CellContext<'_>) -> String {
+fn col_deploy_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     if ctx.obj.metadata.deletion_timestamp.is_some() {
         return "Terminating".into();
     }
-    workload_status(ctx.data, WorkloadCounts::deployment(ctx.data))
+    Cow::Owned(workload_status(
+        ctx.data,
+        WorkloadCounts::deployment(ctx.data),
+    ))
 }
 
-fn col_sts_status(ctx: &CellContext<'_>) -> String {
+fn col_sts_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     if ctx.obj.metadata.deletion_timestamp.is_some() {
         return "Terminating".into();
     }
-    workload_status(ctx.data, WorkloadCounts::statefulset(ctx.data))
+    Cow::Owned(workload_status(
+        ctx.data,
+        WorkloadCounts::statefulset(ctx.data),
+    ))
 }
 
-fn col_rs_status(ctx: &CellContext<'_>) -> String {
+fn col_rs_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     if ctx.obj.metadata.deletion_timestamp.is_some() {
         return "Terminating".into();
     }
-    workload_status(ctx.data, WorkloadCounts::replicaset(ctx.data))
+    Cow::Owned(workload_status(
+        ctx.data,
+        WorkloadCounts::replicaset(ctx.data),
+    ))
 }
 
-fn col_ds_status(ctx: &CellContext<'_>) -> String {
+fn col_ds_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     if ctx.obj.metadata.deletion_timestamp.is_some() {
         return "Terminating".into();
     }
-    workload_status(ctx.data, WorkloadCounts::daemonset(ctx.data))
+    Cow::Owned(workload_status(
+        ctx.data,
+        WorkloadCounts::daemonset(ctx.data),
+    ))
 }
 
 /// The replica counts a workload's health is judged by, normalized across
@@ -828,210 +895,220 @@ fn condition<'a>(d: &'a Value, ty: &str) -> Option<&'a Value> {
         .find(|c| c.get("type").and_then(Value::as_str) == Some(ty))
 }
 
-fn col_service_type(ctx: &CellContext<'_>) -> String {
-    service_type(ctx.data)
+fn col_service_type<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(service_type(ctx.data))
 }
 
-fn col_service_cluster_ip(ctx: &CellContext<'_>) -> String {
-    sget(ctx.data, &["spec", "clusterIP"]).unwrap_or_else(|| "<none>".into())
+fn col_service_cluster_ip<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["spec", "clusterIP"]).unwrap_or("<none>"))
 }
 
-fn col_service_external_ip(ctx: &CellContext<'_>) -> String {
-    external_ip(ctx.data, &service_type(ctx.data))
+fn col_service_external_ip<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(external_ip(ctx.data, service_type(ctx.data)))
 }
 
-fn col_service_ports(ctx: &CellContext<'_>) -> String {
-    svc_ports(ctx.data)
+fn col_service_ports<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(svc_ports(ctx.data))
 }
 
-fn col_node_status(ctx: &CellContext<'_>) -> String {
-    node_ready(ctx.data)
+fn col_node_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(node_ready(ctx.data))
 }
 
-fn col_node_roles(ctx: &CellContext<'_>) -> String {
-    node_roles(ctx.obj)
+fn col_node_roles<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(node_roles(ctx.obj))
 }
 
-fn col_node_taints(ctx: &CellContext<'_>) -> String {
-    count_arr(ctx.data, &["spec", "taints"]).to_string()
+fn col_node_taints<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(count_arr(ctx.data, &["spec", "taints"]).to_string())
 }
 
-fn col_node_version(ctx: &CellContext<'_>) -> String {
-    sget(ctx.data, &["status", "nodeInfo", "kubeletVersion"]).unwrap_or_default()
+fn col_node_version<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["status", "nodeInfo", "kubeletVersion"]).unwrap_or_default())
 }
 
-fn col_namespace_status(ctx: &CellContext<'_>) -> String {
-    sget(ctx.data, &["status", "phase"]).unwrap_or_else(|| "Active".into())
+fn col_namespace_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["status", "phase"]).unwrap_or("Active"))
 }
 
-fn col_configmap_data(ctx: &CellContext<'_>) -> String {
-    (count_obj(ctx.data, &["data"]) + count_obj(ctx.data, &["binaryData"])).to_string()
+fn col_configmap_data<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned((count_obj(ctx.data, &["data"]) + count_obj(ctx.data, &["binaryData"])).to_string())
 }
 
-fn col_secret_type(ctx: &CellContext<'_>) -> String {
-    sget(ctx.data, &["type"]).unwrap_or_else(|| "Opaque".into())
+fn col_secret_type<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["type"]).unwrap_or("Opaque"))
 }
 
-fn col_secret_data(ctx: &CellContext<'_>) -> String {
-    count_obj(ctx.data, &["data"]).to_string()
+fn col_secret_data<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(count_obj(ctx.data, &["data"]).to_string())
 }
 
-fn col_job_completions(ctx: &CellContext<'_>) -> String {
-    format!(
+fn col_job_completions<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(format!(
         "{}/{}",
         iget(ctx.data, &["status", "succeeded"]),
         iget(ctx.data, &["spec", "completions"]).max(1)
-    )
+    ))
 }
 
-fn col_job_duration(ctx: &CellContext<'_>) -> String {
-    job_duration(ctx.data)
+fn col_job_duration<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(job_duration(ctx.data, ctx.now))
 }
 
-fn col_cronjob_schedule(ctx: &CellContext<'_>) -> String {
-    sget(ctx.data, &["spec", "schedule"]).unwrap_or_default()
+fn col_cronjob_schedule<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["spec", "schedule"]).unwrap_or_default())
 }
 
-fn col_cronjob_suspend(ctx: &CellContext<'_>) -> String {
-    bget(ctx.data, &["spec", "suspend"]).to_string()
+fn col_cronjob_suspend<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(bget(ctx.data, &["spec", "suspend"]).to_string())
 }
 
-fn col_cronjob_active(ctx: &CellContext<'_>) -> String {
-    count_arr(ctx.data, &["status", "active"]).to_string()
+fn col_cronjob_active<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(count_arr(ctx.data, &["status", "active"]).to_string())
 }
 
-fn col_cronjob_last_schedule(ctx: &CellContext<'_>) -> String {
-    time_since(ctx.data, &["status", "lastScheduleTime"])
+fn col_cronjob_last_schedule<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(time_since(
+        ctx.data,
+        &["status", "lastScheduleTime"],
+        ctx.now,
+    ))
 }
 
-fn col_event_type(ctx: &CellContext<'_>) -> String {
-    sget(ctx.data, &["type"]).unwrap_or_default()
+fn col_event_type<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["type"]).unwrap_or_default())
 }
 
-fn col_event_reason(ctx: &CellContext<'_>) -> String {
-    sget(ctx.data, &["reason"]).unwrap_or_default()
+fn col_event_reason<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["reason"]).unwrap_or_default())
 }
 
-fn col_event_object(ctx: &CellContext<'_>) -> String {
+fn col_event_object<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     event_object(ctx.data)
 }
 
-fn col_event_message(ctx: &CellContext<'_>) -> String {
+fn col_event_message<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     event_message(ctx.data)
 }
 
-fn col_event_count(ctx: &CellContext<'_>) -> String {
-    event_count(ctx.data).to_string()
+fn col_event_count<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(event_count(ctx.data).to_string())
 }
 
-fn col_hpa_reference(ctx: &CellContext<'_>) -> String {
+fn col_hpa_reference<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     hpa_reference(ctx.data)
 }
 
-fn col_hpa_targets(ctx: &CellContext<'_>) -> String {
-    hpa_targets(ctx.data)
+fn col_hpa_targets<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(hpa_targets(ctx.data))
 }
 
-fn col_hpa_minpods(ctx: &CellContext<'_>) -> String {
-    iopt(ctx.data, &["spec", "minReplicas"])
-        .unwrap_or(1)
-        .to_string()
+fn col_hpa_minpods<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(
+        iopt(ctx.data, &["spec", "minReplicas"])
+            .unwrap_or(1)
+            .to_string(),
+    )
 }
 
-fn col_hpa_maxpods(ctx: &CellContext<'_>) -> String {
-    iopt(ctx.data, &["spec", "maxReplicas"])
-        .map(|n| n.to_string())
-        .unwrap_or_default()
+fn col_hpa_maxpods<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(
+        iopt(ctx.data, &["spec", "maxReplicas"])
+            .map(|n| n.to_string())
+            .unwrap_or_default(),
+    )
 }
 
-fn col_hpa_replicas(ctx: &CellContext<'_>) -> String {
-    iopt(ctx.data, &["status", "currentReplicas"])
-        .unwrap_or(0)
-        .to_string()
+fn col_hpa_replicas<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(
+        iopt(ctx.data, &["status", "currentReplicas"])
+            .unwrap_or(0)
+            .to_string(),
+    )
 }
 
-fn col_pvc_status(ctx: &CellContext<'_>) -> String {
-    sget(ctx.data, &["status", "phase"]).unwrap_or_default()
+fn col_pvc_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["status", "phase"]).unwrap_or_default())
 }
 
-fn col_pvc_volume(ctx: &CellContext<'_>) -> String {
-    sget(ctx.data, &["spec", "volumeName"]).unwrap_or_default()
+fn col_pvc_volume<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["spec", "volumeName"]).unwrap_or_default())
 }
 
-fn col_pvc_capacity(ctx: &CellContext<'_>) -> String {
-    sget(ctx.data, &["status", "capacity", "storage"]).unwrap_or_default()
+fn col_pvc_capacity<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["status", "capacity", "storage"]).unwrap_or_default())
 }
 
-fn col_pv_capacity(ctx: &CellContext<'_>) -> String {
-    sget(ctx.data, &["spec", "capacity", "storage"]).unwrap_or_default()
+fn col_pv_capacity<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["spec", "capacity", "storage"]).unwrap_or_default())
 }
 
-fn col_pv_status(ctx: &CellContext<'_>) -> String {
-    sget(ctx.data, &["status", "phase"]).unwrap_or_default()
+fn col_pv_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["status", "phase"]).unwrap_or_default())
 }
 
-fn col_pv_claim(ctx: &CellContext<'_>) -> String {
-    sget(ctx.data, &["spec", "claimRef", "name"]).unwrap_or_default()
+fn col_pv_claim<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["spec", "claimRef", "name"]).unwrap_or_default())
 }
 
-fn col_ingress_class(ctx: &CellContext<'_>) -> String {
-    sget(ctx.data, &["spec", "ingressClassName"]).unwrap_or_else(|| "<none>".into())
+fn col_ingress_class<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["spec", "ingressClassName"]).unwrap_or("<none>"))
 }
 
-fn col_ingress_hosts(ctx: &CellContext<'_>) -> String {
-    ingress_hosts(ctx.data)
+fn col_ingress_hosts<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(ingress_hosts(ctx.data))
 }
 
-fn col_ingress_address(ctx: &CellContext<'_>) -> String {
-    ingress_address(ctx.data)
+fn col_ingress_address<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(ingress_address(ctx.data))
 }
 
-fn col_httproute_hostnames(ctx: &CellContext<'_>) -> String {
-    httproute_hostnames(ctx.data)
+fn col_httproute_hostnames<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(httproute_hostnames(ctx.data))
 }
 
-fn col_endpoint_count(ctx: &CellContext<'_>) -> String {
+fn col_endpoint_count<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     count_endpoints(ctx.data)
 }
 
-fn col_crd_group(ctx: &CellContext<'_>) -> String {
-    sget(ctx.data, &["spec", "group"]).unwrap_or_default()
+fn col_crd_group<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["spec", "group"]).unwrap_or_default())
 }
 
-fn col_crd_kind(ctx: &CellContext<'_>) -> String {
-    sget(ctx.data, &["spec", "names", "kind"]).unwrap_or_default()
+fn col_crd_kind<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["spec", "names", "kind"]).unwrap_or_default())
 }
 
-fn col_crd_versions(ctx: &CellContext<'_>) -> String {
-    crd_versions(ctx.data)
+fn col_crd_versions<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(crd_versions(ctx.data))
 }
 
-fn col_crd_scope(ctx: &CellContext<'_>) -> String {
-    sget(ctx.data, &["spec", "scope"]).unwrap_or_default()
+fn col_crd_scope<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(sget(ctx.data, &["spec", "scope"]).unwrap_or_default())
 }
 
-fn col_flux_ready(ctx: &CellContext<'_>) -> String {
-    ready_condition(ctx.data).0
+fn col_flux_ready<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(ready_condition(ctx.data).0)
 }
 
-fn col_flux_message(ctx: &CellContext<'_>) -> String {
-    ready_condition(ctx.data).1
+fn col_flux_message<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(ready_condition(ctx.data).1)
 }
 
-fn col_flux_revision(ctx: &CellContext<'_>) -> String {
-    flux_revision(ctx.data)
+fn col_flux_revision<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(flux_revision(ctx.data))
 }
 
-fn col_flux_source_revision(ctx: &CellContext<'_>) -> String {
-    flux_source_revision(ctx.data)
+fn col_flux_source_revision<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(flux_source_revision(ctx.data))
 }
 
-fn col_flux_source_url(ctx: &CellContext<'_>) -> String {
+fn col_flux_source_url<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     flux_source_url(ctx.data)
 }
 
-fn col_flux_suspended(ctx: &CellContext<'_>) -> String {
-    bget(ctx.data, &["spec", "suspend"]).to_string()
+fn col_flux_suspended<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(bget(ctx.data, &["spec", "suspend"]).to_string())
 }
 
 // A Helm release row's underlying object is the raw storage `Secret`
@@ -1039,54 +1116,60 @@ fn col_flux_suspended(ctx: &CellContext<'_>) -> String {
 // name), never the release itself — every cell here goes through
 // `crate::helm` instead of `ctx.name`/`ctx.data`.
 
-fn col_helm_name(ctx: &CellContext<'_>) -> String {
-    crate::helm::release_name(ctx.obj)
-        .unwrap_or(ctx.name)
-        .to_string()
+fn col_helm_name<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Borrowed(crate::helm::release_name(ctx.obj).unwrap_or(ctx.name))
 }
 
-fn col_helm_revision(ctx: &CellContext<'_>) -> String {
-    crate::helm::revision(ctx.obj)
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "-".into())
+fn col_helm_revision<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(
+        crate::helm::revision(ctx.obj)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".into()),
+    )
 }
 
-fn col_helm_status(ctx: &CellContext<'_>) -> String {
-    ctx.helm()
-        .map(|r| r.status.clone())
-        .unwrap_or_else(|| "<invalid>".into())
+fn col_helm_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(
+        ctx.helm()
+            .map(|r| r.status.clone())
+            .unwrap_or_else(|| "<invalid>".into()),
+    )
 }
 
-fn col_helm_chart(ctx: &CellContext<'_>) -> String {
-    match ctx.helm() {
+fn col_helm_chart<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(match ctx.helm() {
         Some(r) if !r.chart_name.is_empty() => format!("{}-{}", r.chart_name, r.chart_version),
         _ => "<unknown>".into(),
-    }
+    })
 }
 
-fn col_helm_app_version(ctx: &CellContext<'_>) -> String {
-    ctx.helm()
-        .map(|r| r.app_version.clone())
-        .unwrap_or_default()
+fn col_helm_app_version<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(
+        ctx.helm()
+            .map(|r| r.app_version.clone())
+            .unwrap_or_default(),
+    )
 }
 
-fn col_helm_description(ctx: &CellContext<'_>) -> String {
-    ctx.helm()
-        .map(|r| r.description.clone())
-        .unwrap_or_default()
+fn col_helm_description<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(
+        ctx.helm()
+            .map(|r| r.description.clone())
+            .unwrap_or_default(),
+    )
 }
 
-fn col_helm_updated(ctx: &CellContext<'_>) -> String {
-    match ctx.helm().and_then(|r| r.last_deployed_secs) {
+fn col_helm_updated<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    Cow::Owned(match ctx.helm().and_then(|r| r.last_deployed_secs) {
         Some(secs) => humanize((Timestamp::now().as_second() - secs).max(0)),
         None => "<unknown>".into(),
-    }
+    })
 }
 
 // ----- helpers ------------------------------------------------------------
 
-fn service_type(d: &Value) -> String {
-    sget(d, &["spec", "type"]).unwrap_or_else(|| "ClusterIP".into())
+fn service_type(d: &Value) -> &str {
+    sget(d, &["spec", "type"]).unwrap_or("ClusterIP")
 }
 
 /// Comma-joined CRD version names (`spec.versions[].name`), e.g. `v1,v1beta1`.
@@ -1110,7 +1193,7 @@ fn crd_versions(d: &Value) -> String {
 /// (status, message) of the `Ready` condition, the health summary Flux (and
 /// most condition-based CRDs) maintain. Missing condition reads as Unknown —
 /// e.g. a Kustomization the controller hasn't reconciled yet.
-fn ready_condition(d: &Value) -> (String, String) {
+fn ready_condition(d: &Value) -> (&str, &str) {
     d.pointer("/status/conditions")
         .and_then(Value::as_array)
         .and_then(|conds| {
@@ -1120,63 +1203,55 @@ fn ready_condition(d: &Value) -> (String, String) {
         })
         .map(|c| {
             (
-                c.get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Unknown")
-                    .to_string(),
-                c.get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                c.get("status").and_then(Value::as_str).unwrap_or("Unknown"),
+                c.get("message").and_then(Value::as_str).unwrap_or_default(),
             )
         })
-        .unwrap_or_else(|| ("Unknown".into(), String::new()))
+        .unwrap_or(("Unknown", ""))
 }
 
 /// Last applied revision of a Flux object: Kustomizations (and HelmRelease
 /// v2beta*) expose `lastAppliedRevision`; HelmRelease v2 GA moved it into
 /// `history`, with `lastAttemptedRevision` as the pre-first-success fallback.
-fn flux_revision(d: &Value) -> String {
+fn flux_revision(d: &Value) -> &str {
     sget(d, &["status", "lastAppliedRevision"])
         .or_else(|| {
             d.pointer("/status/history/0/chartVersion")
                 .and_then(Value::as_str)
-                .map(String::from)
         })
         .or_else(|| sget(d, &["status", "lastAttemptedRevision"]))
         .unwrap_or_default()
 }
 
-fn flux_source_revision(d: &Value) -> String {
+fn flux_source_revision(d: &Value) -> &str {
     sget(d, &["status", "artifact", "revision"])
         .or_else(|| sget(d, &["status", "lastAppliedRevision"]))
         .or_else(|| sget(d, &["status", "lastAttemptedRevision"]))
         .unwrap_or_default()
 }
 
-fn flux_source_url(d: &Value) -> String {
-    sget(d, &["spec", "url"])
-        .or_else(|| {
-            let endpoint = sget(d, &["spec", "endpoint"]);
-            let bucket = sget(d, &["spec", "bucketName"]);
-            match (endpoint, bucket) {
-                (Some(endpoint), Some(bucket)) => {
-                    Some(format!("{}/{}", endpoint.trim_end_matches('/'), bucket))
-                }
-                (Some(endpoint), None) => Some(endpoint),
-                (None, Some(bucket)) => Some(bucket),
-                (None, None) => None,
-            }
-        })
-        .unwrap_or_default()
+fn flux_source_url(d: &Value) -> Cow<'_, str> {
+    if let Some(url) = sget(d, &["spec", "url"]) {
+        return Cow::Borrowed(url);
+    }
+    let endpoint = sget(d, &["spec", "endpoint"]);
+    let bucket = sget(d, &["spec", "bucketName"]);
+    match (endpoint, bucket) {
+        (Some(endpoint), Some(bucket)) => {
+            Cow::Owned(format!("{}/{}", endpoint.trim_end_matches('/'), bucket))
+        }
+        (Some(endpoint), None) => Cow::Borrowed(endpoint),
+        (None, Some(bucket)) => Cow::Borrowed(bucket),
+        (None, None) => Cow::Borrowed(""),
+    }
 }
 
-fn sget(v: &Value, path: &[&str]) -> Option<String> {
+fn sget<'a>(v: &'a Value, path: &[&str]) -> Option<&'a str> {
     let mut cur = v;
     for p in path {
         cur = cur.get(p)?;
     }
-    cur.as_str().map(|s| s.to_string())
+    cur.as_str()
 }
 
 fn iopt(v: &Value, path: &[&str]) -> Option<i64> {
@@ -1232,8 +1307,8 @@ fn count_arr(v: &Value, path: &[&str]) -> usize {
 }
 
 /// Compact human age, e.g. `3d4h`, `12m`, `45s`.
-pub fn age(obj: &DynamicObject) -> String {
-    match age_secs(obj) {
+pub fn age(obj: &DynamicObject, now: i64) -> String {
+    match age_secs(obj, now) {
         Some(secs) => humanize(secs),
         None => "<unknown>".into(),
     }
@@ -1241,9 +1316,17 @@ pub fn age(obj: &DynamicObject) -> String {
 
 /// Age in seconds since creation, or `None` if the object has no timestamp.
 /// Used both for the AGE column and for sorting by age.
-pub fn age_secs(obj: &DynamicObject) -> Option<i64> {
+pub fn age_secs(obj: &DynamicObject, now: i64) -> Option<i64> {
     let ts = obj.metadata.creation_timestamp.as_ref()?;
-    Some((Timestamp::now().as_second() - ts.0.as_second()).max(0))
+    Some((now - ts.0.as_second()).max(0))
+}
+
+/// One reading of the wall clock, in epoch seconds, for a whole frame or
+/// rebuild. Every elapsed-time cell and sort key derives from a single call so
+/// a frame is internally consistent — and so a 2,000-row table takes one
+/// syscall instead of one per visible time cell.
+pub fn now_secs() -> i64 {
+    Timestamp::now().as_second()
 }
 
 fn timestamp_secs(d: &Value, path: &[&str]) -> Option<i64> {
@@ -1260,25 +1343,23 @@ pub fn last_schedule_secs(obj: &DynamicObject) -> Option<i64> {
 
 /// Elapsed seconds behind a Job's humanized DURATION cell (running jobs
 /// measure against now).
-pub fn job_duration_secs(obj: &DynamicObject) -> Option<i64> {
+pub fn job_duration_secs(obj: &DynamicObject, now: i64) -> Option<i64> {
     let start = timestamp_secs(&obj.data, &["status", "startTime"])?;
-    let end = timestamp_secs(&obj.data, &["status", "completionTime"])
-        .unwrap_or_else(|| Timestamp::now().as_second());
+    let end = timestamp_secs(&obj.data, &["status", "completionTime"]).unwrap_or(now);
     Some((end - start).max(0))
 }
 
-fn time_since(d: &Value, path: &[&str]) -> String {
+fn time_since(d: &Value, path: &[&str], now: i64) -> String {
     timestamp_secs(d, path)
-        .map(|secs| humanize((Timestamp::now().as_second() - secs).max(0)))
+        .map(|secs| humanize((now - secs).max(0)))
         .unwrap_or_else(|| "<none>".into())
 }
 
-fn job_duration(d: &Value) -> String {
+fn job_duration(d: &Value, now: i64) -> String {
     let Some(start) = timestamp_secs(d, &["status", "startTime"]) else {
         return "<none>".into();
     };
-    let end = timestamp_secs(d, &["status", "completionTime"])
-        .unwrap_or_else(|| Timestamp::now().as_second());
+    let end = timestamp_secs(d, &["status", "completionTime"]).unwrap_or(now);
     humanize((end - start).max(0))
 }
 
@@ -1342,7 +1423,7 @@ fn pod_summary(obj: &DynamicObject) -> (String, String, String) {
         }
     }
 
-    let phase = sget(d, &["status", "phase"]).unwrap_or_else(|| "Unknown".into());
+    let phase = sget(d, &["status", "phase"]).unwrap_or("Unknown");
     let status = if obj.metadata.deletion_timestamp.is_some() {
         "Terminating".to_string()
     } else if let Some(r) = waiting_reason {
@@ -1350,7 +1431,7 @@ fn pod_summary(obj: &DynamicObject) -> (String, String, String) {
     } else if let Some(r) = terminated_reason {
         r
     } else {
-        phase
+        phase.to_string()
     };
 
     (format!("{ready}/{total}"), status, restarts.to_string())
@@ -1398,7 +1479,7 @@ fn svc_ports(d: &Value) -> String {
         .unwrap_or_else(|| "<none>".into())
 }
 
-fn node_ready(d: &Value) -> String {
+fn node_ready(d: &Value) -> &'static str {
     d.pointer("/status/conditions")
         .and_then(Value::as_array)
         .and_then(|conds| {
@@ -1408,12 +1489,12 @@ fn node_ready(d: &Value) -> String {
         })
         .map(|c| {
             if c.get("status").and_then(Value::as_str) == Some("True") {
-                "Ready".to_string()
+                "Ready"
             } else {
-                "NotReady".to_string()
+                "NotReady"
             }
         })
-        .unwrap_or_else(|| "Unknown".into())
+        .unwrap_or("Unknown")
 }
 
 fn node_roles(obj: &DynamicObject) -> String {
@@ -1483,7 +1564,7 @@ fn httproute_hostnames(d: &Value) -> String {
         .unwrap_or_else(|| "*".into())
 }
 
-fn count_endpoints(d: &Value) -> String {
+fn count_endpoints(d: &Value) -> Cow<'_, str> {
     let n: usize = d
         .pointer("/subsets")
         .and_then(Value::as_array)
@@ -1501,31 +1582,35 @@ fn count_endpoints(d: &Value) -> String {
         })
         .unwrap_or(0);
     if n == 0 {
-        "<none>".into()
+        Cow::Borrowed("<none>")
     } else {
-        n.to_string()
+        Cow::Owned(n.to_string())
     }
 }
 
-fn event_object(d: &Value) -> String {
+fn event_object(d: &Value) -> Cow<'_, str> {
     let Some(obj) = d.get("regarding").or_else(|| d.get("involvedObject")) else {
-        return "<none>".into();
+        return Cow::Borrowed("<none>");
     };
     let kind = obj.get("kind").and_then(Value::as_str).unwrap_or_default();
     let name = obj.get("name").and_then(Value::as_str).unwrap_or_default();
     match (kind.is_empty(), name.is_empty()) {
-        (false, false) => format!("{kind}/{name}"),
-        (false, true) => kind.to_string(),
-        (true, false) => name.to_string(),
-        (true, true) => "<none>".into(),
+        (false, false) => Cow::Owned(format!("{kind}/{name}")),
+        (false, true) => Cow::Borrowed(kind),
+        (true, false) => Cow::Borrowed(name),
+        (true, true) => Cow::Borrowed("<none>"),
     }
 }
 
-fn event_message(d: &Value) -> String {
-    sget(d, &["message"])
+fn event_message(d: &Value) -> Cow<'_, str> {
+    let message = sget(d, &["message"])
         .or_else(|| sget(d, &["note"]))
-        .unwrap_or_default()
-        .replace(['\n', '\r'], " ")
+        .unwrap_or_default();
+    if message.contains(['\n', '\r']) {
+        Cow::Owned(message.replace(['\n', '\r'], " "))
+    } else {
+        Cow::Borrowed(message)
+    }
 }
 
 fn event_count(d: &Value) -> i64 {
@@ -1535,14 +1620,14 @@ fn event_count(d: &Value) -> i64 {
         .unwrap_or(1)
 }
 
-fn hpa_reference(d: &Value) -> String {
+fn hpa_reference(d: &Value) -> Cow<'_, str> {
     let kind = sget(d, &["spec", "scaleTargetRef", "kind"]).unwrap_or_default();
     let name = sget(d, &["spec", "scaleTargetRef", "name"]).unwrap_or_default();
     match (kind.is_empty(), name.is_empty()) {
-        (false, false) => format!("{kind}/{name}"),
-        (false, true) => kind,
-        (true, false) => name,
-        (true, true) => "<none>".into(),
+        (false, false) => Cow::Owned(format!("{kind}/{name}")),
+        (false, true) => Cow::Borrowed(kind),
+        (true, false) => Cow::Borrowed(name),
+        (true, true) => Cow::Borrowed("<none>"),
     }
 }
 
@@ -1784,6 +1869,84 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
+    /// Every elapsed-time cell reads the frame's clock, never its own. Fixing
+    /// `now` makes the rendered value exact instead of racing the wall clock.
+    #[test]
+    fn elapsed_cells_measure_against_the_frame_clock() {
+        let created = "2026-09-05T12:00:00Z";
+        let now = created.parse::<Timestamp>().unwrap().as_second() + 3600 + 120;
+
+        let p = obj(json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "web", "creationTimestamp": created},
+            "status": {"phase": "Running"}
+        }));
+
+        assert_eq!(age(&p, now), "1h2m");
+        assert_eq!(age_secs(&p, now), Some(3720));
+        assert_eq!(
+            volatile_cell(&p, "pods", "AGE", now).as_deref(),
+            Some("1h2m")
+        );
+    }
+
+    /// A running Job's DURATION also ends at the frame clock, so the whole row
+    /// is measured against one instant.
+    #[test]
+    fn a_running_job_measures_its_duration_against_the_frame_clock() {
+        let start = "2026-09-05T12:00:00Z";
+        let now = start.parse::<Timestamp>().unwrap().as_second() + 45;
+        let j = obj(json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "backup"},
+            "status": {"startTime": start}
+        }));
+
+        assert_eq!(job_duration_secs(&j, now), Some(45));
+        assert_eq!(
+            volatile_cell(&j, "jobs", "DURATION", now).as_deref(),
+            Some("45s")
+        );
+
+        // A finished Job measures start-to-completion and ignores the clock.
+        let done = obj(json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {"name": "backup"},
+            "status": {"startTime": start, "completionTime": "2026-09-05T12:00:30Z"}
+        }));
+        assert_eq!(job_duration_secs(&done, now), Some(30));
+        assert_eq!(job_duration_secs(&done, now + 10_000), Some(30));
+    }
+
+    /// The point of one reading per frame: two rows created a hair apart can
+    /// never be measured against two different "now"s, whatever the clock does
+    /// between them.
+    #[test]
+    fn one_frame_clock_keeps_rows_consistent() {
+        let base = "2026-09-05T12:00:00Z"
+            .parse::<Timestamp>()
+            .unwrap()
+            .as_second();
+        let row = |created: i64| {
+            obj(json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {
+                    "name": "web",
+                    "creationTimestamp": Timestamp::from_second(created)
+                        .unwrap()
+                        .to_string(),
+                },
+                "status": {"phase": "Running"}
+            }))
+        };
+        // Both created 59s before the frame's instant.
+        let now = base + 59;
+        assert_eq!(age(&row(base), now), age(&row(base), now));
+        assert_eq!(age(&row(base), now), "59s");
+        // One second later both roll over together, never one at a time.
+        assert_eq!(age(&row(base), now + 1), "1m");
+    }
+
     #[test]
     fn pod_cells_summarize_status_and_restarts() {
         let p = obj(json!({
@@ -1800,7 +1963,7 @@ mod tests {
                 ]
             }
         }));
-        let (cells, status_idx) = cells(&p, "pods");
+        let (cells, status_idx) = cells(&p, "pods", now_secs());
         assert_eq!(cells[0], "web");
         assert_eq!(cells[1], "1/2"); // ready
         assert_eq!(cells[2], "CrashLoopBackOff"); // waiting reason overrides phase
@@ -1826,7 +1989,7 @@ mod tests {
             3,
             json!({"replicas": 3, "readyReplicas": 3, "updatedReplicas": 3}),
         );
-        let (c, status_idx) = cells(&d, "deployments");
+        let (c, status_idx) = cells(&d, "deployments", now_secs());
         assert_eq!(c[1], "3/3");
         assert_eq!(c[2], "Ready");
         assert_eq!(status_idx, Some(2));
@@ -1836,14 +1999,14 @@ mod tests {
             3,
             json!({"replicas": 3, "readyReplicas": 0, "updatedReplicas": 3}),
         );
-        assert_eq!(cells(&d, "deployments").0[2], "Unavailable");
+        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Unavailable");
 
         // Rollout replacing pods (updated < desired) → progressing.
         let d = deploy(
             3,
             json!({"replicas": 4, "readyReplicas": 2, "updatedReplicas": 1}),
         );
-        assert_eq!(cells(&d, "deployments").0[2], "Progressing");
+        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Progressing");
 
         // Fully rolled out but pods unready (crash loops, failed probes) →
         // degraded, not "progressing" — nothing is coming to fix it.
@@ -1851,14 +2014,14 @@ mod tests {
             3,
             json!({"replicas": 3, "readyReplicas": 2, "updatedReplicas": 3}),
         );
-        assert_eq!(cells(&d, "deployments").0[2], "Degraded");
+        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Degraded");
 
         // Scaled to zero reads faded, not broken.
         let d = deploy(0, json!({}));
-        assert_eq!(cells(&d, "deployments").0[2], "ScaledDown");
+        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "ScaledDown");
         // ... and still tearing down reads transitional.
         let d = deploy(0, json!({"replicas": 2, "readyReplicas": 2}));
-        assert_eq!(cells(&d, "deployments").0[2], "Progressing");
+        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Progressing");
     }
 
     #[test]
@@ -1872,7 +2035,7 @@ mod tests {
                                 "reason": "ProgressDeadlineExceeded"}]
             }),
         );
-        assert_eq!(cells(&d, "deployments").0[2], "Stalled");
+        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Stalled");
 
         // Available=False overrides a numerically-satisfied ready count.
         let d = deploy(
@@ -1882,7 +2045,7 @@ mod tests {
                 "conditions": [{"type": "Available", "status": "False"}]
             }),
         );
-        assert_eq!(cells(&d, "deployments").0[2], "Unavailable");
+        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Unavailable");
     }
 
     #[test]
@@ -1894,7 +2057,7 @@ mod tests {
             "status": {"replicas": 3, "readyReplicas": 2, "updatedReplicas": 2}
         }));
         // Rolling update in flight (updated < desired) → progressing.
-        assert_eq!(cells(&sts, "statefulsets").0[2], "Progressing");
+        assert_eq!(cells(&sts, "statefulsets", now_secs()).0[2], "Progressing");
 
         let ds = obj(json!({
             "apiVersion": "apps/v1", "kind": "DaemonSet",
@@ -1903,7 +2066,7 @@ mod tests {
                        "numberReady": 3, "updatedNumberScheduled": 5}
         }));
         // Fully rolled out, nodes unready → degraded. STATUS follows AVAILABLE.
-        assert_eq!(cells(&ds, "daemonsets").0[5], "Degraded");
+        assert_eq!(cells(&ds, "daemonsets", now_secs()).0[5], "Degraded");
 
         // An old, scaled-down ReplicaSet must read faded, not broken.
         let rs = obj(json!({
@@ -1912,7 +2075,7 @@ mod tests {
             "spec": {"replicas": 0},
             "status": {"replicas": 0}
         }));
-        assert_eq!(cells(&rs, "replicasets").0[4], "ScaledDown");
+        assert_eq!(cells(&rs, "replicasets", now_secs()).0[4], "ScaledDown");
 
         // spec.replicas unset defaults to 1 — a bare RS with one ready pod
         // is healthy, not degraded.
@@ -1921,7 +2084,7 @@ mod tests {
             "metadata": {"name": "web-abc", "namespace": "default"},
             "status": {"replicas": 1, "readyReplicas": 1}
         }));
-        assert_eq!(cells(&rs, "replicasets").0[4], "Ready");
+        assert_eq!(cells(&rs, "replicasets", now_secs()).0[4], "Ready");
     }
 
     #[test]
@@ -1933,7 +2096,7 @@ mod tests {
             "spec": {"replicas": 3},
             "status": {"replicas": 3, "readyReplicas": 3, "updatedReplicas": 3}
         }));
-        assert_eq!(cells(&d, "deployments").0[2], "Terminating");
+        assert_eq!(cells(&d, "deployments", now_secs()).0[2], "Terminating");
     }
 
     #[test]
@@ -1949,7 +2112,7 @@ mod tests {
             "status": {"conditions": [{"type": "Ready", "status": "True"}],
                        "nodeInfo": {"kubeletVersion": "v1.31.0"}}
         }));
-        let (node_cells, status_idx) = cells(&n, "nodes");
+        let (node_cells, status_idx) = cells(&n, "nodes", now_secs());
         assert_eq!(node_cells[0], "cp-1");
         assert_eq!(node_cells[1], "Ready");
         assert_eq!(node_cells[2], "control-plane");
@@ -1958,7 +2121,7 @@ mod tests {
         assert_eq!(status_idx, Some(1));
 
         let bare = obj(json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": "w-1"}}));
-        let (bare_cells, _) = cells(&bare, "nodes");
+        let (bare_cells, _) = cells(&bare, "nodes", now_secs());
         assert_eq!(bare_cells[3], "0");
     }
 
@@ -1971,7 +2134,7 @@ mod tests {
                      "ports": [{"port": 80, "protocol": "TCP"}]},
             "status": {"loadBalancer": {}}
         }));
-        let (cells, _) = cells(&s, "services");
+        let (cells, _) = cells(&s, "services", now_secs());
         assert_eq!(cells[1], "LoadBalancer");
         assert_eq!(cells[3], "<pending>");
         assert_eq!(cells[4], "80/TCP");
@@ -1997,7 +2160,7 @@ mod tests {
             headers("customresourcedefinitions"),
             vec!["NAME", "GROUP", "KIND", "VERSIONS", "SCOPE", "AGE"]
         );
-        let (cells, _) = cells(&crd, "customresourcedefinitions");
+        let (cells, _) = cells(&crd, "customresourcedefinitions", now_secs());
         assert_eq!(cells[0], "widgets.example.com");
         assert_eq!(cells[1], "example.com");
         assert_eq!(cells[2], "Widget");
@@ -2021,7 +2184,7 @@ mod tests {
                 ]
             }
         }));
-        let (cells, status_idx) = cells(&ks, "kustomizations");
+        let (cells, status_idx) = cells(&ks, "kustomizations", now_secs());
         assert_eq!(cells[0], "apps");
         assert_eq!(cells[1], "True");
         assert_eq!(cells[2], "Applied revision: main@sha1:abc123");
@@ -2045,7 +2208,7 @@ mod tests {
                 ]
             }
         }));
-        let (cells, status_idx) = cells(&hr, "helmreleases");
+        let (cells, status_idx) = cells(&hr, "helmreleases", now_secs());
         assert_eq!(cells[1], "False");
         assert_eq!(cells[2], "install retries exhausted");
         assert_eq!(cells[3], "6.5.4");
@@ -2067,7 +2230,7 @@ mod tests {
                 ]
             }
         }));
-        let (cells, status_idx) = cells(&git, "gitrepositories");
+        let (cells, status_idx) = cells(&git, "gitrepositories", now_secs());
         assert_eq!(
             headers("gitrepositories"),
             vec![
@@ -2101,7 +2264,7 @@ mod tests {
                 "conditions": [{"type": "Ready", "status": "False", "message": "denied"}]
             }
         }));
-        let (cells, status_idx) = cells(&bucket, "buckets");
+        let (cells, status_idx) = cells(&bucket, "buckets", now_secs());
         assert_eq!(cells[1], "False");
         assert_eq!(cells[2], "denied");
         assert_eq!(cells[3], "sha256:abc123");
@@ -2123,7 +2286,7 @@ mod tests {
                 "completionTime": "2024-01-01T01:05:00Z"
             }
         }));
-        let (cells, _) = cells(&job, "jobs");
+        let (cells, _) = cells(&job, "jobs", now_secs());
         assert_eq!(
             headers("jobs"),
             vec!["NAME", "COMPLETIONS", "DURATION", "AGE"]
@@ -2141,7 +2304,7 @@ mod tests {
             "spec": {"schedule": "*/15 * * * *", "suspend": false},
             "status": {"active": [{"name": "backup-1"}]}
         }));
-        let (cells, _) = cells(&cron, "cronjobs");
+        let (cells, _) = cells(&cron, "cronjobs", now_secs());
         assert_eq!(
             headers("cronjobs"),
             vec![
@@ -2171,7 +2334,7 @@ mod tests {
             "note": "Back-off restarting\nfailed container",
             "series": {"count": 7}
         }));
-        let (cells, status_idx) = cells(&event, "events");
+        let (cells, status_idx) = cells(&event, "events", now_secs());
         assert_eq!(
             headers("events"),
             vec![
@@ -2215,7 +2378,7 @@ mod tests {
                 }]
             }
         }));
-        let (cells, _) = cells(&hpa, "horizontalpodautoscalers");
+        let (cells, _) = cells(&hpa, "horizontalpodautoscalers", now_secs());
         assert_eq!(
             headers("horizontalpodautoscalers"),
             vec![
@@ -2242,7 +2405,7 @@ mod tests {
             "kind": "Kustomization",
             "metadata": {"name": "new"}
         }));
-        let (cells, _) = cells(&ks, "kustomizations");
+        let (cells, _) = cells(&ks, "kustomizations", now_secs());
         assert_eq!(cells[1], "Unknown");
         assert_eq!(cells[2], "");
         assert_eq!(cells[3], "");
@@ -2260,7 +2423,7 @@ mod tests {
             },
             "status": {"loadBalancer": {"ingress": [{"ip": "203.0.113.10"}]}}
         }));
-        let (cells, _) = cells(&ing, "ingresses");
+        let (cells, _) = cells(&ing, "ingresses", now_secs());
         assert_eq!(
             headers("ingresses"),
             ["NAME", "CLASS", "HOSTS", "ADDRESS", "AGE"]
@@ -2277,13 +2440,16 @@ mod tests {
             "metadata": {"name": "lb"},
             "status": {"loadBalancer": {"ingress": [{"hostname": "abc.elb.amazonaws.com"}]}}
         }));
-        assert_eq!(cells(&hostname, "ingresses").0[3], "abc.elb.amazonaws.com");
+        assert_eq!(
+            cells(&hostname, "ingresses", now_secs()).0[3],
+            "abc.elb.amazonaws.com"
+        );
 
         let pending = obj(json!({
             "apiVersion": "networking.k8s.io/v1", "kind": "Ingress",
             "metadata": {"name": "pending"}
         }));
-        assert_eq!(cells(&pending, "ingresses").0[3], "<none>");
+        assert_eq!(cells(&pending, "ingresses", now_secs()).0[3], "<none>");
     }
 
     #[test]
@@ -2294,7 +2460,7 @@ mod tests {
             "metadata": {"name": "web"},
             "spec": {"hostnames": ["app.example.com", "www.example.com"]}
         }));
-        let (row, idx) = cells(&route, "httproutes");
+        let (row, idx) = cells(&route, "httproutes", now_secs());
         assert_eq!(headers("httproutes"), ["NAME", "HOSTNAMES", "AGE"]);
         assert_eq!(row[1], "app.example.com,www.example.com");
         assert_eq!(idx, None);
@@ -2303,7 +2469,7 @@ mod tests {
             "apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
             "metadata": {"name": "any"}
         }));
-        assert_eq!(cells(&wildcard, "httproutes").0[1], "*");
+        assert_eq!(cells(&wildcard, "httproutes", now_secs()).0[1], "*");
     }
 
     #[test]
@@ -2312,7 +2478,7 @@ mod tests {
             "apiVersion": "example.com/v1", "kind": "Widget",
             "metadata": {"name": "thingy"}
         }));
-        let (cells, idx) = cells(&o, "widgets");
+        let (cells, idx) = cells(&o, "widgets", now_secs());
         assert_eq!(cells[0], "thingy");
         assert_eq!(cells.len(), 2);
         assert_eq!(idx, None);
@@ -2357,7 +2523,7 @@ mod tests {
 
         for kind in kinds {
             let headers = headers(kind);
-            let (cells, status_idx) = cells(&o, kind);
+            let (cells, status_idx) = cells(&o, kind, now_secs());
             assert_eq!(headers.len(), cells.len(), "{kind} column count");
             if let Some(idx) = status_idx {
                 assert!(idx < cells.len(), "{kind} status index");
@@ -2413,7 +2579,7 @@ mod tests {
             "metadata": {"name": "web"},
             "status": {"phase": "Running", "hostIP": "10.0.0.9"}
         }));
-        let (cells, status_idx) = spec.cells(&o);
+        let (cells, status_idx) = spec.cells(&o, now_secs());
         assert_eq!(cells[2], "Running");
         assert_eq!(cells[4], "10.0.0.9");
         assert_eq!(status_idx, Some(2));
@@ -2494,11 +2660,37 @@ mod tests {
         }));
         assert!(spec.is_user_column("CPU"));
         assert!(!spec.is_user_column("NAME"));
-        match spec.sort_value(&o, "CPU").unwrap() {
+        match spec.sort_value(&o, "CPU", now_secs()).unwrap() {
             SortValue::Num(n) => assert_eq!(n, 0.5),
             SortValue::Text(t) => panic!("expected numeric sort, got '{t}'"),
         }
-        assert!(spec.sort_value(&o, "MISSING").is_none());
+        assert!(spec.sort_value(&o, "MISSING", now_secs()).is_none());
+    }
+
+    #[test]
+    fn curated_cell_borrows_existing_object_strings() {
+        let pod = obj(json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "pod-a"},
+            "status": {
+                "podIP": "10.0.0.7",
+                "containerStatuses": []
+            }
+        }));
+        let spec = build_spec("pods", None, None, true);
+
+        assert!(matches!(
+            spec.cell_at(&pod, 0, now_secs()),
+            Some(Cow::Borrowed("pod-a"))
+        ));
+        assert!(matches!(
+            spec.cell_at(&pod, 4, now_secs()),
+            Some(Cow::Borrowed("10.0.0.7"))
+        ));
+        assert!(matches!(
+            spec.cell_at(&pod, 1, now_secs()),
+            Some(Cow::Owned(_))
+        ));
     }
 
     #[test]
@@ -2513,10 +2705,11 @@ mod tests {
             }))
         };
         let spec = build_spec("kustomizations", None, None, false);
-        let ready = |status: &str| match spec.sort_value(&flux(status), "READY").unwrap() {
-            SortValue::Text(t) => t,
-            SortValue::Num(n) => panic!("flux READY must sort as text, got {n}"),
-        };
+        let ready =
+            |status: &str| match spec.sort_value(&flux(status), "READY", now_secs()).unwrap() {
+                SortValue::Text(t) => t,
+                SortValue::Num(n) => panic!("flux READY must sort as text, got {n}"),
+            };
         assert!(ready("False") < ready("True"));
         assert!(ready("True") < ready("Unknown"));
 
@@ -2529,7 +2722,7 @@ mod tests {
             ]}
         }));
         let spec = build_spec("pods", None, None, false);
-        match spec.sort_value(&pod, "READY").unwrap() {
+        match spec.sort_value(&pod, "READY", now_secs()).unwrap() {
             SortValue::Num(n) => assert_eq!(n, 1.0),
             SortValue::Text(t) => panic!("pod READY must sort numerically, got '{t}'"),
         }

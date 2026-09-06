@@ -2,7 +2,12 @@
 
 ## Plugins
 
-`[[plugins]]` binds a shell-out command to a key. `key` is a **chord**: a single
+Plugins can use inline configuration or separate packages.
+To create a package, see [Create a plugin package](plugin-authoring.md).
+Packages support named commands, validated inputs, JSON reports, and managed port-forwards.
+Enter `:plugin-cancel` to stop the active plugin run.
+
+`[[plugins]]` assigns an external command to a key or palette command. `key` is a **chord**: a single
 character (`"g"`), a modifier combination (`"ctrl-g"`, `"alt-x"`, `"shift-b"`), or
 a function or named key (`"f5"`, `"ctrl-f2"`). A built-in key wins over a plugin
 on the same chord.
@@ -29,10 +34,20 @@ dangerous = true          # confirm (showing the exact command) first
 - **Placeholders** are substituted as whole arguments, never spliced into a shell
   string: `$NAME`, `$NAMESPACE`/`$NS`, `$CONTEXT`, `$CLUSTER`, `$RESOURCE`
   (plural), `$GROUP`, `$VERSION`, `$KIND`, `$FILTER`.
-- **`output`**: `terminal` (default, interactive - suspends the TUI), `popup`
-  (captured off-thread into a scrollable view), or `background` (detached - a
-  notification flashes on completion). `popup` and `background` obey `timeout`
-  (`"30s"` default) and bound the captured output.
+- **`output`** selects `terminal`, `popup`, `background`, or `report`.
+  `terminal` is the default. It suspends the TUI for an interactive command.
+  `popup` shows captured text. `background` shows a completion message.
+  `report` shows a [JSON report](plugin-authoring.md#report-format).
+  Captured modes use `timeout` (`"30s"` by default) and enforce output limits.
+- **`palette`** assigns a command name, such as `palette = "scan"` for `:scan`.
+  The `key` field is optional when `palette` is present.
+- **`target = "context"`** runs once without a selected row.
+  The default, `selection`, uses selected or marked rows.
+- **`requires`** lists required executables. **`install`** supplies instructions when an executable is absent.
+- **`inputs`** defines validated `name=value` arguments.
+  See [Inputs](plugin-authoring.md#inputs).
+- **`network_load = true`** identifies a load test.
+  It requires confirmation and blocks the plugin in read-only mode.
 - **`mutating`** (default `true`): read-only mode blocks a mutating plugin. Set
   it to `false` to allow a known read-only one.
 - **`confirm`** / **`dangerous`**: prompt before running, showing the exact
@@ -42,6 +57,8 @@ dangerous = true          # confirm (showing the exact command) first
 - **Bulk**: with rows marked (`space`), a `popup` or `background` plugin runs over
   every marked row and reports partial failures. An interactive `terminal` plugin
   can't run over a set and refuses a marked run.
+
+Guardrails match plugin actions with `plugin:<palette>`, or `plugin:<name>` when no palette command exists.
 
 On an invalid value (a bad chord, an unknown `output`, a malformed `timeout`)
 sofka disables just that plugin or falls back to the default and shows a warning
@@ -67,6 +84,14 @@ view = "xray"                            # optional: xray | pulse
 ```
 
 ## Workspaces
+
+Without an active workspace, `Tab` / `Shift-Tab` cycle pods → services →
+deployments → statefulsets → daemonsets → secrets → configmaps → ingresses →
+PVCs in the current namespace, including all namespaces. The cycle wraps and
+skips kinds absent from API discovery. From a resource outside this set, `Tab`
+starts at pods and `Shift-Tab` starts at PVCs (or the next available kind in
+that direction). Switching resources clears filters and drill-down scope, as
+with `:resource`; `[` / `]` still navigate view history.
 
 `[[workspaces]]` group several views into a named set for one task - checkout
 ops, a cluster upgrade, cert renewal. Open one with a chord or the palette (`▦`).

@@ -88,6 +88,7 @@ pub enum Msg {
     },
     /// Captured output of an `output = "popup"` plugin run.
     PluginOutput {
+        run: u64,
         generation: u64,
         claim: StatusClaim,
         title: String,
@@ -98,6 +99,7 @@ pub enum Msg {
     /// Completion notice for an `output = "background"` plugin run (single or
     /// bulk): how many jobs succeeded and the failures (label + reason).
     PluginBulkDone {
+        run: u64,
         generation: u64,
         claim: StatusClaim,
         name: String,
@@ -228,6 +230,13 @@ pub enum Msg {
         generation: u64,
         error: String,
     },
+    /// A generation-independent persistent UI-state write failed. The id lets
+    /// the UI acknowledge that it actually handled the notice; merely putting
+    /// it in the event channel is not delivery during shutdown.
+    StateWriteFailed {
+        id: u64,
+        error: String,
+    },
     /// A background action (delete, restart, scale, drain, helm op, …)
     /// finished; replaces its "…ing" progress flash with a result. Also
     /// carries `:can-i` verdicts, which are the same thing: a one-line answer
@@ -313,7 +322,25 @@ pub fn row_key(obj: &DynamicObject) -> String {
 /// contributor to RSS and to per-event cost. Nothing mutates an object once
 /// stored (`apply` replaces wholesale), so sharing is safe.
 pub type RowKey = Rc<str>;
-pub type Items = HashMap<RowKey, Arc<DynamicObject>>;
+pub type Items = FastMap<RowKey, Arc<DynamicObject>>;
+
+/// The hasher for maps keyed by cluster data — row keys, cell caches, sort
+/// keys. The default `SipHash` is chosen to make hash flooding infeasible for
+/// keys an attacker supplies; a filter keystroke rehashes every row key in the
+/// store, so that costs real frame time here.
+///
+/// `foldhash`'s randomized state keeps a per-process seed, so a collision set
+/// cannot be precomputed against the binary. What it drops is the guarantee
+/// against an adversary who can both observe timing and choose keys — and here
+/// the keys are `namespace/name` of objects the API server already accepted,
+/// read by a user who is authenticated to that cluster and is watching those
+/// objects deliberately. Anything that could flood these maps could already
+/// exhaust them by simply creating objects.
+///
+/// Config, theme and registry maps keep the standard hasher: they are built
+/// once from local files and never sit in a hot path.
+pub type FastMap<K, V> = HashMap<K, V, foldhash::fast::RandomState>;
+pub type FastSet<T> = std::collections::HashSet<T, foldhash::fast::RandomState>;
 
 /// How a store operation affected the rows currently visible to the UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -378,7 +405,7 @@ impl Store {
             self.pending = None;
             true
         } else {
-            self.pending = Some(HashMap::new());
+            self.pending = Some(Items::default());
             false
         }
     }
@@ -455,8 +482,19 @@ impl Store {
         self.items.get(key).map(AsRef::as_ref)
     }
 
+    pub(crate) fn shared(&self, key: &str) -> Option<Arc<DynamicObject>> {
+        self.items.get(key).cloned()
+    }
+
     pub fn key(&self, key: &str) -> Option<&RowKey> {
         self.items.get_key_value(key).map(|(key, _)| key)
+    }
+
+    /// An object together with the canonical key it is stored under, so a
+    /// caller that needs both does not have to rebuild the key it looked the
+    /// object up with.
+    pub fn entry(&self, key: &str) -> Option<(&RowKey, &DynamicObject)> {
+        self.items.get_key_value(key).map(|(k, v)| (k, v.as_ref()))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&RowKey, &DynamicObject)> {
@@ -508,7 +546,7 @@ mod tests {
         store.remove("default/gone");
         advanced(&store, &mut last, "remove (no such key)");
 
-        let mut seeded = Items::new();
+        let mut seeded = Items::default();
         seeded.insert(Rc::from("default/b"), Arc::new(pod("b")));
         store.seed(seeded);
         advanced(&store, &mut last, "seed");

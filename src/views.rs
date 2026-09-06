@@ -410,6 +410,75 @@ pub fn lookup<'a>(views: &'a HashMap<String, View>, ar: &ApiResource) -> Option<
 /// `/metadata/…` and `/apiVersion`/`/kind` come from the typed fields, the
 /// rest from the body (`DynamicObject::data` holds spec/status/…).
 pub fn extract(obj: &DynamicObject, pointer: &str) -> Option<Value> {
+    extract_ref(obj, pointer).map(Extracted::into_value)
+}
+
+/// A custom column's extracted value, borrowed wherever the object already
+/// holds it in the shape the renderer needs: `DynamicObject::data` is already
+/// a `Value` tree, and `ObjectMeta`'s scalars and label/annotation values are
+/// already `String`s. A column pointing at a 100-element array or a nested
+/// object therefore formats it where it lies instead of deep-cloning the whole
+/// subtree first, and only the finished cell allocates.
+///
+/// `Owned` covers the metadata shapes that have to be serialized to answer the
+/// pointer at all (`ownerReferences`, whole `metadata`, timestamps).
+pub(crate) enum Extracted<'a> {
+    /// A node of the object body.
+    Json(&'a Value),
+    /// A string the object already stores as one.
+    Text(&'a str),
+    /// A value that had to be built to answer the pointer.
+    Owned(Value),
+}
+
+impl<'a> Extracted<'a> {
+    /// The string form, when the value is one — text, time and quantity
+    /// columns all want this and nothing else.
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Extracted::Text(s) => Some(s),
+            Extracted::Json(v) => v.as_str(),
+            Extracted::Owned(v) => v.as_str(),
+        }
+    }
+
+    /// Give up the borrow. Only [`extract`]'s owned callers pay this.
+    fn into_value(self) -> Value {
+        match self {
+            Extracted::Json(v) => v.clone(),
+            Extracted::Text(s) => Value::String(s.to_string()),
+            Extracted::Owned(v) => v,
+        }
+    }
+
+    /// The rendered cell — the one allocation the extraction path owes.
+    fn render(&self) -> String {
+        match self {
+            Extracted::Text(s) => (*s).into(),
+            Extracted::Json(v) => render_value(v),
+            Extracted::Owned(v) => render_value(v),
+        }
+    }
+
+    fn number(&self) -> Option<f64> {
+        match self {
+            Extracted::Text(s) => s.trim().parse().ok(),
+            Extracted::Json(v) => number_of(v),
+            Extracted::Owned(v) => number_of(v),
+        }
+    }
+
+    fn quantity(&self) -> Option<f64> {
+        match self {
+            Extracted::Text(s) => parse_quantity(s),
+            Extracted::Json(v) => quantity_of(v),
+            Extracted::Owned(v) => quantity_of(v),
+        }
+    }
+}
+
+/// [`extract`] without the clone. See [`Extracted`].
+pub(crate) fn extract_ref<'a>(obj: &'a DynamicObject, pointer: &str) -> Option<Extracted<'a>> {
     if let Some(rest) = pointer.strip_prefix("/metadata")
         && (rest.is_empty() || rest.starts_with('/'))
     {
@@ -420,43 +489,53 @@ pub fn extract(obj: &DynamicObject, pointer: &str) -> Option<Value> {
             return obj
                 .types
                 .as_ref()
-                .map(|t| Value::String(t.api_version.clone()));
+                .map(|t| Extracted::Text(t.api_version.as_str()));
         }
-        "/kind" => return obj.types.as_ref().map(|t| Value::String(t.kind.clone())),
+        "/kind" => return obj.types.as_ref().map(|t| Extracted::Text(t.kind.as_str())),
         _ => {}
     }
-    obj.data.pointer(pointer).cloned()
+    obj.data.pointer(pointer).map(Extracted::Json)
 }
 
 /// Resolve metadata without serializing the entire `ObjectMeta` for every
 /// custom-column cell. Complex or whole-metadata requests still serialize the
 /// selected value, preserving the exact JSON Pointer behavior and output.
-fn extract_metadata(meta: &kube::core::ObjectMeta, rest: &str) -> Option<Value> {
+fn extract_metadata<'a>(meta: &'a kube::core::ObjectMeta, rest: &str) -> Option<Extracted<'a>> {
     if rest.is_empty() {
-        return serde_json::to_value(meta).ok();
+        return serde_json::to_value(meta).ok().map(Extracted::Owned);
     }
     let path = rest.strip_prefix('/')?;
     let field = path.split_once('/').map_or(path, |(field, _)| field);
     let tail = &path[field.len()..];
 
+    // A `String` field ObjectMeta already holds: the cell is that string.
+    // A pointer that walks further into a JSON string matches nothing, which
+    // is what serializing it and walking `tail` used to conclude the long way.
+    macro_rules! text {
+        ($value:expr) => {{
+            let s: &str = $value;
+            tail.is_empty().then_some(Extracted::Text(s))
+        }};
+    }
+
     macro_rules! selected {
         ($value:expr) => {{
             let value = serde_json::to_value($value).ok()?;
             if tail.is_empty() {
-                Some(value)
+                Some(Extracted::Owned(value))
             } else {
-                value.pointer(tail).cloned()
+                value.pointer(tail).cloned().map(Extracted::Owned)
             }
         }};
     }
 
     match field {
-        "name" => selected!(meta.name.as_ref()?),
-        "namespace" => selected!(meta.namespace.as_ref()?),
-        "uid" => selected!(meta.uid.as_ref()?),
-        "resourceVersion" => selected!(meta.resource_version.as_ref()?),
-        "generateName" => selected!(meta.generate_name.as_ref()?),
-        "selfLink" => selected!(meta.self_link.as_ref()?),
+        "name" => text!(meta.name.as_ref()?),
+        "namespace" => text!(meta.namespace.as_ref()?),
+        "uid" => text!(meta.uid.as_ref()?),
+        "resourceVersion" => text!(meta.resource_version.as_ref()?),
+        "generateName" => text!(meta.generate_name.as_ref()?),
+        "selfLink" => text!(meta.self_link.as_ref()?),
         "generation" => selected!(meta.generation?),
         "deletionGracePeriodSeconds" => selected!(meta.deletion_grace_period_seconds?),
         "creationTimestamp" => selected!(meta.creation_timestamp.as_ref()?),
@@ -470,29 +549,31 @@ fn extract_metadata(meta: &kube::core::ObjectMeta, rest: &str) -> Option<Value> 
     }
 }
 
-fn extract_string_map(
-    map: &std::collections::BTreeMap<String, String>,
+fn extract_string_map<'a>(
+    map: &'a std::collections::BTreeMap<String, String>,
     tail: &str,
-) -> Option<Value> {
+) -> Option<Extracted<'a>> {
     if tail.is_empty() {
-        return serde_json::to_value(map).ok();
+        return serde_json::to_value(map).ok().map(Extracted::Owned);
     }
     let token = tail.strip_prefix('/')?;
     if token.contains('/') {
         return None;
     }
     // JSON Pointer unescapes `~1` before `~0`; doing so in this order also
-    // preserves the RFC-defined meaning of tokens such as `~01`.
+    // preserves the RFC-defined meaning of tokens such as `~01`. A label or
+    // annotation value is borrowed straight out of the map — the whole map
+    // used to be serialized to JSON to read one key out of it.
     if token.contains('~') {
         let key = token.replace("~1", "/").replace("~0", "~");
-        map.get(&key).cloned().map(Value::String)
+        map.get(&key).map(|v| Extracted::Text(v.as_str()))
     } else {
-        map.get(token).cloned().map(Value::String)
+        map.get(token).map(|v| Extracted::Text(v.as_str()))
     }
 }
 
 /// Render one custom column's cell. Missing values read as `<none>`.
-pub fn render_cell(obj: &DynamicObject, col: &UserColumn) -> String {
+pub fn render_cell(obj: &DynamicObject, col: &UserColumn, now: i64) -> String {
     if col.kind == ColumnKind::Condition {
         return condition_status(obj, &col.pointer).unwrap_or_else(|| "<none>".into());
     }
@@ -500,17 +581,17 @@ pub fn render_cell(obj: &DynamicObject, col: &UserColumn) -> String {
         return "<none>".into();
     };
     match col.kind {
-        ColumnKind::Time => render_time(&v),
-        _ => render_value(&v),
+        ColumnKind::Time => render_time(&v, now),
+        _ => v.render(),
     }
 }
 
 /// Value of a non-`Condition` column: a JSON Pointer extract, or a named
 /// field of a `status.conditions` entry looked up by type.
-fn cell_value(obj: &DynamicObject, col: &UserColumn) -> Option<Value> {
+fn cell_value<'a>(obj: &'a DynamicObject, col: &UserColumn) -> Option<Extracted<'a>> {
     match col.condition_field.as_deref() {
-        Some(field) => condition_value(obj, &col.pointer, field),
-        None => extract(obj, &col.pointer),
+        Some(field) => condition_value(obj, &col.pointer, field).map(Extracted::Json),
+        None => extract_ref(obj, &col.pointer),
     }
 }
 
@@ -524,14 +605,13 @@ pub fn condition_status(obj: &DynamicObject, cond_type: &str) -> Option<String> 
 
 /// One field of the `status.conditions` entry whose `type` is `cond_type`,
 /// found by name — array order isn't guaranteed by anything.
-fn condition_value(obj: &DynamicObject, cond_type: &str, field: &str) -> Option<Value> {
+fn condition_value<'a>(obj: &'a DynamicObject, cond_type: &str, field: &str) -> Option<&'a Value> {
     obj.data
         .pointer("/status/conditions")?
         .as_array()?
         .iter()
         .find(|c| c.get("type").and_then(Value::as_str) == Some(cond_type))?
         .get(field)
-        .cloned()
 }
 
 fn render_value(v: &Value) -> String {
@@ -547,27 +627,27 @@ fn render_value(v: &Value) -> String {
 /// Timestamps render as compact elapsed time (`3d4h`); a future timestamp
 /// (e.g. a certificate's `notAfter`) reads `in 30d`. Values that don't parse
 /// as RFC 3339 fall back to the raw string.
-fn render_time(v: &Value) -> String {
+fn render_time(v: &Extracted<'_>, now: i64) -> String {
     let Some(s) = v.as_str() else {
-        return render_value(v);
+        return v.render();
     };
     match s.parse::<Timestamp>() {
         Ok(ts) => {
-            let delta = Timestamp::now().as_second() - ts.as_second();
+            let delta = now - ts.as_second();
             if delta >= 0 {
                 crate::columns::humanize(delta)
             } else {
                 format!("in {}", crate::columns::humanize(-delta))
             }
         }
-        Err(_) => s.to_string(),
+        Err(_) => s.into(),
     }
 }
 
 /// Comparable value of a custom column's cell: numbers, quantities, and times
 /// sort by value (missing/unparseable last in ascending order), text sorts
 /// case-insensitively.
-pub fn sort_value(obj: &DynamicObject, col: &UserColumn) -> SortValue {
+pub fn sort_value(obj: &DynamicObject, col: &UserColumn, now: i64) -> SortValue {
     if col.kind == ColumnKind::Condition {
         return SortValue::Text(
             condition_status(obj, &col.pointer)
@@ -577,26 +657,29 @@ pub fn sort_value(obj: &DynamicObject, col: &UserColumn) -> SortValue {
     }
     let v = cell_value(obj, col);
     match col.kind {
-        ColumnKind::Number => SortValue::Num(v.as_ref().and_then(number_of).unwrap_or(f64::MAX)),
+        ColumnKind::Number => {
+            SortValue::Num(v.as_ref().and_then(Extracted::number).unwrap_or(f64::MAX))
+        }
         ColumnKind::Quantity => {
-            SortValue::Num(v.as_ref().and_then(quantity_of).unwrap_or(f64::MAX))
+            SortValue::Num(v.as_ref().and_then(Extracted::quantity).unwrap_or(f64::MAX))
         }
         // Elapsed seconds, like AGE: ascending = most recent (or furthest in
         // the future) first, unknowns last.
         ColumnKind::Time => SortValue::Num(
             v.as_ref()
-                .and_then(Value::as_str)
+                .and_then(Extracted::as_str)
                 .and_then(|s| s.parse::<Timestamp>().ok())
-                .map(|ts| (Timestamp::now().as_second() - ts.as_second()) as f64)
+                .map(|ts| (now - ts.as_second()) as f64)
                 .unwrap_or(f64::MAX),
         ),
         // Condition is handled above (its "pointer" is a condition name, not
         // something `extract` understands).
         ColumnKind::Text | ColumnKind::Status | ColumnKind::Condition => SortValue::Text(
             v.as_ref()
-                .map(render_value)
+                .map(Extracted::render)
                 .unwrap_or_default()
-                .to_lowercase(),
+                .to_lowercase()
+                .to_string(),
         ),
     }
 }
@@ -855,8 +938,8 @@ mod tests {
             ]}
         }))
         .unwrap();
-        assert_eq!(render_cell(&obj, col), "False");
-        match sort_value(&obj, col) {
+        assert_eq!(render_cell(&obj, col, crate::columns::now_secs()), "False");
+        match sort_value(&obj, col, crate::columns::now_secs()) {
             SortValue::Text(t) => assert_eq!(t, "false"),
             SortValue::Num(_) => panic!("conditions sort as text"),
         }
@@ -866,7 +949,10 @@ mod tests {
             "metadata": {"name": "new"}
         }))
         .unwrap();
-        assert_eq!(render_cell(&bare, col), "<none>");
+        assert_eq!(
+            render_cell(&bare, col, crate::columns::now_secs()),
+            "<none>"
+        );
     }
 
     #[test]
@@ -1225,6 +1311,142 @@ mod tests {
         );
     }
 
+    /// The borrowed extraction must answer every pointer exactly as the owned
+    /// one did — it is the same function now, so this pins the shapes that
+    /// actually get borrowed rather than cloned.
+    #[test]
+    fn borrowed_extraction_matches_the_owned_value_it_replaced() {
+        let big: Vec<Value> = (0..100).map(|i| json!({"i": i})).collect();
+        let o = obj(json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "w1",
+                "namespace": "team",
+                "labels": {"app": "web"},
+                "annotations": {"a.example.com/note": "hi", "with/slash": "s"},
+                "generation": 7,
+            },
+            "spec": {"size": 3, "tags": ["a", "b"], "items": big,
+                     "nested": {"deep": {"leaf": "found"}}},
+            "status": {"phase": "Ready"}
+        }));
+
+        // Borrowed straight out of the body: no subtree is cloned to read it.
+        assert!(matches!(
+            extract_ref(&o, "/spec/items"),
+            Some(Extracted::Json(_))
+        ));
+        assert!(matches!(
+            extract_ref(&o, "/spec/nested/deep"),
+            Some(Extracted::Json(_))
+        ));
+        // Borrowed straight out of ObjectMeta / a label map.
+        assert!(matches!(
+            extract_ref(&o, "/metadata/name"),
+            Some(Extracted::Text("w1"))
+        ));
+        assert!(matches!(
+            extract_ref(&o, "/metadata/labels/app"),
+            Some(Extracted::Text("web"))
+        ));
+        assert!(matches!(
+            extract_ref(&o, "/metadata/annotations/with~1slash"),
+            Some(Extracted::Text("s"))
+        ));
+        assert!(matches!(
+            extract_ref(&o, "/apiVersion"),
+            Some(Extracted::Text("example.com/v1"))
+        ));
+        // Still owned: these have to be built to answer the pointer at all.
+        assert!(matches!(
+            extract_ref(&o, "/metadata/generation"),
+            Some(Extracted::Owned(_))
+        ));
+        assert!(matches!(
+            extract_ref(&o, "/metadata/labels"),
+            Some(Extracted::Owned(_))
+        ));
+
+        // Whatever the representation, the owned answer is unchanged.
+        for pointer in [
+            "/spec/items",
+            "/spec/nested/deep",
+            "/spec/tags/1",
+            "/metadata/name",
+            "/metadata/namespace",
+            "/metadata/labels",
+            "/metadata/labels/app",
+            "/metadata/annotations/a.example.com~1note",
+            "/metadata/annotations/with~1slash",
+            "/metadata/generation",
+            "/metadata",
+            "/apiVersion",
+            "/kind",
+            "/status/phase",
+            // A pointer walking into a string still matches nothing.
+            "/metadata/name/nope",
+            "/metadata/labels/app/nope",
+            "/spec/missing",
+        ] {
+            let borrowed = extract_ref(&o, pointer).map(Extracted::into_value);
+            assert_eq!(borrowed, extract(&o, pointer), "pointer {pointer}");
+        }
+    }
+
+    /// Rendering and sorting read the borrowed value, so they must produce
+    /// what they produced when every extraction was a fresh `Value`.
+    #[test]
+    fn borrowed_cells_render_and_sort_unchanged() {
+        let o = obj(json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": {"name": "w1", "labels": {"replicas": "12"}},
+            "spec": {"tags": ["a", "b"], "cpu": "250m", "count": 42},
+            "status": {"phase": "Ready"}
+        }));
+        let now = crate::columns::now_secs();
+
+        assert_eq!(
+            render_cell(&o, &col("/metadata/name", ColumnKind::Text), now),
+            "w1"
+        );
+        assert_eq!(
+            render_cell(&o, &col("/status/phase", ColumnKind::Text), now),
+            "Ready"
+        );
+        assert_eq!(
+            render_cell(&o, &col("/spec/tags", ColumnKind::Text), now),
+            r#"["a","b"]"#
+        );
+        assert_eq!(
+            render_cell(&o, &col("/spec/count", ColumnKind::Number), now),
+            "42"
+        );
+        assert_eq!(
+            render_cell(&o, &col("/nope", ColumnKind::Text), now),
+            "<none>"
+        );
+
+        // A quantity and a number reached through a borrowed label string.
+        match sort_value(&o, &col("/spec/cpu", ColumnKind::Quantity), now) {
+            SortValue::Num(n) => assert_eq!(n, 0.25),
+            SortValue::Text(t) => panic!("quantity sorts numerically, got {t}"),
+        }
+        match sort_value(
+            &o,
+            &col("/metadata/labels/replicas", ColumnKind::Number),
+            now,
+        ) {
+            SortValue::Num(n) => assert_eq!(n, 12.0),
+            SortValue::Text(t) => panic!("number sorts numerically, got {t}"),
+        }
+        match sort_value(&o, &col("/metadata/name", ColumnKind::Text), now) {
+            SortValue::Text(t) => assert_eq!(t, "w1"),
+            SortValue::Num(n) => panic!("text sorts as text, got {n}"),
+        }
+    }
+
     #[test]
     fn extracts_pointers_across_metadata_typemeta_and_body() {
         let o = obj(json!({
@@ -1313,14 +1535,36 @@ mod tests {
             "metadata": {"name": "w1"},
             "spec": {"size": 3, "on": true, "tags": ["a"]}
         }));
-        assert_eq!(render_cell(&o, &col("/spec/size", ColumnKind::Text)), "3");
-        assert_eq!(render_cell(&o, &col("/spec/on", ColumnKind::Text)), "true");
         assert_eq!(
-            render_cell(&o, &col("/spec/tags", ColumnKind::Text)),
+            render_cell(
+                &o,
+                &col("/spec/size", ColumnKind::Text),
+                crate::columns::now_secs()
+            ),
+            "3"
+        );
+        assert_eq!(
+            render_cell(
+                &o,
+                &col("/spec/on", ColumnKind::Text),
+                crate::columns::now_secs()
+            ),
+            "true"
+        );
+        assert_eq!(
+            render_cell(
+                &o,
+                &col("/spec/tags", ColumnKind::Text),
+                crate::columns::now_secs()
+            ),
             "[\"a\"]"
         );
         assert_eq!(
-            render_cell(&o, &col("/spec/nope", ColumnKind::Text)),
+            render_cell(
+                &o,
+                &col("/spec/nope", ColumnKind::Text),
+                crate::columns::now_secs()
+            ),
             "<none>"
         );
     }
@@ -1338,13 +1582,28 @@ mod tests {
                 "junk": "not-a-time"
             }
         }));
-        assert_eq!(render_cell(&o, &col("/spec/past", ColumnKind::Time)), "1h");
         assert_eq!(
-            render_cell(&o, &col("/spec/future", ColumnKind::Time)),
+            render_cell(
+                &o,
+                &col("/spec/past", ColumnKind::Time),
+                crate::columns::now_secs()
+            ),
+            "1h"
+        );
+        assert_eq!(
+            render_cell(
+                &o,
+                &col("/spec/future", ColumnKind::Time),
+                crate::columns::now_secs()
+            ),
             "in 30d"
         );
         assert_eq!(
-            render_cell(&o, &col("/spec/junk", ColumnKind::Time)),
+            render_cell(
+                &o,
+                &col("/spec/junk", ColumnKind::Time),
+                crate::columns::now_secs()
+            ),
             "not-a-time"
         );
     }
@@ -1379,13 +1638,31 @@ mod tests {
             }
         }));
         // Lexically "1Gi" < "500m" — by value it must be the other way.
-        let q = |p: &str| num(sort_value(&o, &col(p, ColumnKind::Quantity)));
+        let q = |p: &str| {
+            num(sort_value(
+                &o,
+                &col(p, ColumnKind::Quantity),
+                crate::columns::now_secs(),
+            ))
+        };
         assert!(q("/spec/small") < q("/spec/big"));
         // Lexically "10" < "9".
-        let n = |p: &str| num(sort_value(&o, &col(p, ColumnKind::Number)));
+        let n = |p: &str| {
+            num(sort_value(
+                &o,
+                &col(p, ColumnKind::Number),
+                crate::columns::now_secs(),
+            ))
+        };
         assert!(n("/spec/nine") < n("/spec/ten"));
         // Ascending time = most recent first (smaller elapsed).
-        let t = |p: &str| num(sort_value(&o, &col(p, ColumnKind::Time)));
+        let t = |p: &str| {
+            num(sort_value(
+                &o,
+                &col(p, ColumnKind::Time),
+                crate::columns::now_secs(),
+            ))
+        };
         assert!(t("/spec/new") < t("/spec/old"));
         // Missing values sort last in ascending order.
         assert_eq!(q("/spec/missing"), f64::MAX);
@@ -1513,17 +1790,26 @@ mod tests {
                 }
             ]}
         }));
-        assert_eq!(render_cell(&obj, &view.columns[0]), "False");
-        assert_eq!(render_cell(&obj, &view.columns[1]), "DependencyNotReady");
-        assert_eq!(render_cell(&obj, &view.columns[2]), "waiting on source");
-        match sort_value(&obj, &view.columns[1]) {
+        assert_eq!(
+            render_cell(&obj, &view.columns[0], crate::columns::now_secs()),
+            "False"
+        );
+        assert_eq!(
+            render_cell(&obj, &view.columns[1], crate::columns::now_secs()),
+            "DependencyNotReady"
+        );
+        assert_eq!(
+            render_cell(&obj, &view.columns[2], crate::columns::now_secs()),
+            "waiting on source"
+        );
+        match sort_value(&obj, &view.columns[1], crate::columns::now_secs()) {
             SortValue::Text(t) => assert_eq!(t, "dependencynotready"),
             SortValue::Num(_) => panic!("reason sorts as text"),
         }
 
         let spec = crate::columns::build_spec("widgets", None, Some(&view), false);
         assert_eq!(spec.headers(), vec!["NAME", "A", "B", "C", "AGE"]);
-        let (cells, status_idx) = spec.cells(&obj);
+        let (cells, status_idx) = spec.cells(&obj, crate::columns::now_secs());
         assert_eq!(
             &cells[1..4],
             ["False", "DependencyNotReady", "waiting on source"]

@@ -22,6 +22,12 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 - **Drill-down navigation** with a breadcrumb stack: workload/service → pods,
   cronjob → its jobs, node → its pods, pod → containers, namespace → re-scope,
   CRD → its custom resources. `esc` goes back.
+- **Resource cycling** (`Tab` / `Shift-Tab`) - browse pods → services →
+  deployments → statefulsets → daemonsets → secrets → configmaps → ingresses →
+  PVCs, wrapping in either direction without configuration. Keeps the current
+  namespace (including all namespaces), skips kinds absent from API discovery,
+  and follows the active workspace's views when one is open. `[` / `]` remain
+  view history.
 - **Command palette** (`:`) - fuzzy search over the full resource catalog, your
   saved bookmarks and workspaces, and the built-in commands (`ctx`, `helm`,
   `pulse`, `xray`, `explain`, `timeline`, `gitops`, `can-i`, `journal`, `debug`,
@@ -210,3 +216,19 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   state/snapshot/bundle directories. The connected Kubernetes revision also
   stays visible in the main header.
   Identifiers and counts only, never credentials, tokens, or Secret values.
+
+## External plugin packages
+
+- **Package discovery** reads `plugins/*/plugin.toml` from the sofka configuration directory.
+  Packages reload with `:reload`.
+- **Named commands** and key chords start adapters without changes to sofka's source code.
+- **Validated inputs** supply named arguments with types, defaults, choices, and limits.
+- **JSON reports** show text sections and tables in a searchable document.
+- **Shared execution** limits output and concurrency.
+  It cancels processes on timeout, navigation, or `:plugin-cancel`.
+- **Safety controls** apply read-only mode, confirmation, and guardrails to plugins.
+  Load-test plugins require a network-load declaration.
+- **Managed port-forwards** supply a local endpoint for a selected pod or service.
+- **Local checks** validate package manifests and reports without a cluster.
+
+See [Create a plugin package](plugin-authoring.md).

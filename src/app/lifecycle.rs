@@ -267,6 +267,7 @@ impl App {
         self.applied_filter_labels = filter_labels;
         self.applied_filter_fields = filter_fields;
         self.clear_progress_flash();
+        self.stop_plugins();
         self.generation += 1;
         self.gen_flag.store(self.generation, Ordering::SeqCst);
         for t in self.tasks.drain(..) {
@@ -383,6 +384,7 @@ impl App {
     /// watched version — a better automatic fallback than NAME/AGE. Results
     /// (including "nothing usable") are cached per plural for the session.
     fn maybe_fetch_printer_columns(&mut self, kind: &Kind) {
+        self.printer_columns_pending = None;
         let user_has_columns = self
             .active_user_view()
             .is_some_and(|v| !v.columns.is_empty());
@@ -403,13 +405,17 @@ impl App {
         let plural = self.kind_plural.clone();
         let tx = self.tx.clone();
         let genr = self.generation;
+        self.printer_columns_pending = Some(self.kind_plural.clone());
         let handle = tokio::spawn(async move {
             let api: Api<DynamicObject> = Api::all_with(client, &crd_kind.ar);
             // No CRD (aggregated API) or no permission → stay on NAME/AGE.
-            let Ok(crd) = api.get(&name).await else {
-                return;
+            // Reported rather than dropped: a caller waiting for the columns
+            // would otherwise wait for a message that never comes, and the
+            // per-session cache is documented to hold "nothing usable" too.
+            let view = match api.get(&name).await {
+                Ok(crd) => crate::views::printer_columns_view(&crd.data, &version),
+                Err(_) => None,
             };
-            let view = crate::views::printer_columns_view(&crd.data, &version);
             let _ = tx
                 .send(Msg::PrinterColumns {
                     generation: genr,
@@ -783,6 +789,7 @@ impl App {
     pub(super) fn bump_generation(&mut self) {
         self.stop_event_stream();
         self.clear_progress_flash();
+        self.stop_plugins();
         self.generation += 1;
         self.gen_flag.store(self.generation, Ordering::SeqCst);
         for t in self.tasks.drain(..) {
@@ -842,6 +849,13 @@ impl App {
                 self.watch_errors = self.watch_errors.saturating_add(1);
                 self.last_error = Some(error.clone());
                 self.borrow_status(format!("error: {error}"), true);
+            }
+            Msg::StateWriteFailed { id, error } => {
+                self.last_state_write_error = Some(error.clone());
+                self.borrow_status(format!("state not saved: {error}"), true);
+                if let Some(writer) = &self.state_writer {
+                    writer.acknowledge_failure(id);
+                }
             }
             Msg::Flash {
                 generation,
@@ -920,6 +934,9 @@ impl App {
                 view,
             } if generation == self.generation => {
                 let for_current = plural == self.kind_plural;
+                if self.printer_columns_pending.as_deref() == Some(plural.as_str()) {
+                    self.printer_columns_pending = None;
+                }
                 self.crd_views.insert(plural, *view);
                 if for_current {
                     self.refresh_view_spec();
@@ -1022,12 +1039,15 @@ impl App {
                 self.clear_claimed_status(claim);
             }
             Msg::PluginOutput {
+                run,
                 generation,
                 claim,
                 title,
                 lines,
                 warn,
-            } if generation == self.generation => {
+            } if generation == self.generation && run == self.plugin_run => {
+                self.plugin_task = None;
+                self.plugin_claim = None;
                 self.detail = Scrollable {
                     title,
                     lines: lines.into(),
@@ -1040,12 +1060,15 @@ impl App {
                 }
             }
             Msg::PluginBulkDone {
+                run,
                 generation,
                 claim,
                 name,
                 ok,
                 failed,
-            } if generation == self.generation => {
+            } if generation == self.generation && run == self.plugin_run => {
+                self.plugin_task = None;
+                self.plugin_claim = None;
                 if failed.is_empty() {
                     self.set_claimed_status(claim, format!("plugin {name}: {ok} ok"), false);
                 } else {
@@ -1169,10 +1192,6 @@ impl App {
                 // one it replaces, which would otherwise leave a stale
                 // search-match cache behind.
                 self.detail.replace_lines(lines.into());
-                self.detail.scroll = self
-                    .detail
-                    .scroll
-                    .min(self.detail.lines.len().saturating_sub(1));
             }
             Msg::TransferDone {
                 generation,

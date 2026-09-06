@@ -11,6 +11,7 @@
 //! `pod_summary` walks that array and a fixture without it would measure an
 //! empty loop.
 
+use k8s_openapi::api::core::v1::Service;
 use kube::core::DynamicObject;
 use serde_json::json;
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -200,11 +201,30 @@ pub fn seed(app: &mut App, objs: impl IntoIterator<Item = DynamicObject>) {
     }
 }
 
-/// An app holding `n` synthetic pods, already listed as the pods view.
+/// An app holding `n` synthetic pods, already listed as the pods view — with
+/// the resolved kind and its real column spec installed, so cells, filters and
+/// headers are the ones the pods view actually renders.
 pub fn pods_app(n: usize) -> (App, Receiver<Msg>) {
     let (mut a, rx) = app();
-    a.kind_plural = "pods".to_string();
+    a.bench_install_kind("pods");
     seed(&mut a, (0..n).map(pod));
+    (a, rx)
+}
+
+/// `pods_app` plus a metrics snapshot for every pod, so the CPU/MEM columns
+/// render real values instead of the missing-metrics dash.
+pub fn pods_app_with_metrics(n: usize) -> (App, Receiver<Msg>) {
+    let (mut a, rx) = pods_app(n);
+    for i in 0..n {
+        let o = pod(i);
+        a.metrics.insert(
+            row_key(&o),
+            (
+                ((i * 37) % 4000) as i64,
+                ((i * 1024 * 977) % 4_000_000_000) as i64,
+            ),
+        );
+    }
     (a, rx)
 }
 
@@ -233,7 +253,7 @@ pub fn arc_clone_items(items: &crate::store::Items) -> crate::store::Items {
 /// An app holding `n` synthetic Helm release Secrets.
 pub fn helm_app(n: usize) -> (App, Receiver<Msg>) {
     let (mut a, rx) = app();
-    a.kind_plural = "helm".to_string();
+    a.bench_install_kind("helm");
     seed(&mut a, (0..n).map(helm_secret));
     (a, rx)
 }
@@ -316,4 +336,119 @@ pub fn log_lines_wide(n: usize) -> Vec<String> {
 /// Sender factory for benches that need to construct messages directly.
 pub fn channel() -> (Sender<Msg>, Receiver<Msg>) {
     mpsc::channel(4096)
+}
+
+/// Service-discovery input with many usable candidates. Reverse namespaces
+/// ensure the minimum is not an accidental first-item fast path.
+pub fn services(n: usize) -> Vec<Service> {
+    (0..n)
+        .map(|i| {
+            serde_json::from_value(json!({
+                "metadata": {
+                    "name": format!("backend-{i:04}"),
+                    "namespace": format!("ns-{:04}", n - i),
+                },
+                "spec": {
+                    "ports": [
+                        {"name": "metrics", "port": 8080},
+                        {"port": if i.is_multiple_of(2) { 9428 } else { 9090 }},
+                    ]
+                }
+            }))
+            .expect("bench Service fixture is valid")
+        })
+        .collect()
+}
+
+/// Production one-pass VictoriaLogs candidate selection.
+pub fn pick_log_service(services: &[Service]) -> Option<(String, String, i32)> {
+    crate::providers::bench_pick_log_service(services)
+}
+
+/// Production one-pass Prometheus/VictoriaMetrics candidate selection.
+pub fn pick_metrics_service(services: &[Service]) -> Option<(String, String, i32)> {
+    crate::providers::bench_pick_metrics_service(services)
+}
+
+/// The allocation-heavy provider-selection implementation before this
+/// follow-up: materialize every usable candidate, then call `min_by_key`.
+pub fn pick_log_service_collected(services: &[Service]) -> Option<(String, String, i32)> {
+    let candidates: Vec<(&Service, i32)> = services
+        .iter()
+        .filter_map(|service| {
+            let ports = service.spec.as_ref()?.ports.as_ref()?;
+            let port = ports
+                .iter()
+                .find(|port| port.name.as_deref() == Some("http"))
+                .or_else(|| ports.iter().find(|port| port.port == 9428))
+                .or_else(|| ports.first())?;
+            Some((service, port.port))
+        })
+        .collect();
+    finish_collected(candidates)
+}
+
+/// Metrics-provider form of the former collected implementation.
+pub fn pick_metrics_service_collected(services: &[Service]) -> Option<(String, String, i32)> {
+    let candidates: Vec<(&Service, i32)> = services
+        .iter()
+        .filter_map(|service| {
+            let ports = service.spec.as_ref()?.ports.as_ref()?;
+            let port = ports
+                .iter()
+                .find(|port| port.name.as_deref() == Some("http"))
+                .or_else(|| {
+                    ports
+                        .iter()
+                        .find(|port| matches!(port.port, 9090 | 8428 | 8429))
+                })
+                .or_else(|| ports.first())?;
+            Some((service, port.port))
+        })
+        .collect();
+    finish_collected(candidates)
+}
+
+fn finish_collected(candidates: Vec<(&Service, i32)>) -> Option<(String, String, i32)> {
+    let (service, port) = candidates.iter().min_by_key(|(service, _)| {
+        (
+            service.metadata.namespace.as_deref().unwrap_or_default(),
+            service.metadata.name.as_deref().unwrap_or_default(),
+        )
+    })?;
+    Some((
+        service.metadata.namespace.clone().unwrap_or_default(),
+        service.metadata.name.clone().unwrap_or_default(),
+        *port,
+    ))
+}
+
+/// A terminal backed by an in-memory buffer, the size a benchmark draws into.
+pub fn terminal(w: u16, h: u16) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+    ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("bench terminal")
+}
+
+/// One full frame of the real UI, drawn into an in-memory backend — the unit
+/// the table renderer is actually judged by (per-row cell rendering, width
+/// measurement, column layout and mouse geometry all included).
+pub fn render_frame(
+    terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+    app: &mut App,
+) {
+    terminal
+        .draw(|f| crate::ui::draw(f, app))
+        .expect("bench frame");
+}
+
+/// The headers the table draws, for asserting a fixture is representative.
+pub fn headers(app: &App) -> std::rc::Rc<[String]> {
+    app.display_headers()
+}
+
+/// What the table renderer does per frame before drawing anything: resolve the
+/// visible window and warm its cell cache.
+pub fn warm_viewport(app: &App, offset: usize, n: usize) -> usize {
+    let rows = app.rows_window_keyed(offset, n);
+    app.ensure_table_cell_cache(&rows);
+    rows.len()
 }
