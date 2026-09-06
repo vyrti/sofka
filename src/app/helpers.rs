@@ -565,16 +565,32 @@ pub(super) async fn forward_log_stream(
     use futures_util::{AsyncBufReadExt, TryStreamExt};
     use tokio::time::MissedTickBehavior;
 
-    let stream = match api.log_stream(&pod, &lp).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            let _ = tx
-                .send(Msg::LogLines {
-                    generation,
-                    lines: vec![format!("[error] {e}")],
-                })
-                .await;
+    let stream = loop {
+        if flag.load(Ordering::SeqCst) != generation || tx.is_closed() {
             return;
+        }
+        match api.log_stream(&pod, &lp).await {
+            Ok(stream) => break stream,
+            Err(kube::Error::Api(e))
+                if lp.follow
+                    && !lp.previous
+                    && e.code == 400
+                    && e.message.contains("is waiting to start") =>
+            {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    _ = tx.closed() => return,
+                }
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(Msg::LogLines {
+                        generation,
+                        lines: vec![format!("[error] {e}")],
+                    })
+                    .await;
+                return;
+            }
         }
     };
 

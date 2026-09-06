@@ -172,7 +172,8 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   [Debug containers and pods](debugging.md#debug-containers-and-pods).
 - **Logs** (`l`) - per-container on a pod, or aggregated across all matching
   pods on a workload/service, with filtering, previous-container logs, and
-  configurable tail/buffer/lookback. sofka parses ANSI color from the source app
+  configurable tail/buffer/lookback. If a container is waiting to start, sofka
+  retries until its logs are available. sofka parses ANSI color from the source app
   and maps it onto the active skin instead of printing literal escapes. See
   [Log controls](debugging.md#log-controls).
 - **VictoriaLogs integration** (`L` / `:vlogs`) - log history from a
