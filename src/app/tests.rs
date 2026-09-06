@@ -6828,6 +6828,68 @@ async fn helm_list_dedup_refreshes_when_a_new_revision_arrives() {
     );
 }
 
+/// Mouse ranges have to come from the layout the Table actually rendered. The
+/// curated pod widths are sized from content, not from the budget, so in a
+/// narrow terminal they overflow it and the solver shrinks them — and a
+/// running sum over the declared widths then points every column after the
+/// first at the wrong place. Clicking AGE selected RESTARTS.
+#[tokio::test]
+async fn header_click_in_a_narrow_terminal_sorts_the_column_it_hits() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "a", "namespace": "default"},
+            "status": {"phase": "Running", "containerStatuses":
+                [{"ready": true, "restartCount": 5, "state": {"running": {}}}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+
+    // 50 columns is narrow enough that the declared widths do not fit.
+    let mut term = Terminal::new(TestBackend::new(50, 20)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let hit = app.table_hit.borrow().clone().expect("geometry recorded");
+
+    // Click AGE where it is drawn, not where its declared width would put it.
+    let buf = term.backend().buffer().clone();
+    let header: String = (0..buf.area.width)
+        .map(|x| {
+            buf[(x, hit.header_y)]
+                .symbol()
+                .chars()
+                .next()
+                .unwrap_or(' ')
+        })
+        .collect();
+    let age_x = header.find("AGE").expect("AGE header is on screen") as u16;
+    let age_idx = app
+        .display_headers()
+        .iter()
+        .position(|h| h == "AGE")
+        .expect("AGE column exists");
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: age_x,
+        row: hit.header_y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .unwrap();
+
+    assert_eq!(
+        app.sort_column,
+        Some(age_idx),
+        "clicking the rendered AGE header must sort AGE"
+    );
+}
+
 #[tokio::test]
 async fn helm_filter_matches_release_name_not_secret_name() {
     let (mut app, _rx) = test_app();

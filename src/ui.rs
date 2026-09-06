@@ -954,35 +954,38 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     // carries the display-header index it shows, since columns can be
     // scrolled out of view.
     {
-        use ratatui::layout::Margin;
+        use ratatui::layout::{Flex, Margin};
         let inner = area.inner(Margin::new(1, 1));
         let sel_w = 2u16; // "▌ " with HighlightSpacing::Always
-        let cols_x = inner.x.saturating_add(sel_w);
         let cols_end = inner.x.saturating_add(inner.width);
-        // The widths are already fixed `Length`s that fit the budget, and the
-        // Table lays them out left-packed with the same 2-cell spacing — so
-        // the columns land on a running sum. Running the constraint solver a
-        // second time (and cloning the constraints for it) only to rediscover
-        // that was pure duplicate work.
-        let mut x = cols_x;
-        let mut ranges = Vec::with_capacity(col_widths.len());
-        for (w, i) in col_widths
-            .iter()
-            .copied()
-            .zip((0..headers.len()).filter(|&i| col_visible(i)))
-        {
-            let start = x.min(cols_end);
-            let end = start.saturating_add(w).min(cols_end);
-            ranges.push((start, end, i));
-            x = end.saturating_add(2); // Table::column_spacing
-        }
+        // Run the same solver the Table runs, with the same widths, spacing
+        // and default `Start` flex. A running sum over the declared widths is
+        // not equivalent: `Exact`/`Cap` columns are sized from their content,
+        // not from the budget, so in a narrow terminal they overflow it and
+        // the solver shrinks them. Every column after the first then sits at
+        // an x the sum never predicted — and clamping cannot recover it,
+        // because the space is redistributed rather than truncated.
+        let cols_area = Rect {
+            x: inner.x.saturating_add(sel_w),
+            y: inner.y,
+            width: inner.width.saturating_sub(sel_w),
+            height: inner.height,
+        };
+        let rects = Layout::horizontal(widths.iter().copied())
+            .flex(Flex::Start)
+            .spacing(2)
+            .split(cols_area);
         app.record_table_hit(
             inner.y,
             inner.y.saturating_add(1),
             inner.height.saturating_sub(1),
             inner.x,
             cols_end,
-            ranges,
+            rects
+                .iter()
+                .zip((0..headers.len()).filter(|&i| col_visible(i)))
+                .map(|(r, i)| (r.x, r.x.saturating_add(r.width), i))
+                .collect(),
         );
     }
 
