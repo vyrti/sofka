@@ -189,6 +189,9 @@ pub fn read_package(dir: &Path) -> Result<Plugin, String> {
 }
 
 pub fn validate_plugin(plugin: &Plugin) -> Result<(), String> {
+    if let Some(field) = plugin.unknown_fields.keys().next() {
+        return Err(format!("unknown field {field:?} in plugin manifest"));
+    }
     if plugin.name.trim().is_empty() || plugin.command.trim().is_empty() {
         return Err("name and command must not be empty".into());
     }

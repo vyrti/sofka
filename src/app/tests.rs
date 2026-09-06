@@ -10319,3 +10319,66 @@ async fn plugin_timeout_is_visible_through_the_command_path() {
     );
     assert!(app.plugin_task.is_none());
 }
+
+#[tokio::test]
+async fn unknown_inline_plugin_fields_preserve_base_and_override_settings() {
+    for layer in ["base", "cluster", "context"] {
+        let dir = std::env::temp_dir().join(format!(
+            "sofka-inline-plugin-compat-{}-{layer}",
+            std::process::id()
+        ));
+        write_config(&dir, "readonly = false\n");
+        let config_dir = match layer {
+            "cluster" => dir.join("clusters/test-cluster"),
+            "context" => dir.join("clusters/test-cluster/test-context"),
+            _ => dir.clone(),
+        };
+        write_config(
+            &config_dir,
+            r#"
+            readonly = true
+            favorite_namespaces = ["safe"]
+            [aliases]
+            pluginpods = "pods"
+            [[plugins]]
+            name = "Compatible plugin"
+            palette = "compatible-plugin"
+            command = "echo"
+            mutating = false
+            obsolete_option = true
+            [[plugins]]
+            name = "Other plugin"
+            key = "ctrl-g"
+            command = "echo"
+            mutating = false
+        "#,
+        );
+        let (mut app, _rx) = app_with_pod();
+        app.cluster.cluster_name = "test-cluster".into();
+        app.cluster.context = "test-context".into();
+        app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+        plugin_command(&mut app, "reload");
+        assert!(
+            app.readonly,
+            "{layer}: read-only setting was lost: {}",
+            app.flash
+        );
+        assert_eq!(app.namespace_favorites, ["safe"]);
+        assert_eq!(
+            app.user_aliases.get("pluginpods").map(String::as_str),
+            Some("pods")
+        );
+        assert_eq!(app.plugins.len(), 2, "{layer}: plugins were lost");
+        assert!(
+            app.config_warnings.is_empty(),
+            "{layer}: {:?}",
+            app.config_warnings
+        );
+        plugin_command(&mut app, "compatible-plugin");
+        assert!(
+            matches!(app.pending, Some(Suspend::Shell(_))),
+            "{layer}: inline plugin did not run"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

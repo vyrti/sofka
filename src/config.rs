@@ -784,8 +784,10 @@ pub struct Skin {
 /// output = "popup"          # capture into a scrollable view (not the terminal)
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Plugin {
+    /// Inline configuration ignores unknown fields. Package validation rejects them.
+    #[serde(flatten)]
+    pub(crate) unknown_fields: std::collections::BTreeMap<String, toml::Value>,
     /// Key chord that triggers the plugin (see [`crate::keys::KeyChord`]).
     #[serde(default)]
     pub key: String,
