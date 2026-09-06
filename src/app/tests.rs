@@ -10087,6 +10087,51 @@ async fn a_noop_context_reselect_keeps_an_inflight_navigation() {
     assert_eq!(app.kind_plural, "services");
 }
 
+/// Re-selecting the destination of an in-flight context switch must not start
+/// a replacement generation that loses the navigation waiting behind it.
+#[tokio::test]
+async fn reselecting_inflight_context_target_keeps_deferred_navigation() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    bind_bookmark(&mut app, "services", "west");
+
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    let inflight = app.generation;
+    assert!(app.pending_bookmark.is_some());
+
+    pick_context(&mut app, "west");
+    assert_eq!(app.generation, inflight, "replacement switch was started");
+    assert!(
+        app.pending_bookmark.is_some(),
+        "deferred bookmark was discarded"
+    );
+
+    land_context(&mut app, "west");
+    assert_eq!(app.kind_plural, "services");
+}
+
+#[tokio::test]
+async fn deferred_navigation_to_same_inflight_target_replaces_predecessor() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    bind_bookmark(&mut app, "services", "west");
+
+    type_resource_query(&mut app, "pods --context west /status=Running");
+    let inflight = app.generation;
+    assert!(app.pending_resource_query.is_some());
+
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    assert_eq!(app.generation, inflight);
+    assert!(
+        app.pending_resource_query.is_none(),
+        "displaced query stays armed"
+    );
+    assert!(app.pending_bookmark.is_some());
+
+    land_context(&mut app, "west");
+    assert_eq!(app.kind_plural, "services");
+}
+
 /// Deferred navigations are mutually exclusive: a bookmark, workspace or
 /// palette query that starts a context switch owns what lands when it
 /// completes, and must not leave an earlier one armed to fire later.

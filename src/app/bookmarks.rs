@@ -38,6 +38,8 @@ impl App {
             && ctx != self.cluster.context
         {
             self.switch_context(ctx);
+            self.pending_resource_query = None;
+            self.pending_workspace = None;
             self.pending_bookmark = Some(bm);
             return;
         }

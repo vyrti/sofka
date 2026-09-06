@@ -1517,6 +1517,9 @@ pub struct App {
 
     pub generation: u64,
     gen_flag: Arc<AtomicU64>,
+    /// Context currently being connected to, paired with the generation that
+    /// owns its eventual result.
+    context_switch_target: Option<(u64, String)>,
     pub tasks: Vec<JoinHandle<()>>,
     pub tx: Sender<Msg>,
     /// Ordered off-thread persistence for small UI state files. `None` keeps
@@ -1911,6 +1914,7 @@ impl App {
             scope_label: None,
             generation: 0,
             gen_flag: Arc::new(AtomicU64::new(0)),
+            context_switch_target: None,
             tasks: Vec::new(),
             tx,
             state_writer: None,

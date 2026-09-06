@@ -23,6 +23,8 @@ impl App {
         {
             let context = context.clone();
             self.switch_context(context);
+            self.pending_bookmark = None;
+            self.pending_workspace = None;
             self.pending_resource_query = Some(query);
             return;
         }
@@ -1339,18 +1341,23 @@ impl App {
                 generation,
                 name,
                 result,
-            } if generation == self.generation => match result {
-                Ok(cluster) => self.apply_context_switch(name, cluster),
-                Err(e) => {
-                    self.pending_resource_query = None;
-                    self.flash_warn(&format!("context switch failed: {e}"));
-                    // Never connected anywhere yet — put the picker back up
-                    // instead of stranding the user on an empty table.
-                    if !self.cluster.connected {
-                        self.open_contexts();
+            } if generation == self.generation => {
+                self.context_switch_target = None;
+                match result {
+                    Ok(cluster) => self.apply_context_switch(name, cluster),
+                    Err(e) => {
+                        self.pending_resource_query = None;
+                        self.pending_bookmark = None;
+                        self.pending_workspace = None;
+                        self.flash_warn(&format!("context switch failed: {e}"));
+                        // Never connected anywhere yet — put the picker back up
+                        // instead of stranding the user on an empty table.
+                        if !self.cluster.connected {
+                            self.open_contexts();
+                        }
                     }
                 }
-            },
+            }
             _ => {} // stale generation, drop
         }
         if preserve_selection {

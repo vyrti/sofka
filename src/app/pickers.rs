@@ -757,13 +757,22 @@ impl App {
         if name == self.cluster.context && self.cluster.connected {
             return;
         }
+        // Re-selecting the target of the live connection is also a no-op. A
+        // bookmark, workspace, or query may be waiting for it to land, and a
+        // replacement connection would otherwise invalidate that destination.
+        if self
+            .context_switch_target
+            .as_ref()
+            .is_some_and(|(generation, target)| *generation == self.generation && target == &name)
+        {
+            return;
+        }
         // One deferred navigation at a time. Whatever asked for this switch
         // owns what lands when it completes, so anything armed by an earlier
         // switch is dropped here rather than left to fire on a later one.
-        // Below the no-op return, deliberately: a re-select that starts no
-        // switch must not disarm one already in flight. Callers that defer
-        // arm their own slot *after* this returns, and each guards on the
-        // context actually differing, so none of them reach that return.
+        // Below both no-op returns, deliberately: a re-select that starts no
+        // switch must not disarm one already in flight. Callers that arm a new
+        // deferred action clear its competing slots after this returns.
         self.pending_resource_query = None;
         self.pending_bookmark = None;
         self.pending_workspace = None;
@@ -774,6 +783,7 @@ impl App {
         // Bump first: this switch's own progress flash belongs to the new
         // generation, and the bump clears any left over from the old one.
         self.bump_generation();
+        self.context_switch_target = Some((self.generation, name.clone()));
         self.set_flash(format!("switching to {name}…"));
         self.stash_view_snapshot();
         self.store.clear();
