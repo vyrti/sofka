@@ -310,7 +310,7 @@ enum ConfirmAction {
     /// Run a confirmed plugin (`confirm`/`dangerous`) once accepted — one job
     /// (label, argv) per target, so a bulk run confirms once.
     Plugin {
-        jobs: Vec<(String, Vec<String>)>,
+        jobs: Vec<crate::plugins::Job>,
         name: String,
         mode: PluginMode,
         timeout: u64,
@@ -331,6 +331,8 @@ pub enum PluginMode {
     Terminal,
     /// Captured off-thread into a scrollable document view.
     Popup,
+    /// Versioned JSON report rendered as a searchable document.
+    Report,
     /// Detached; a notification flashes on completion.
     Background,
 }
@@ -1537,6 +1539,9 @@ pub struct App {
     pub user_aliases: HashMap<String, String>,
     /// User-defined shell-out plugins.
     pub plugins: Vec<crate::config::Plugin>,
+    pub(super) plugin_task: Option<crate::plugins::Task>,
+    pub(super) plugin_run: u64,
+    pub(super) plugin_claim: Option<StatusClaim>,
     /// Saved navigation commands (`[[bookmarks]]`), re-applied on context
     /// switch and `:reload`.
     pub bookmarks: Vec<crate::config::Bookmark>,
@@ -1847,6 +1852,9 @@ impl App {
             all_contexts: Vec::new(),
             user_aliases: HashMap::new(),
             plugins: Vec::new(),
+            plugin_task: None,
+            plugin_run: 0,
+            plugin_claim: None,
             bookmarks: Vec::new(),
             pending_bookmark: None,
             workspaces: Vec::new(),
@@ -2007,6 +2015,7 @@ mod navigation;
 mod notify;
 mod overlays;
 mod pickers;
+mod plugins;
 mod rightsize;
 mod rows;
 mod snapshot;
@@ -2019,3 +2028,8 @@ pub use pickers::DEFAULT_SORT_LABEL;
 
 #[cfg(test)]
 mod tests;
+
+/// Built-ins retain ownership of their command names when loading packages.
+pub(crate) fn plugin_command_reserved(name: &str) -> bool {
+    name == "plugin-cancel" || PALETTE_COMMANDS.iter().any(|c| c.names.contains(&name))
+}

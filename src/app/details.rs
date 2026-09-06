@@ -6,6 +6,7 @@ impl App {
     /// Remember which view a transient sub-view (logs/detail/diff) was opened
     /// from, so `esc` returns there (e.g. back to the xray tree, not the table).
     pub(super) fn set_return_mode(&mut self) {
+        self.stop_plugins();
         // A transient sub-view (logs/detail/events) opened from a list-style
         // view returns to that view, not the table underneath it.
         self.return_mode = match self.mode {

@@ -66,6 +66,14 @@ struct Args {
     #[arg(long)]
     snapshot: bool,
 
+    /// Validate a plugin package without executing it or connecting to a cluster.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["check", "snapshot", "info", "validate_plugin_report"])]
+    validate_plugin: Option<PathBuf>,
+
+    /// Validate and render a versioned plugin JSON report without a cluster.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["check", "snapshot", "info"])]
+    validate_plugin_report: Option<PathBuf>,
+
     /// Print version/build, config sources, directories, and the current
     /// kubeconfig context, then exit (no cluster connection). For live
     /// discovery/metrics/watch status, use `:info` inside the TUI.
@@ -102,6 +110,24 @@ fn main() -> Result<()> {
 }
 
 async fn run_main(args: Args) -> Result<()> {
+    if let Some(dir) = &args.validate_plugin {
+        let plugin = sofka::plugins::read_package(dir).map_err(anyhow::Error::msg)?;
+        sofka::plugins::available(&plugin).map_err(anyhow::Error::msg)?;
+        println!("valid plugin: {}", plugin.name);
+        return Ok(());
+    }
+    if let Some(path) = &args.validate_plugin_report {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take((sofka::plugins::MAX_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        for line in sofka::plugins::render_report(&bytes).map_err(anyhow::Error::msg)? {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+
     let (loader, mut config_warnings) = config::ConfigLoader::load();
 
     // `--info`: print static diagnostics (no cluster connection) and exit.

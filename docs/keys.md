@@ -113,3 +113,14 @@ and `ctrl-e` (compact mode) are reserved by built-ins and can't be bound.
 Interactive actions (`e`, `s` for shell, `a`) suspend the TUI and shell out to
 `kubectl`. Delete, scale, restart, set-image, suspend, resume, reconcile, and
 port-forward go through the kube API (or a backgrounded process) directly.
+
+## Plugin commands
+
+| Command                      | Action                                                |
+| ---------------------------- | ----------------------------------------------------- |
+| `:<plugin> [name=value ...]` | Run a plugin with validated inputs.                   |
+| `:plugin-cancel`             | Stop the active plugin run and its temporary forward. |
+
+Installed packages add their commands and key chords to `?` help.
+Use `:reload` after a package change.
+See [Create a plugin package](plugin-authoring.md).

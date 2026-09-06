@@ -2132,6 +2132,10 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             "provider logs: change lookback period (30m, 4h, 2d)",
         ),
         Line::from(""),
+        bind(
+            ":plugin-cancel",
+            "cancel the active plugin and its temporary forward",
+        ),
         bind(":q / ctrl-c", "quit"),
         bind("?", "global help — close to return to the previous screen"),
     ];
@@ -2140,9 +2144,18 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("  Plugins", theme::title())));
         for p in &app.plugins {
-            let key = crate::keys::KeyChord::parse(&p.key)
-                .map(|c| c.label())
-                .unwrap_or_else(|_| format!("{}?", p.key));
+            let mut bindings = Vec::new();
+            if !p.key.is_empty() {
+                bindings.push(
+                    crate::keys::KeyChord::parse(&p.key)
+                        .map(|c| c.label())
+                        .unwrap_or_else(|_| format!("{}?", p.key)),
+                );
+            }
+            if let Some(command) = &p.palette {
+                bindings.push(format!(":{command}"));
+            }
+            let key = bindings.join(" / ");
             let scope = if p.scopes.is_empty() {
                 "all resources".to_string()
             } else {

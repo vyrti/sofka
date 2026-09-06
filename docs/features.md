@@ -210,3 +210,19 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   state/snapshot/bundle directories. The connected Kubernetes revision also
   stays visible in the main header.
   Identifiers and counts only, never credentials, tokens, or Secret values.
+
+## External plugin packages
+
+- **Package discovery** reads `plugins/*/plugin.toml` from the sofka configuration directory.
+  Packages reload with `:reload`.
+- **Named commands** and key chords start adapters without changes to sofka's source code.
+- **Validated inputs** supply named arguments with types, defaults, choices, and limits.
+- **JSON reports** show text sections and tables in a searchable document.
+- **Shared execution** limits output and concurrency.
+  It cancels processes on timeout, navigation, or `:plugin-cancel`.
+- **Safety controls** apply read-only mode, confirmation, and guardrails to plugins.
+  Load-test plugins require a network-load declaration.
+- **Managed port-forwards** supply a local endpoint for a selected pod or service.
+- **Local checks** validate package manifests and reports without a cluster.
+
+See [Create a plugin package](plugin-authoring.md).

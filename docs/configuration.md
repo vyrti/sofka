@@ -105,3 +105,17 @@ A skin in an override sets the colors for that context. A context with no skin
 keeps the session skin (config `skin.name`, the auto-detected default, or your
 last `:skin` choice). Overrides are re-read on every `:ctx` switch, so edits
 apply without a restart.
+
+## Plugin packages
+
+sofka reads packages from the `plugins/` directory next to `config.toml`.
+Each package directory contains a `plugin.toml` manifest.
+Enter `:reload` to read package changes.
+The `:config` view shows invalid packages and absent executables.
+
+Inline `[[plugins]]` entries take priority over packages with the same name or palette command.
+Packages load after cluster and context overrides.
+An empty inline plugin list does not disable installed packages.
+
+The [manifest reference](plugin-authoring.md#manifest) describes the package fields.
+The [authoring guide](plugin-authoring.md) includes an adapter and tests without a cluster.
