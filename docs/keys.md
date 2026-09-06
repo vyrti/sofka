@@ -7,8 +7,15 @@ pickers keep both characters available as input.
 
 ## Table views
 
+Use `:resource -n namespace --context context /filter` to apply a complete query.
+Scope options precede the slash. Structured filter terms combine with spaces or
+`&&`, with `||` for OR and `!(...)` for group negation. `/` edits the active filter
+and Esc clears it. See [filtering](filtering.md)
+for the grammar and selector persistence rules.
+
 | Key                                           | Action                                                                                                                                                        |
 | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `:resource -n ns --context ctx /filter`       | query resource, namespace, context, and filter together                                                                                                       |
 | `:<resource>`                                 | command palette - fuzzy over kinds and built-in commands                                                                                                      |
 | `:<resource> <ns>`                            | switch kind and namespace at once (`:deploy social`; `all`/`*` = all namespaces; the namespace tab-completes)                                                 |
 | `[` / `]`                                     | view history - back / forward through visited kind+namespace views                                                                                            |

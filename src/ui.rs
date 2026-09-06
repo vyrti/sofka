@@ -873,14 +873,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(theme::teal())
         };
         title.push(Span::styled(format!(" /{}", app.filter), style));
-        title.push(Span::styled(
-            if app.filter_server_side() {
-                " ·server"
-            } else {
-                " ·local"
-            },
-            theme::dim(),
-        ));
+        title.push(Span::styled(app.filter_location(), theme::dim()));
     }
     title.push(Span::raw(" "));
 
@@ -2017,7 +2010,11 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         ),
         bind(
             "/",
-            "filter: fuzzy · !inverse · -l/-f selectors (server-side on ⏎) · col=val cpu>500m age<2h",
+            "filter: fuzzy · !inverse · -l/-f selectors (server-side on ⏎) · col=val cpu>500m age<2h · && || !(...)",
+        ),
+        bind(
+            ":resource -n ns --context ctx /filter",
+            "query resource, namespace, context and filter together",
         ),
         bind(
             "ctrl-u · ctrl-w",
@@ -3348,8 +3345,8 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
                     "  ⏎ apply server-side",
                     Style::default().fg(theme::yellow()),
                 ));
-            } else if app.filter_server_side() {
-                spans.push(Span::styled("  ·server", theme::dim()));
+            } else {
+                spans.push(Span::styled(app.filter_location(), theme::dim()));
             }
             Line::from(spans)
         }

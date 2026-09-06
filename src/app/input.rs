@@ -186,6 +186,7 @@ impl App {
                     // Dropping the filter also drops its server-side
                     // selectors, so the watch must widen back out.
                     self.sync_filter_selectors();
+                    self.save_history_filter();
                 } else if !self.pop_frame() {
                     // at root, nothing to pop
                 }
@@ -267,6 +268,7 @@ impl App {
             }
             // k9s: 0 = all namespaces.
             KeyCode::Char('0') => {
+                self.save_history_filter();
                 self.namespace.clear();
                 self.drop_owner_scope();
                 self.remember_namespace();
@@ -380,6 +382,26 @@ impl App {
         }
         self.help_return = Mode::Table;
         self.palette_return = Mode::Table;
+        let query_head = typed.split_whitespace().next().unwrap_or("");
+        let owns_command = PALETTE_COMMANDS
+            .iter()
+            .any(|c| c.names.contains(&query_head))
+            || self
+                .plugins
+                .iter()
+                .any(|p| p.palette.as_deref() == Some(query_head));
+        if (self.cluster.resolve(query_head).is_some() || !owns_command)
+            && (typed.contains(" /")
+                || typed
+                    .split_whitespace()
+                    .any(|s| matches!(s, "-n" | "--namespace" | "--context")))
+        {
+            match crate::filter::ResourceQuery::parse(&typed) {
+                Ok(query) => self.apply_resource_query(query),
+                Err(error) => self.flash_warn(&format!("query: {error}")),
+            }
+            return;
+        }
         // `:kind namespace` switches both at once (`:deploy social`,
         // `:cephclusters all`); only the first word selects the kind.
         let (head, ns_arg) = match typed.split_once(char::is_whitespace) {
@@ -847,13 +869,15 @@ impl App {
                 self.filter.clear();
                 self.mode = Mode::Table;
                 self.sync_filter_selectors();
+                self.save_history_filter();
             }
             KeyCode::Enter => {
-                self.mode = Mode::Table;
                 if let Some(err) = self.filter_error() {
                     self.flash_warn(&format!("filter: {err}"));
                 } else {
+                    self.mode = Mode::Table;
                     self.sync_filter_selectors();
+                    self.save_history_filter();
                 }
             }
             KeyCode::Backspace => {

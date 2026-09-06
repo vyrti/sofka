@@ -510,6 +510,7 @@ impl App {
     }
 
     pub(super) fn set_namespace(&mut self, sel: String) {
+        self.save_history_filter();
         self.namespace = normalize_ns(&sel);
         self.drop_owner_scope();
         self.note_recent_namespace(&sel);
@@ -751,6 +752,7 @@ impl App {
     /// Reconnecting re-runs API discovery, which can take seconds, so it runs
     /// off-thread; the new cluster (or error) arrives as `Msg::ContextSwitched`.
     pub(super) fn switch_context(&mut self, name: String) {
+        self.pending_resource_query = None;
         // Re-selecting the current context is a no-op — unless we never
         // connected to it, in which case picking it again is a retry.
         if name == self.cluster.context && self.cluster.connected {
@@ -874,7 +876,10 @@ impl App {
         self.config_warnings.extend(threshold_warnings);
         // A bookmark/workspace that requested this context lands on its own
         // view(s); a plain switch lands on the context's default resource.
-        if self.pending_workspace.is_some() {
+        if let Some(mut query) = self.pending_resource_query.take() {
+            query.context = None;
+            self.apply_resource_query(query);
+        } else if self.pending_workspace.is_some() {
             self.apply_pending_workspace();
         } else if self.pending_bookmark.is_some() {
             self.apply_pending_bookmark();

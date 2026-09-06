@@ -65,6 +65,22 @@ fn filter(c: &mut Criterion) {
             });
         });
     }
+    let (mut app, _rx) = bs::pods_app(n);
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+        .unwrap();
+    app.filter = "workload-0004".into();
+    black_box(app.row_count());
+    g.bench_function("edit/2000", |b| {
+        b.iter(|| {
+            app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
+                .unwrap();
+            black_box(app.row_count());
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+                .unwrap();
+            black_box(app.row_count());
+        })
+    });
     g.finish();
 }
 
@@ -223,7 +239,11 @@ fn filter_cmp(c: &mut Criterion) {
     ] {
         let (mut app, _rx) = bs::pods_app(n);
         app.filter = pat.to_string();
-        black_box(app.row_count());
+        let count = app.row_count();
+        assert!(
+            count > 0 && count < n,
+            "comparison fixture must exercise real column values"
+        );
         g.bench_with_input(BenchmarkId::new(label, n), &n, |b, &n| {
             let mut i = 0usize;
             b.iter(|| {

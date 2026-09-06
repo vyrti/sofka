@@ -17,6 +17,37 @@ fn node_pods_watch_forbidden(error: &watcher::Error) -> bool {
 impl App {
     // ----- navigation ----------------------------------------------------
 
+    pub(super) fn apply_resource_query(&mut self, query: crate::filter::ResourceQuery) {
+        if let Some(context) = &query.context
+            && (context != &self.cluster.context || !self.cluster.connected)
+        {
+            let context = context.clone();
+            self.switch_context(context);
+            self.pending_resource_query = Some(query);
+            return;
+        }
+        self.pending_resource_query = None;
+        let Some(kind) = self.cluster.resolve(&query.resource) else {
+            self.flash_warn(&format!("No resource matches '{}'", query.resource));
+            return;
+        };
+        self.save_history_filter();
+        if let Some(ns) = &query.namespace {
+            self.namespace = normalize_ns(ns);
+            self.note_recent_namespace(ns);
+            self.remember_namespace();
+        }
+        self.set_root_view(kind);
+        self.filter = query.filter;
+        self.record_history();
+        self.start_watch();
+        self.set_flash(format!(
+            "Viewing {} in {}",
+            self.kind_plural,
+            self.namespace_label()
+        ));
+    }
+
     /// Switch the active resource kind by user input. Pushes the current view
     /// so `esc` can return.
     pub fn switch_kind(&mut self, input: &str) {
@@ -28,6 +59,7 @@ impl App {
     pub fn switch_kind_ns(&mut self, input: &str, ns: Option<&str>) {
         match self.cluster.resolve(input) {
             Some(kind) => {
+                self.save_history_filter();
                 if let Some(ns) = ns {
                     self.namespace = normalize_ns(ns);
                     self.note_recent_namespace(ns);
@@ -148,6 +180,16 @@ impl App {
 
     // ----- view history (`[` / `]`) ---------------------------------------
 
+    pub(super) fn save_history_filter(&mut self) {
+        if self.stack.is_empty()
+            && let Some(entry) = self.history.get_mut(self.history_pos)
+            && entry.kind_plural == self.kind_plural
+            && entry.namespace == self.namespace
+        {
+            entry.filter = self.filter.clone();
+        }
+    }
+
     /// Record the current root view (kind + namespace). Called after every
     /// root switch; navigating with `[`/`]` bypasses this so hopping through
     /// history doesn't rewrite it. A new entry truncates the forward tail.
@@ -158,6 +200,7 @@ impl App {
         let entry = ViewEntry {
             kind_plural: self.kind_plural.clone(),
             namespace: self.namespace.clone(),
+            filter: self.filter.clone(),
         };
         if self.history.get(self.history_pos) == Some(&entry) {
             return;
@@ -175,6 +218,7 @@ impl App {
             self.flash_warn("already at oldest view");
             return;
         }
+        self.save_history_filter();
         self.history_pos -= 1;
         self.apply_history_entry();
     }
@@ -184,6 +228,7 @@ impl App {
             self.flash_warn("already at newest view");
             return;
         }
+        self.save_history_filter();
         self.history_pos += 1;
         self.apply_history_entry();
     }
@@ -199,6 +244,7 @@ impl App {
         self.namespace = entry.namespace;
         let title = kind.title();
         self.set_root_view(kind);
+        self.filter = entry.filter;
         self.flash = format!(
             "history {}/{}: {title} in {}",
             self.history_pos + 1,
@@ -210,6 +256,7 @@ impl App {
     }
 
     pub(super) fn push_frame(&mut self) {
+        self.save_history_filter();
         if self.kind.is_none() {
             return;
         }
@@ -900,13 +947,19 @@ impl App {
                         headers.get(i).cloned()
                     })
                     .is_some_and(|h| matches!(h.as_str(), "CPU" | "MEM" | "%CPU" | "%MEM"));
+                let filter_uses_metrics = match &*self.parsed_filter() {
+                    crate::filter::ParsedFilter::Structured(s) => {
+                        s.terms.iter().any(crate::filter::Term::metrics_sensitive)
+                    }
+                    _ => false,
+                };
                 if !data.is_empty() || !containers.is_empty() {
                     self.metrics_seen = true;
                 }
                 self.metrics_error = None;
                 self.metrics = data;
                 self.container_metrics = containers;
-                if sort_uses_metrics {
+                if sort_uses_metrics || filter_uses_metrics {
                     self.invalidate_rows();
                 }
             }
@@ -1274,6 +1327,7 @@ impl App {
             } if generation == self.generation => match result {
                 Ok(cluster) => self.apply_context_switch(name, cluster),
                 Err(e) => {
+                    self.pending_resource_query = None;
                     self.flash_warn(&format!("context switch failed: {e}"));
                     // Never connected anywhere yet — put the picker back up
                     // instead of stranding the user on an empty table.

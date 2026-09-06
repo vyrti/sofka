@@ -81,16 +81,44 @@ impl App {
         cells: &mut crate::store::FastMap<RowKey, CellCacheEntry>,
         now: i64,
     ) -> bool {
-        use crate::filter::{ParsedFilter, Term};
+        use crate::filter::ParsedFilter;
         match parsed {
             ParsedFilter::Fuzzy(pat) => {
                 pat.is_empty() || self.fuzzy_match_row(o, pat, key, cells, now)
             }
-            ParsedFilter::Structured(s) => s.terms.iter().all(|t| match t {
-                Term::Fuzzy(pat) => self.fuzzy_match_row(o, pat, key, cells, now),
-                Term::NotFuzzy(pat) => !self.fuzzy_match_row(o, pat, key, cells, now),
-                Term::Cmp(cmp) => self.eval_cmp(o, cmp, now),
-            }),
+            ParsedFilter::Structured(s) => s
+                .terms
+                .iter()
+                .all(|t| self.eval_term(o, key, t, cells, now) == Some(true)),
+        }
+    }
+
+    fn eval_term(
+        &self,
+        o: &DynamicObject,
+        key: &RowKey,
+        term: &crate::filter::Term,
+        cells: &mut crate::store::FastMap<RowKey, CellCacheEntry>,
+        now: i64,
+    ) -> Option<bool> {
+        use crate::filter::Term;
+        match term {
+            Term::Fuzzy(pat) => Some(self.fuzzy_match_row(o, pat, key, cells, now)),
+            Term::NotFuzzy(pat) => Some(!self.fuzzy_match_row(o, pat, key, cells, now)),
+            Term::Cmp(cmp) => self.eval_cmp(o, key, cmp, now),
+            Term::All(terms) | Term::Not(terms) | Term::Any(terms) => {
+                let any = matches!(term, Term::Any(_));
+                let inverse = matches!(term, Term::Not(_));
+                let mut result = Some(!any);
+                for t in terms {
+                    match self.eval_term(o, key, t, cells, now) {
+                        Some(value) if value == any => return Some(value ^ inverse),
+                        None => result = None,
+                        _ => {}
+                    }
+                }
+                result.map(|v| v ^ inverse)
+            }
         }
     }
 
@@ -188,29 +216,40 @@ impl App {
     /// read the live metrics snapshot, `age` the creation timestamp; any
     /// other key names a displayed column (numeric values compare by the
     /// cell's leading number, text case-insensitively).
-    fn eval_cmp(&self, o: &DynamicObject, cmp: &crate::filter::Cmp, now: i64) -> bool {
+    fn eval_cmp(
+        &self,
+        o: &DynamicObject,
+        key: &RowKey,
+        cmp: &crate::filter::Cmp,
+        now: i64,
+    ) -> Option<bool> {
         use crate::filter::CmpValue;
-        match &cmp.value {
-            CmpValue::Cpu(want) => cmp.op.eval(self.metrics_for(o).0.cmp(want)),
-            CmpValue::Mem(want) => cmp.op.eval(self.metrics_for(o).1.cmp(want)),
-            CmpValue::Duration(want) => match crate::columns::age_secs(o, now) {
-                Some(age) => cmp.op.eval(age.cmp(want)),
-                None => false,
-            },
-            CmpValue::Num(want) => match self.column_cell(o, &cmp.key, now) {
-                Some(cell) => cmp
-                    .op
-                    .eval(crate::columns::parse_leading_num(&cell).total_cmp(want)),
-                None => false,
-            },
+        let ordering = match &cmp.value {
+            CmpValue::Cpu(want) => self.row_metrics(o, key)?.0.cmp(want),
+            CmpValue::Mem(want) => self.row_metrics(o, key)?.1.cmp(want),
+            CmpValue::Duration(want) => crate::columns::age_secs(o, now)?.cmp(want),
+            CmpValue::Num(want) => {
+                let cell = self.column_cell(o, &cmp.key, now)?;
+                crate::filter::cell_number(&cell)?.total_cmp(want)
+            }
             // `want` was folded once at parse time. ASCII cells compare through
             // an allocation-free byte iterator; non-ASCII cells use
             // whole-string lowercasing for context-sensitive Unicode mappings.
-            CmpValue::Str(want) => match self.column_cell(o, &cmp.key, now) {
-                Some(cell) => cmp.op.eval(crate::filter::cmp_folded_lower(&cell, want)),
-                None => false,
-            },
-        }
+            CmpValue::Str(want) => {
+                let cell = self.column_cell(o, &cmp.key, now)?;
+                crate::filter::cmp_folded_lower(&cell, want)
+            }
+        };
+        Some(cmp.op.eval(ordering))
+    }
+
+    fn row_metrics(&self, o: &DynamicObject, key: &RowKey) -> Option<(i64, i64)> {
+        let metric_key = match self.kind_plural.as_str() {
+            "pods" => key.as_ref(),
+            "nodes" => o.metadata.name.as_deref()?,
+            _ => return None,
+        };
+        self.metrics.get(metric_key).copied()
     }
 
     /// The displayed cell a comparison key names (case-insensitive column
@@ -218,10 +257,28 @@ impl App {
     /// without a STATUS column. Extracts only the named column — this runs
     /// per object per rebuild when a structured filter is active.
     fn column_cell<'o>(&self, o: &'o DynamicObject, key: &str, now: i64) -> Option<Cow<'o, str>> {
-        if key.eq_ignore_ascii_case("namespace") || key.eq_ignore_ascii_case("ns") {
+        if matches!(key, "namespace" | "ns" | "metadata.namespace") {
             // Borrowed: the namespace is already a `String` on the object, and
             // this runs per object per rebuild.
             return Some(o.metadata.namespace.as_deref().unwrap_or("").into());
+        }
+        match key {
+            "metadata.name" => return o.metadata.name.as_deref().map(Cow::Borrowed),
+            "spec.nodename" => {
+                return o
+                    .data
+                    .pointer("/spec/nodeName")
+                    .and_then(|v| v.as_str())
+                    .map(Cow::Borrowed);
+            }
+            "status.phase" => {
+                return o
+                    .data
+                    .pointer("/status/phase")
+                    .and_then(|v| v.as_str())
+                    .map(Cow::Borrowed);
+            }
+            _ => {}
         }
         if let Some(i) = self.spec.header_index(key) {
             return self.spec.cell_at(o, i, now);
@@ -237,6 +294,19 @@ impl App {
     /// filter — i.e. the active filter is (partly) server-side.
     pub fn filter_server_side(&self) -> bool {
         self.applied_filter_labels.is_some() || self.applied_filter_fields.is_some()
+    }
+
+    pub fn filter_location(&self) -> &'static str {
+        if self.filter_selectors_pending() {
+            return " ·pending ⏎";
+        }
+        if !self.filter_server_side() {
+            return " ·local";
+        }
+        match &*self.parsed_filter() {
+            crate::filter::ParsedFilter::Structured(s) if !s.terms.is_empty() => " ·server+local",
+            _ => " ·server",
+        }
     }
 
     /// Parse error of the current filter input, if any.
@@ -291,9 +361,20 @@ impl App {
 
     pub(super) fn ensure_rows_cache(&self) {
         let mut cache = self.rows_cache.borrow_mut();
-        if !cache.dirty {
+        if !cache.dirty
+            && (!cache.time_sensitive || cache.filter_second == crate::columns::now_secs())
+        {
             return;
         }
+        let parsed = self.parsed_filter();
+        let now = crate::columns::now_secs();
+        cache.time_sensitive = match &*parsed {
+            crate::filter::ParsedFilter::Structured(s) => {
+                s.terms.iter().any(crate::filter::Term::time_sensitive)
+            }
+            _ => false,
+        };
+        cache.filter_second = now;
         cache.column_widths = None;
 
         let headers = self.display_headers();
@@ -323,12 +404,10 @@ impl App {
         }
         // Parsed once, not once per object: the filter check used to re-borrow
         // the filter cache and re-compare the raw filter string for every row.
-        let parsed = self.parsed_filter();
         // One clock reading for the whole rebuild. Every AGE cell, DURATION
         // cell and `age >` comparison in this pass is measured against the
         // same instant, so a rebuild that crosses a second boundary cannot
         // sort two rows against two different "now"s.
-        let now = crate::columns::now_secs();
         // Disjoint field borrows so the filter can warm the cell cache while
         // the sort-key cache is also held.
         let RowsCache {

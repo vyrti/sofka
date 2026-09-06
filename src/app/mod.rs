@@ -43,6 +43,11 @@ impl App {
     pub fn bench_invalidate_rows(&self) {
         self.invalidate_rows();
     }
+
+    #[cfg(feature = "bench")]
+    pub fn bench_refresh_view_spec(&mut self) {
+        self.refresh_view_spec();
+    }
 }
 
 /// Larger cap used while autoscroll is paused: we stop trimming so the line
@@ -1350,6 +1355,8 @@ const HIGHLIGHT_CACHE_LIMIT: usize = 4096;
 /// wasteful on large clusters; we rebuild only when the store or filter changes.
 #[derive(Default)]
 struct RowsCache {
+    filter_second: i64,
+    time_sensitive: bool,
     dirty: bool,
     keys: Vec<RowKey>,
     cells: crate::store::FastMap<RowKey, CellCacheEntry>,
@@ -1445,12 +1452,12 @@ struct ViewKey {
 }
 
 /// One root view for the `[`/`]` history: which kind was listed in which
-/// namespace. Drill-down state (selectors, filter, scope) is deliberately not
-/// kept — history replays root views; the breadcrumb stack handles drills.
+/// namespace, including its filter. The breadcrumb stack handles drill scopes.
 #[derive(Clone, PartialEq, Eq)]
 struct ViewEntry {
     kind_plural: String,
     namespace: String,
+    filter: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1568,6 +1575,7 @@ pub struct App {
     /// restart is needed and to mark the filter as server-side in the UI.
     applied_filter_labels: Option<String>,
     applied_filter_fields: Option<String>,
+    pending_resource_query: Option<crate::filter::ResourceQuery>,
     pub command: String,
     pub cmd_suggestions: Vec<Suggestion>,
     pub cmd_sel: usize,
@@ -1930,6 +1938,7 @@ impl App {
             spec_rev: 0,
             applied_filter_labels: None,
             applied_filter_fields: None,
+            pending_resource_query: None,
             command: String::new(),
             cmd_suggestions: Vec::new(),
             cmd_sel: 0,
@@ -2068,6 +2077,8 @@ impl App {
             matcher: crate::fuzzy::Fuzzy::new(),
             hay_buf: RefCell::new(String::new()),
             rows_cache: RefCell::new(RowsCache {
+                filter_second: 0,
+                time_sensitive: false,
                 dirty: true,
                 keys: Vec::new(),
                 cells: crate::store::FastMap::default(),

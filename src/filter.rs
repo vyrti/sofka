@@ -4,7 +4,7 @@
 //! pattern over "namespace name", falling back to each rendered column cell
 //! (so `/10.96` finds a Service by its CLUSTER-IP). Once any structured marker
 //! appears, the input is split on whitespace and every term must match
-//! (terms are AND-ed; there is no OR/grouping — deliberately small):
+//! (terms are AND-ed, optionally with `&&`; `||` and parentheses combine groups):
 //!
 //! - `text`                   fuzzy match (namespace + name + any column cell)
 //! - `!text`                  inverse fuzzy match
@@ -19,7 +19,8 @@
 //! `1d2h`); any other key compares numerically when the value is a number
 //! and as case-insensitive text otherwise. Parsing never fails hard — a
 //! broken term is skipped and reported via [`Structured::error`] so the
-//! table doesn't blank out mid-keystroke.
+//! table doesn't blank out mid-keystroke. Enter keeps malformed input open.
+//! Quotes preserve spaces in values; parentheses preserve label-selector sets.
 
 /// The parsed form of the filter input.
 #[derive(Debug, Clone, PartialEq)]
@@ -47,6 +48,45 @@ pub enum Term {
     Fuzzy(String),
     NotFuzzy(String),
     Cmp(Cmp),
+    All(Vec<Term>),
+    Any(Vec<Term>),
+    Not(Vec<Term>),
+}
+
+impl Term {
+    pub fn metrics_sensitive(&self) -> bool {
+        match self {
+            Self::Cmp(Cmp {
+                value: CmpValue::Cpu(_) | CmpValue::Mem(_),
+                ..
+            }) => true,
+            Self::All(terms) | Self::Any(terms) | Self::Not(terms) => {
+                terms.iter().any(Self::metrics_sensitive)
+            }
+            _ => false,
+        }
+    }
+
+    pub fn time_sensitive(&self) -> bool {
+        match self {
+            Self::Cmp(Cmp {
+                value: CmpValue::Duration(_),
+                ..
+            }) => true,
+            Self::All(terms) | Self::Any(terms) | Self::Not(terms) => {
+                terms.iter().any(Self::time_sensitive)
+            }
+            _ => false,
+        }
+    }
+
+    fn fuzzy_needle(&self) -> Option<&str> {
+        match self {
+            Self::Fuzzy(text) => Some(text),
+            Self::All(terms) | Self::Any(terms) => terms.iter().find_map(Self::fuzzy_needle),
+            _ => None,
+        }
+    }
 }
 
 /// One `key<op>value` column comparison.
@@ -127,10 +167,7 @@ impl ParsedFilter {
     pub fn fuzzy_needle(&self) -> Option<&str> {
         match self {
             ParsedFilter::Fuzzy(pat) => (!pat.is_empty()).then_some(pat.as_str()),
-            ParsedFilter::Structured(s) => s.terms.iter().find_map(|t| match t {
-                Term::Fuzzy(pat) => Some(pat.as_str()),
-                _ => None,
-            }),
+            ParsedFilter::Structured(s) => s.terms.iter().find_map(Term::fuzzy_needle),
         }
     }
 }
@@ -141,9 +178,49 @@ pub fn parse(input: &str) -> ParsedFilter {
         return ParsedFilter::Fuzzy(trimmed.to_string());
     }
 
+    ParsedFilter::Structured(match tokenize(trimmed) {
+        Ok(tokens) => parse_tokens(&tokens, 0),
+        Err(error) => Structured {
+            error: Some(error),
+            ..Structured::default()
+        },
+    })
+}
+
+fn parse_tokens(tokens: &[String], depth: usize) -> Structured {
+    if depth > 32 {
+        return Structured {
+            error: Some("filter nesting exceeds 32 levels".into()),
+            ..Structured::default()
+        };
+    }
+    if tokens.iter().any(|t| t == "||") {
+        let mut branches = Vec::new();
+        for branch in tokens.split(|t| t == "||") {
+            let parsed = parse_tokens(branch, depth + 1);
+            let error = if branch.is_empty() {
+                Some("expected terms on both sides of ||".into())
+            } else if parsed.labels.is_some() || parsed.fields.is_some() {
+                Some("place selectors outside OR groups: -l app=api (a || b)".into())
+            } else {
+                parsed.error
+            };
+            if let Some(error) = error {
+                return Structured {
+                    error: Some(error),
+                    ..Structured::default()
+                };
+            }
+            branches.push(Term::All(parsed.terms));
+        }
+        return Structured {
+            terms: vec![Term::Any(branches)],
+            ..Structured::default()
+        };
+    }
     let mut terms = Vec::new();
-    let mut labels: Vec<&str> = Vec::new();
-    let mut fields: Vec<&str> = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
+    let mut fields: Vec<String> = Vec::new();
     let mut error: Option<String> = None;
     let fail = |slot: &mut Option<String>, msg: String| {
         if slot.is_none() {
@@ -151,33 +228,82 @@ pub fn parse(input: &str) -> ParsedFilter {
         }
     };
 
-    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
     let mut i = 0;
     while i < tokens.len() {
-        let tok = tokens[i];
+        let tok = tokens[i].as_str();
         i += 1;
+        let group = tok
+            .strip_prefix("!(")
+            .map(|s| (s, true))
+            .or_else(|| tok.strip_prefix('(').map(|s| (s, false)));
+        if let Some((inner, inverse)) = group {
+            let parsed = inner
+                .strip_suffix(')')
+                .ok_or("unclosed group".to_string())
+                .and_then(tokenize)
+                .map(|tokens| parse_tokens(&tokens, depth + 1));
+            match parsed {
+                Ok(s) if s.labels.is_some() || s.fields.is_some() => fail(
+                    &mut error,
+                    "selectors must be outside Boolean groups".into(),
+                ),
+                Ok(s) if s.error.is_some() => fail(&mut error, s.error.unwrap()),
+                Ok(s) if s.terms.is_empty() => fail(&mut error, "empty Boolean group".into()),
+                Ok(s) => terms.push(if inverse {
+                    Term::Not(s.terms)
+                } else {
+                    Term::All(s.terms)
+                }),
+                Err(e) => fail(&mut error, e),
+            }
+            continue;
+        }
+        if tok == "&&" {
+            if i == 1 || i == tokens.len() || tokens[i] == "&&" {
+                fail(&mut error, "expected terms on both sides of &&".into());
+            }
+            continue;
+        }
         // `-l <sel>` / `-f <sel>`, or attached (`-lapp=api`).
         if tok == "-l" || tok == "-f" {
             match tokens.get(i) {
-                Some(sel) => {
+                Some(sel) if !sel.starts_with('-') && sel != "&&" => {
+                    let mut sel = sel.clone();
+                    i += 1;
+                    if tok == "-l" && tokens.get(i).is_some_and(|s| s == "in" || s == "notin") {
+                        sel.push(' ');
+                        sel.push_str(&tokens[i]);
+                        i += 1;
+                        if let Some(set) = tokens.get(i).filter(|s| s.starts_with('(')) {
+                            sel.push(' ');
+                            sel.push_str(set);
+                            i += 1;
+                        } else {
+                            fail(&mut error, "expected selector set in parentheses".into());
+                            continue;
+                        }
+                    }
+                    if sel.is_empty() || (tok == "-f" && !sel.contains('=')) {
+                        fail(&mut error, format!("invalid selector after {tok}"));
+                        continue;
+                    }
                     if tok == "-l" {
                         &mut labels
                     } else {
                         &mut fields
                     }
                     .push(sel);
-                    i += 1;
                 }
-                None => fail(&mut error, format!("expected selector after {tok}")),
+                _ => fail(&mut error, format!("expected selector after {tok}")),
             }
             continue;
         }
         if let Some(sel) = attached_selector(tok, "-l") {
-            labels.push(sel);
+            labels.push(sel.to_string());
             continue;
         }
         if let Some(sel) = attached_selector(tok, "-f") {
-            fields.push(sel);
+            fields.push(sel.to_string());
             continue;
         }
         if let Some((key, op, value)) = split_cmp(tok) {
@@ -206,25 +332,126 @@ pub fn parse(input: &str) -> ParsedFilter {
         terms.push(Term::Fuzzy(tok.to_string()));
     }
 
-    ParsedFilter::Structured(Structured {
+    Structured {
         terms,
         labels: (!labels.is_empty()).then(|| labels.join(",")),
         fields: (!fields.is_empty()).then(|| fields.join(",")),
         error,
-    })
+    }
 }
 
 /// Whether any token flips the input from a single legacy fuzzy pattern into
 /// the structured grammar. Mirrors the markers `parse` acts on.
 fn is_structured(input: &str) -> bool {
-    input.split_whitespace().any(|tok| {
-        tok == "-l"
-            || tok == "-f"
-            || attached_selector(tok, "-l").is_some()
-            || attached_selector(tok, "-f").is_some()
-            || tok.starts_with('!')
-            || split_cmp(tok).is_some()
-    })
+    input.contains("&&")
+        || input.contains("||")
+        || input.split_whitespace().any(|tok| {
+            tok == "&&"
+                || tok == "-l"
+                || tok == "-f"
+                || attached_selector(tok, "-l").is_some()
+                || attached_selector(tok, "-f").is_some()
+                || tok.starts_with('!')
+                || tok.starts_with('(')
+                || split_cmp(tok.trim_start_matches('(')).is_some()
+        })
+}
+
+fn tokenize(input: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut depth = 0usize;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+                if depth > 0 {
+                    token.push(c);
+                }
+            } else {
+                token.push(c);
+            }
+        } else if c == '\'' || c == '"' {
+            quote = Some(c);
+            if depth > 0 {
+                token.push(c);
+            }
+        } else if c == '(' {
+            depth += 1;
+            token.push(c);
+        } else if c == ')' {
+            depth = depth.checked_sub(1).ok_or("unexpected ')' in filter")?;
+            token.push(c);
+        } else if depth == 0 && matches!(c, '&' | '|') && chars.peek() == Some(&c) {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+            chars.next();
+            tokens.push(format!("{c}{c}"));
+        } else if c.is_whitespace() && depth == 0 {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+        } else {
+            token.push(c);
+        }
+    }
+    if quote.is_some() || depth != 0 {
+        return Err("unclosed quote or selector set".into());
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    Ok(tokens)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceQuery {
+    pub resource: String,
+    pub namespace: Option<String>,
+    pub context: Option<String>,
+    pub filter: String,
+}
+
+impl ResourceQuery {
+    /// Scope options precede `/filter`; everything after the slash belongs to
+    /// the row grammar, including whitespace and selector flags.
+    pub fn parse(input: &str) -> Result<Self, String> {
+        let (scope, filter) = input.split_once(" /").unwrap_or((input, ""));
+        let mut words = scope.split_whitespace();
+        let resource = words.next().ok_or("expected resource")?.to_string();
+        let mut query = Self {
+            resource,
+            namespace: None,
+            context: None,
+            filter: filter.into(),
+        };
+        while let Some(word) = words.next() {
+            let slot = match word {
+                "-n" | "--namespace" => &mut query.namespace,
+                "--context" => &mut query.context,
+                _ if !word.starts_with('-') && query.namespace.is_none() => {
+                    query.namespace = Some(word.into());
+                    continue;
+                }
+                _ => return Err(format!("unexpected scope argument '{word}'")),
+            };
+            let value = words
+                .next()
+                .filter(|s| !s.starts_with('-'))
+                .ok_or_else(|| format!("expected value after {word}"))?;
+            if slot.is_some() {
+                return Err(format!("duplicate {word}"));
+            }
+            *slot = Some(value.into());
+        }
+        if let Some(error) = parse(filter).error() {
+            return Err(error.into());
+        }
+        Ok(query)
+    }
 }
 
 /// The selector of an attached `-l`/`-f` form (`-lapp=api`). Requires an `=`
@@ -243,7 +470,8 @@ fn split_cmp(tok: &str) -> Option<(&str, Op, &str)> {
     {
         return None;
     }
-    let key_end = tok.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))?;
+    let key_end =
+        tok.find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))?;
     let (key, rest) = tok.split_at(key_end);
     let (op, value) = if let Some(v) = rest.strip_prefix("!=") {
         (Op::Ne, v)
@@ -304,11 +532,26 @@ fn typed_value(key: &str, raw: &str) -> Result<CmpValue, String> {
         "age" => parse_duration(raw)
             .map(CmpValue::Duration)
             .ok_or_else(|| format!("bad duration '{raw}'")),
-        _ => Ok(raw
-            .parse::<f64>()
-            .map(CmpValue::Num)
-            .unwrap_or_else(|_| CmpValue::Str(fold_lower(raw)))),
+        _ => match raw.parse::<f64>() {
+            Ok(value) if value.is_finite() => Ok(CmpValue::Num(value)),
+            Ok(_) => Err(format!("non-finite number '{raw}'")),
+            Err(_) if key.eq_ignore_ascii_case("restarts") => {
+                Err(format!("bad restart count '{raw}'"))
+            }
+            Err(_) => Ok(CmpValue::Str(fold_lower(raw))),
+        },
     }
+}
+
+/// Numeric columns may append annotations, but missing cells are not zero.
+pub fn cell_number(cell: &str) -> Option<f64> {
+    let number = cell
+        .trim()
+        .split([' ', '/', '('])
+        .next()?
+        .parse::<f64>()
+        .ok()?;
+    number.is_finite().then_some(number)
 }
 
 /// CPU quantity → millicores: `250m` → 250, `1` → 1000, `500000000n` → 500.
@@ -323,7 +566,8 @@ fn parse_cpu(s: &str) -> Option<i64> {
         _ => (s, 1000.0),
     };
     let v: f64 = num.parse().ok()?;
-    (v >= 0.0).then(|| (v * scale).round() as i64)
+    (v >= 0.0 && (v * scale).is_finite() && v * scale < i64::MAX as f64)
+        .then(|| (v * scale).round() as i64)
 }
 
 /// Memory quantity → bytes: `1Gi`, `512Mi`, `2000000`. Validating twin of
@@ -343,11 +587,12 @@ fn parse_mem(s: &str) -> Option<i64> {
     for (suf, mult) in suffixes {
         if let Some(num) = s.strip_suffix(suf) {
             let v: f64 = num.trim().parse().ok()?;
-            return (v >= 0.0).then(|| (v * mult) as i64);
+            return (v >= 0.0 && (v * mult).is_finite() && v * mult < i64::MAX as f64)
+                .then(|| (v * mult) as i64);
         }
     }
     let v: f64 = s.parse().ok()?;
-    (v >= 0.0).then_some(v as i64)
+    (v >= 0.0 && v.is_finite() && v < i64::MAX as f64).then_some(v as i64)
 }
 
 /// Duration → seconds: `90s`, `2h`, `1d2h`, `1h30m`, bare `300` (seconds).
@@ -378,7 +623,7 @@ fn parse_duration(s: &str) -> Option<i64> {
         if num.is_empty() {
             return None;
         }
-        total += num.parse::<i64>().ok()? * unit;
+        total = total.checked_add(num.parse::<i64>().ok()?.checked_mul(unit)?)?;
         num.clear();
     }
     // Trailing digits without a unit (`2h30`) are malformed.
@@ -388,6 +633,130 @@ fn parse_duration(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boolean_precedence_groups_and_inverse() {
+        let s = structured("api || worker && !canary");
+        assert_eq!(s.error, None);
+        assert_eq!(
+            s.terms,
+            vec![Term::Any(vec![
+                Term::All(vec![Term::Fuzzy("api".into())]),
+                Term::All(vec![
+                    Term::Fuzzy("worker".into()),
+                    Term::NotFuzzy("canary".into())
+                ]),
+            ])]
+        );
+        let s = structured("-l app=api (status=Running||age>2h) !(restarts>=5)");
+        assert_eq!(s.error, None);
+        assert_eq!(s.labels.as_deref(), Some("app=api"));
+        assert!(s.terms.iter().any(Term::time_sensitive));
+        assert_eq!(structured("(name='api server' || !canary)").error, None);
+        for input in [
+            "api ||",
+            "|| api",
+            "api || || worker",
+            "status=Running && ()",
+            "-l app=api || worker",
+            "!(-l app=api)",
+            "(status=Running)junk",
+        ] {
+            assert!(parse(input).error().is_some(), "{input}");
+        }
+        let deep = format!("{}age>2h{}", "(".repeat(40), ")".repeat(40));
+        assert!(parse(&deep).error().is_some());
+    }
+
+    #[test]
+    fn numeric_validation_and_well_known_fields() {
+        for input in ["restarts=NaN", "restarts>inf", "restarts>=oops"] {
+            assert!(parse(input).error().is_some(), "{input}");
+        }
+        assert_eq!(cell_number("-"), None);
+        assert_eq!(cell_number("NaN"), None);
+        assert_eq!(cell_number("5 (2m ago)"), Some(5.0));
+        assert_eq!(
+            structured("spec.nodeName=node-3 metadata.namespace=prod status.phase=Running")
+                .terms
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn sets_quotes_and_explicit_and() {
+        let s = structured("-l app in (api, worker),env=prod && status=Running");
+        assert_eq!(s.labels.as_deref(), Some("app in (api, worker),env=prod"));
+        assert_eq!(s.terms.len(), 1);
+        assert_eq!(s.error, None);
+        assert_eq!(
+            structured("-l 'app notin (api, worker)' !canary")
+                .labels
+                .as_deref(),
+            Some("app notin (api, worker)")
+        );
+        assert_eq!(
+            structured("name='api server'").terms,
+            vec![Term::Cmp(Cmp {
+                key: "name".into(),
+                op: Op::Eq,
+                value: CmpValue::Str("api server".into())
+            })]
+        );
+        for input in [
+            "-l app in (api",
+            "-l app in",
+            "-l 'app=api",
+            "-l -f metadata.name=api",
+            "-f spec.nodeName",
+            "status=Running &&",
+            "&& api",
+        ] {
+            assert!(parse(input).error().is_some(), "{input}");
+        }
+    }
+
+    #[test]
+    fn resource_queries_validate_scope_and_filter() {
+        assert_eq!(
+            ResourceQuery::parse("pods -n prod --context west /-l app=api age<2h").unwrap(),
+            ResourceQuery {
+                resource: "pods".into(),
+                namespace: Some("prod".into()),
+                context: Some("west".into()),
+                filter: "-l app=api age<2h".into(),
+            }
+        );
+        assert_eq!(
+            ResourceQuery::parse("pods all /kube system")
+                .unwrap()
+                .filter,
+            "kube system"
+        );
+        for input in [
+            "pods -n",
+            "pods --context",
+            "pods -n -x",
+            "pods prod extra /api",
+            "pods /cpu>oops",
+        ] {
+            assert!(ResourceQuery::parse(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn quantities_and_durations_reject_overflow() {
+        for input in [
+            "cpu>inf",
+            "cpu>1e100",
+            "memory>inf",
+            "memory>1e100Gi",
+            "age<9223372036854775807w",
+        ] {
+            assert!(parse(input).error().is_some(), "{input}");
+        }
+    }
 
     fn structured(input: &str) -> Structured {
         match parse(input) {

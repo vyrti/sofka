@@ -1,6 +1,18 @@
 use super::*;
 
 impl App {
+    fn retain_filter_selectors(&mut self) {
+        let parsed = self.parsed_filter();
+        let mut selectors = Vec::new();
+        if let Some(labels) = parsed.labels() {
+            selectors.push(format!("-l '{labels}'"));
+        }
+        if let Some(fields) = parsed.fields() {
+            selectors.push(format!("-f '{fields}'"));
+        }
+        drop(parsed);
+        self.filter = selectors.join(" ");
+    }
     // ----- drill-down ----------------------------------------------------
 
     pub(super) fn drill(&mut self) {
@@ -112,7 +124,7 @@ impl App {
             uid: obj.metadata.uid.clone(),
         });
         self.scope_label = Some(format!("cronjob/{name}"));
-        self.filter.clear();
+        self.retain_filter_selectors();
         self.reset_sort();
         self.table_state.select(Some(0));
         self.flash = format!("↳ jobs of {name}");
@@ -143,7 +155,7 @@ impl App {
         self.fields = Some("type=helm.sh/release.v1".into());
         self.owner = None;
         self.scope_label = Some(format!("helm/{release}"));
-        self.filter.clear();
+        self.retain_filter_selectors();
         self.reset_sort();
         self.table_state.select(Some(0));
         self.flash = format!("↳ {release} history");
@@ -169,7 +181,7 @@ impl App {
         self.fields = Some("type=helm.sh/release.v1".into());
         self.owner = None;
         self.scope_label = Some(format!("helm/{release}"));
-        self.filter.clear();
+        self.retain_filter_selectors();
         self.reset_sort();
         self.table_state.select(Some(0));
         self.flash = format!("↳ {release} history");
@@ -262,7 +274,7 @@ impl App {
         self.fields = None;
         self.owner = None;
         self.scope_label = Some(format!("crd/{crd_name}"));
-        self.filter.clear();
+        self.retain_filter_selectors();
         self.reset_sort();
         self.table_state.select(Some(0));
         self.flash = format!("↳ {plural}");
@@ -304,7 +316,7 @@ impl App {
         self.fields = fields;
         self.owner = None;
         self.scope_label = Some(scope);
-        self.filter.clear();
+        self.retain_filter_selectors();
         self.reset_sort();
         self.table_state.select(Some(0));
         self.flash = format!("↳ drilled into {plural}");
@@ -340,7 +352,7 @@ impl App {
         self.fields = Some(format!("metadata.name={}", t.name));
         self.owner = None;
         self.scope_label = Some(t.name.clone());
-        self.filter.clear();
+        self.retain_filter_selectors();
         self.reset_sort();
         self.table_state.select(Some(0));
         self.mode = Mode::Table;

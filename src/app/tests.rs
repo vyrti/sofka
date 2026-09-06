@@ -9168,6 +9168,476 @@ fn row_names(app: &App) -> Vec<String> {
         .collect()
 }
 
+fn type_resource_query(app: &mut App, query: &str) {
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in query.chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+}
+
+fn selector_api(streaming: bool) -> (Cluster, mpsc::UnboundedReceiver<http::Uri>) {
+    use futures_util::stream;
+    use hyper::body::{Bytes, Frame};
+    use std::convert::Infallible;
+
+    let (seen, requests) = mpsc::unbounded_channel();
+    let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+        let uri = request.uri().clone();
+        seen.send(uri.clone()).ok();
+        async move {
+            let query: HashMap<_, _> = form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
+                .into_owned()
+                .collect();
+            let initial = query.contains_key("sendInitialEvents");
+            let watch = query.get("watch").is_some_and(|s| s == "true");
+            let table = uri.path().starts_with("/api/v1/") && uri.path().ends_with("/pods");
+            let invalid_field = query
+                .get("fieldSelector")
+                .is_some_and(|s| s.contains("spec.unsupported"));
+            let status = if !table {
+                404
+            } else if invalid_field || (initial && !streaming) {
+                400
+            } else {
+                200
+            };
+            let body = if status != 200 {
+                json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"BadRequest","code":status,
+                    "message": if invalid_field { "field label not supported: spec.unsupported" } else { "sendInitialEvents is not supported" }}).to_string()
+            } else {
+                let namespace = uri
+                    .path()
+                    .split("/namespaces/")
+                    .nth(1)
+                    .and_then(|s| s.split('/').next())
+                    .unwrap_or("prod");
+                let api = json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"api","namespace":namespace,"resourceVersion":"10","labels":{"app":"api","env":"prod"}},"spec":{"nodeName":"node-3"},"status":{"phase":"Running"}});
+                let unrelated = json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"other","namespace":namespace,"resourceVersion":"10"},"spec":{"nodeName":"node-4"}});
+                let items =
+                    if query.contains_key("labelSelector") || query.contains_key("fieldSelector") {
+                        vec![api]
+                    } else {
+                        vec![api, unrelated]
+                    };
+                if initial {
+                    let mut body = items
+                        .into_iter()
+                        .map(|object| json!({"type":"ADDED","object":object}).to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    body.push('\n');
+                    body.push_str(&json!({"type":"BOOKMARK","object":{"apiVersion":"v1","kind":"Pod","metadata":{"resourceVersion":"10","annotations":{"k8s.io/initial-events-end":"true"}}}}).to_string());
+                    body.push('\n');
+                    body
+                } else if watch {
+                    String::new()
+                } else {
+                    json!({"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"10"},"items":items}).to_string()
+                }
+            };
+            let frames = stream::iter([Ok::<_, Infallible>(Frame::data(Bytes::from(body)))]);
+            let frames = if watch && status == 200 {
+                frames.chain(stream::pending()).boxed()
+            } else {
+                frames.boxed()
+            };
+            Ok::<_, Infallible>(
+                http::Response::builder()
+                    .status(status)
+                    .body(http_body_util::StreamBody::new(frames))
+                    .unwrap(),
+            )
+        }
+    });
+    let mut cluster = Cluster::fake();
+    cluster.client = kube::Client::new(service, "default");
+    (cluster, requests)
+}
+
+async fn next_selector_request(requests: &mut mpsc::UnboundedReceiver<http::Uri>) -> http::Uri {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let uri = requests.recv().await.expect("request channel closed");
+            if uri.path().starts_with("/api/v1/") && uri.path().ends_with("/pods") {
+                return uri;
+            }
+        }
+    })
+    .await
+    .expect("pod API request timeout")
+}
+
+async fn sync_selector_view(app: &mut App, rx: &mut Receiver<Msg>) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let msg = rx.recv().await.expect("watch channel closed");
+            let done = matches!(&msg, Msg::Synced { generation } if *generation == app.generation);
+            app.handle_msg(msg);
+            if done {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("filtered view sync timeout");
+}
+
+#[tokio::test]
+async fn selectors_reach_streaming_list_and_watch_requests_from_keys() {
+    for streaming in [true, false] {
+        let (cluster, mut requests) = selector_api(streaming);
+        let (tx, mut rx) = mpsc::channel(1024);
+        let mut app = App::new(cluster, tx);
+        type_resource_query(
+            &mut app,
+            "pods -n prod /-l 'app in (api, worker),env=prod' -f spec.nodeName=node-3 status=Running",
+        );
+        sync_selector_view(&mut app, &mut rx).await;
+        assert_eq!(row_names(&app), ["api"]);
+        for step in 0..if streaming { 1 } else { 3 } {
+            let uri = next_selector_request(&mut requests).await;
+            let query: HashMap<_, _> = form_urlencoded::parse(uri.query().unwrap().as_bytes())
+                .into_owned()
+                .collect();
+            assert_eq!(uri.path(), "/api/v1/namespaces/prod/pods");
+            assert_eq!(
+                query.get("labelSelector").map(String::as_str),
+                Some("app in (api, worker),env=prod")
+            );
+            assert_eq!(
+                query.get("fieldSelector").map(String::as_str),
+                Some("spec.nodeName=node-3")
+            );
+            assert_eq!(query.contains_key("sendInitialEvents"), step == 0);
+            assert_eq!(
+                query.get("watch").map(String::as_str) == Some("true"),
+                step != 1
+            );
+        }
+        app.handle_key(ctrl(KeyCode::Char('r'))).unwrap();
+        sync_selector_view(&mut app, &mut rx).await;
+        let uri = next_selector_request(&mut requests).await;
+        assert!(uri.query().unwrap().contains("fieldSelector="));
+        if !streaming {
+            next_selector_request(&mut requests).await;
+        }
+        app.handle_key(press(KeyCode::Char('0'))).unwrap();
+        sync_selector_view(&mut app, &mut rx).await;
+        let uri = next_selector_request(&mut requests).await;
+        assert_eq!(uri.path(), "/api/v1/pods");
+        assert!(uri.query().unwrap().contains("labelSelector="));
+        if !streaming {
+            next_selector_request(&mut requests).await;
+        }
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        sync_selector_view(&mut app, &mut rx).await;
+        let uri = next_selector_request(&mut requests).await;
+        assert!(!uri.query().unwrap().contains("Selector="));
+        assert_eq!(row_names(&app), ["api", "other"]);
+    }
+}
+
+#[tokio::test]
+async fn unsupported_fields_remain_scoped_and_show_api_error() {
+    let (cluster, mut requests) = selector_api(true);
+    let (tx, mut rx) = mpsc::channel(1024);
+    let mut app = App::new(cluster, tx);
+    type_resource_query(&mut app, "pods /-l app=api -f spec.unsupported=x");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let msg = rx.recv().await.unwrap();
+            let done =
+                matches!(&msg, Msg::Error { generation, .. } if *generation == app.generation);
+            app.handle_msg(msg);
+            if done {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(app.flash_err);
+    assert!(
+        app.flash.contains("field label not supported"),
+        "{}",
+        app.flash
+    );
+    assert_eq!(
+        app.applied_filter_fields.as_deref(),
+        Some("spec.unsupported=x")
+    );
+    for _ in 0..2 {
+        let uri = next_selector_request(&mut requests).await;
+        let query: HashMap<_, _> = form_urlencoded::parse(uri.query().unwrap().as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(
+            query.get("fieldSelector").map(String::as_str),
+            Some("spec.unsupported=x")
+        );
+        assert_eq!(
+            query.get("labelSelector").map(String::as_str),
+            Some("app=api")
+        );
+    }
+    assert!(row_names(&app).is_empty());
+}
+
+#[tokio::test]
+async fn boolean_groups_short_circuit_and_match_operational_queries() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for (name, phase, restarts) in [
+        ("api", "Running", 1),
+        ("worker", "Pending", 7),
+        ("canary", "Running", 9),
+    ] {
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":name,"namespace":"prod"},
+            "spec":{"nodeName":"node-3"},
+            "status":{"phase":phase,"containerStatuses":[{"restartCount":restarts,"state":{"running":{}}}]}}),
+        );
+    }
+    type_filter(&mut app, "(status=Pending || restarts>=5) && !canary");
+    assert_eq!(row_names(&app), ["worker"]);
+    retype_filter(&mut app, "!(status=Pending || restarts>=5)");
+    assert_eq!(row_names(&app), ["api"]);
+    retype_filter(&mut app, "api || worker && restarts>=5");
+    assert_eq!(row_names(&app), ["api", "worker"]);
+    retype_filter(
+        &mut app,
+        "spec.nodeName=node-3 metadata.namespace=prod status.phase=Pending",
+    );
+    assert_eq!(row_names(&app), ["worker"]);
+    retype_filter(&mut app, "-l env=prod (api || worker)");
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("env=prod"));
+    assert_eq!(app.filter_location(), " ·server+local");
+    assert_eq!(
+        row_names(&app),
+        Vec::<String>::new(),
+        "new API watch starts empty"
+    );
+}
+
+#[tokio::test]
+async fn unavailable_metrics_are_unknown_even_under_negation() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for name in ["unknown", "zero", "busy"] {
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":name,"namespace":"default"}}),
+        );
+    }
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::from([
+            ("default/zero".into(), (0, 0)),
+            ("default/busy".into(), (600, 2 * 1024 * 1024 * 1024)),
+        ]),
+        containers: HashMap::new(),
+    });
+    for query in [
+        "cpu<500m",
+        "memory<1Gi",
+        "cpu=0",
+        "!(cpu>=500m)",
+        "!(memory>=1Gi)",
+    ] {
+        retype_filter(&mut app, query);
+        assert_eq!(row_names(&app), ["zero"], "{query}");
+    }
+    retype_filter(&mut app, "cpu>500m || memory>1Gi");
+    assert_eq!(row_names(&app), ["busy"]);
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::from([
+            ("default/zero".into(), (900, 0)),
+            ("default/busy".into(), (100, 0)),
+        ]),
+        containers: HashMap::new(),
+    });
+    assert_eq!(
+        row_names(&app),
+        ["zero"],
+        "poll changes membership without a watch event"
+    );
+    app.handle_msg(Msg::Metrics {
+        generation: app.generation,
+        data: HashMap::new(),
+        containers: HashMap::new(),
+    });
+    assert!(
+        row_names(&app).is_empty(),
+        "metrics removal invalidates membership"
+    );
+    retype_filter(&mut app, "name=unknown || cpu>500m");
+    assert_eq!(
+        row_names(&app),
+        ["unknown"],
+        "a known true OR branch can match"
+    );
+}
+
+#[tokio::test]
+async fn saved_selector_is_on_the_first_watch_and_visible_in_ui() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (cluster, mut requests) = selector_api(true);
+    let (tx, mut rx) = mpsc::channel(1024);
+    let mut app = App::new(cluster, tx);
+    app.bookmarks = vec![crate::config::Bookmark {
+        name: "API".into(),
+        key: Some("ctrl-a".into()),
+        resource: "pods".into(),
+        namespace: Some("prod".into()),
+        filter: Some("-l app=api status=Running".into()),
+        ..Default::default()
+    }];
+    app.handle_key(ctrl(KeyCode::Char('a'))).unwrap();
+    sync_selector_view(&mut app, &mut rx).await;
+    let uri = next_selector_request(&mut requests).await;
+    assert!(uri.query().unwrap().contains("labelSelector=app%3Dapi"));
+    assert_eq!(row_names(&app), ["api"]);
+    let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::draw(frame, &mut app))
+        .unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(screen.contains("/-l app=api status=Running"));
+    assert!(screen.contains("server+local"));
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    assert_eq!(app.filter, "-l app=api status=Running");
+    app.handle_key(ctrl(KeyCode::Char('u'))).unwrap();
+    assert_eq!(app.filter_location(), " ·pending ⏎");
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    sync_selector_view(&mut app, &mut rx).await;
+    assert_eq!(row_names(&app), ["api", "other"]);
+    assert_eq!(app.filter_location(), " ·local");
+}
+
+#[tokio::test]
+async fn palette_query_scopes_first_watch_and_supports_history() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    let generation = app.generation;
+    type_resource_query(
+        &mut app,
+        "pods -n prod --context test /-l app in (api, worker) -f spec.nodeName=node-3 && !canary status=Running",
+    );
+    assert_eq!(
+        app.generation,
+        generation + 1,
+        "no unfiltered initial watch"
+    );
+    assert_eq!(app.namespace, "prod");
+    assert_eq!(
+        app.applied_filter_labels.as_deref(),
+        Some("app in (api, worker)")
+    );
+    assert_eq!(
+        app.applied_filter_fields.as_deref(),
+        Some("spec.nodeName=node-3")
+    );
+    assert_eq!(app.filter_location(), " ·server+local");
+    for (name, phase) in [
+        ("api", "Running"),
+        ("canary", "Running"),
+        ("worker", "Pending"),
+    ] {
+        apply(
+            &mut app,
+            json!({"apiVersion":"v1", "kind":"Pod", "metadata":{"name":name,"namespace":"prod"}, "status":{"phase":phase}}),
+        );
+    }
+    assert_eq!(row_names(&app), ["api"]);
+    app.handle_key(press(KeyCode::Char('['))).unwrap();
+    assert_eq!(app.kind_plural, "deployments");
+    app.handle_key(press(KeyCode::Char(']'))).unwrap();
+    assert_eq!(
+        app.applied_filter_fields.as_deref(),
+        Some("spec.nodeName=node-3")
+    );
+    app.handle_key(press(KeyCode::Char('0'))).unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(
+        app.applied_filter_fields.as_deref(),
+        Some("spec.nodeName=node-3")
+    );
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert!(app.filter.is_empty());
+    assert!(!app.filter_server_side());
+}
+
+#[tokio::test]
+async fn palette_query_waits_for_context_and_rejects_invalid_input() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    let generation = app.generation;
+    type_resource_query(&mut app, "pods -n prod /cpu>oops");
+    assert_eq!(app.generation, generation);
+    assert_eq!(app.kind_plural, "deployments");
+    assert!(app.flash_err);
+    type_resource_query(&mut app, "pods -n prod --context west /-l app=api");
+    assert!(app.pending_resource_query.is_some());
+    let mut cluster = Cluster::fake();
+    cluster.context = "west".into();
+    app.handle_msg(Msg::ContextSwitched {
+        generation: app.generation,
+        name: "west".into(),
+        result: Ok(Box::new(cluster)),
+    });
+    assert_eq!(app.cluster.context, "west");
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.namespace, "prod");
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("app=api"));
+    assert!(app.pending_resource_query.is_none());
+}
+
+#[tokio::test]
+async fn malformed_filter_stays_editable_without_widening_watch() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    type_filter(&mut app, "-l app=api");
+    let generation = app.generation;
+    retype_filter(&mut app, "-l app in (");
+    assert_eq!(app.mode, Mode::Filter);
+    assert_eq!(app.generation, generation);
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("app=api"));
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert!(!app.filter_server_side());
+}
+
+#[tokio::test]
+async fn age_filter_rechecks_rows_as_time_passes_without_watch_updates() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1", "kind":"Pod", "metadata":{
+            "name":"old", "namespace":"default", "creationTimestamp":"2020-01-01T00:00:00Z"
+        }}),
+    );
+    type_filter(&mut app, "age>2h");
+    assert_eq!(row_names(&app), ["old"]);
+    // Model the previous second's membership; no dirty bit or watch event.
+    {
+        let mut cache = app.rows_cache.borrow_mut();
+        cache.keys.clear();
+        cache.filter_second -= 1;
+        assert!(!cache.dirty);
+    }
+    assert_eq!(row_names(&app), ["old"]);
+}
+
 #[tokio::test]
 async fn legacy_fuzzy_filter_with_spaces_is_one_pattern() {
     let (mut app, _rx) = test_app();
@@ -9413,10 +9883,10 @@ async fn local_filter_edits_never_restart_the_watch() {
 }
 
 #[tokio::test]
-async fn drill_clears_server_selector_and_pop_restores_it() {
+async fn drill_preserves_server_selector_and_pop_restores_it() {
     let (mut app, _rx) = test_app();
     app.switch_kind("deployments");
-    type_filter(&mut app, "-l env=prod");
+    type_filter(&mut app, "-l env=prod -f metadata.namespace=default");
     assert_eq!(app.applied_filter_labels.as_deref(), Some("env=prod"));
 
     apply(
@@ -9429,26 +9899,58 @@ async fn drill_clears_server_selector_and_pop_restores_it() {
     );
     app.table_state.select(Some(0));
 
-    // Drill: like the fuzzy filter, the filter (and with it the server-side
-    // selector) is cleared for the child view; the drill's own selector takes
-    // over.
+    // Drill combines the persistent query selector with the child scope.
     app.handle_key(press(KeyCode::Enter)).unwrap();
     assert_eq!(app.kind_plural, "pods");
-    assert!(app.filter.is_empty());
-    assert_eq!(app.applied_filter_labels, None);
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("env=prod"));
+    assert_eq!(
+        app.watch_key.as_ref().unwrap().labels.as_deref(),
+        Some("app=web,env=prod")
+    );
     assert_eq!(app.labels.as_deref(), Some("app=web"));
+    assert_eq!(
+        app.watch_key.as_ref().unwrap().fields.as_deref(),
+        Some("metadata.namespace=default")
+    );
 
     // Pop: the saved frame restores the filter, and the rewatch re-applies
     // its selector server-side.
-    app.handle_key(press(KeyCode::Esc)).unwrap();
+    app.handle_key(press(KeyCode::Esc)).unwrap(); // clear child filter
+    app.handle_key(press(KeyCode::Esc)).unwrap(); // return to parent
     assert_eq!(app.kind_plural, "deployments");
-    assert_eq!(app.filter, "-l env=prod");
+    assert_eq!(app.filter, "-l env=prod -f metadata.namespace=default");
+    assert_eq!(
+        app.applied_filter_fields.as_deref(),
+        Some("metadata.namespace=default")
+    );
     assert_eq!(app.applied_filter_labels.as_deref(), Some("env=prod"));
     assert_eq!(app.labels, None);
 }
 
 #[tokio::test]
-async fn root_switch_and_history_clear_server_selector_like_fuzzy() {
+async fn namespace_picker_and_history_preserve_both_selectors() {
+    let (mut app, _rx) = test_app();
+    type_resource_query(&mut app, "pods -n prod /-l app=api -f spec.nodeName=node-3");
+    app.ns_list = vec!["<all>".into(), "prod".into(), "qa".into()];
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    for c in "qa".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.namespace, "qa");
+    for (key, namespace) in [('[', "prod"), (']', "qa")] {
+        app.handle_key(press(KeyCode::Char(key))).unwrap();
+        assert_eq!(app.namespace, namespace);
+        assert_eq!(app.applied_filter_labels.as_deref(), Some("app=api"));
+        assert_eq!(
+            app.applied_filter_fields.as_deref(),
+            Some("spec.nodeName=node-3")
+        );
+    }
+}
+
+#[tokio::test]
+async fn root_switch_clears_filter_and_history_restores_it() {
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
     type_filter(&mut app, "-l app=api");
@@ -9460,11 +9962,11 @@ async fn root_switch_and_history_clear_server_selector_like_fuzzy() {
     assert!(app.filter.is_empty());
     assert_eq!(app.applied_filter_labels, None);
 
-    // History replay lands on the root view without the old filter.
+    // History restores the complete root query.
     app.handle_key(press(KeyCode::Char('['))).unwrap();
     assert_eq!(app.kind_plural, "pods");
-    assert!(app.filter.is_empty());
-    assert_eq!(app.applied_filter_labels, None);
+    assert_eq!(app.filter, "-l app=api");
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("app=api"));
 }
 
 #[tokio::test]

@@ -42,7 +42,14 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 - **Filtering** (`/`) with matched-character highlighting: fuzzy text, `!text`
   inverse match, `-l`/`-f` label and field selectors (evaluated server-side on
   ⏎), and typed column comparisons (`status=CrashLoopBackOff`, `cpu>500m`,
-  `memory>1Gi`, `restarts>=5`, `age<2h`). Space-separated terms AND together.
+  `memory>1Gi`, `restarts>=5`, `age<2h`). Structured terms AND together with
+  spaces or `&&`; `||` combines alternatives, parentheses group expressions,
+  and `!(...)` negates a group. Quote values containing spaces. Selectors survive refresh,
+  namespace changes, drill-down, and view history. The title shows local,
+  server-side, mixed, or pending evaluation; `/` edits and Esc clears.
+  Palette queries combine scope and filtering:
+  `:pods -n prod --context west /-l app=api status=Running`.
+  See [filter grammar and selectors](filtering.md).
 - **Global fuzzy find** (`:find <text>`) - search object names across the common
   kinds (workloads, pods, services, config, ingresses, jobs, storage, nodes,
   namespaces, Flux objects) in every namespace at once, concurrently. Results

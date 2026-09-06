@@ -205,6 +205,8 @@ pub fn seed(app: &mut App, objs: impl IntoIterator<Item = DynamicObject>) {
 pub fn pods_app(n: usize) -> (App, Receiver<Msg>) {
     let (mut a, rx) = app();
     a.kind_plural = "pods".to_string();
+    a.kind = a.cluster.resolve("pods");
+    a.bench_refresh_view_spec();
     seed(&mut a, (0..n).map(pod));
     (a, rx)
 }
