@@ -1823,6 +1823,113 @@ async fn pod_status_changes_keep_column_positions_stable() {
 }
 
 #[tokio::test]
+async fn scrolling_pods_keeps_column_positions_stable() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for (width, height) in [(80, 24), (120, 32), (180, 48), (220, 52)] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("pods");
+        app.namespace.clear();
+        for i in 0..90 {
+            let namespace = if i == 0 { "a-long-namespace" } else { "z" };
+            let name = if i == 89 {
+                "pod-89-with-a-much-longer-name-than-the-other-pods".to_string()
+            } else {
+                format!("pod-{i:02}")
+            };
+            apply(
+                &mut app,
+                json!({
+                    "apiVersion": "v1", "kind": "Pod",
+                    "metadata": {"name": name, "namespace": namespace},
+                    "status": {"phase": "Running"}
+                }),
+            );
+        }
+        app.handle_key(press(KeyCode::Home)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let initial = app.table_hit.borrow().clone().unwrap();
+        let header = |terminal: &Terminal<TestBackend>| -> String {
+            (0..width)
+                .map(|x| terminal.backend().buffer()[(x, initial.header_y)].symbol())
+                .collect()
+        };
+        let initial_header = header(&terminal);
+
+        for key in [KeyCode::Down, KeyCode::Up] {
+            for _ in 0..89 {
+                app.handle_key(press(key)).unwrap();
+                terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+                assert_eq!(
+                    app.table_hit.borrow().as_ref().unwrap().cols,
+                    initial.cols,
+                    "columns moved at {width}x{height}, offset {}",
+                    app.table_state.offset()
+                );
+                assert_eq!(header(&terminal), initial_header);
+            }
+            if key == KeyCode::Down {
+                assert!(app.table_state.offset() > 0);
+                assert_eq!(app.table_state.selected(), Some(89));
+            }
+        }
+        assert_eq!(app.table_state.offset(), 0);
+    }
+}
+
+#[tokio::test]
+async fn table_widths_follow_offscreen_updates_filters_and_view_changes() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let pod = |i: usize, node: &str| {
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": format!("pod-{i:02}"), "namespace": "default"},
+            "spec": {"nodeName": node},
+            "status": {"phase": "Running"}
+        })
+    };
+    for i in 0..40 {
+        apply(&mut app, pod(i, "node"));
+    }
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(180, 24)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let initial = app.table_hit.borrow().clone().unwrap().cols;
+
+    apply(
+        &mut app,
+        pod(39, "node-with-a-much-longer-name-outside-the-viewport"),
+    );
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let updated = app.table_hit.borrow().clone().unwrap().cols;
+    assert_ne!(updated, initial, "an updated row must change the widths");
+    app.handle_key(press(KeyCode::End)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.table_hit.borrow().as_ref().unwrap().cols, updated);
+
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "pod-00".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.row_count(), 1);
+    assert_eq!(app.table_hit.borrow().as_ref().unwrap().cols, initial);
+
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert!(!app.display_headers().iter().any(|h| h == "NODE"));
+    assert_eq!(
+        app.table_hit.borrow().as_ref().unwrap().cols.len(),
+        app.display_headers().len()
+    );
+}
+
+#[tokio::test]
 async fn mouse_click_selects_row_header_click_sorts_wheel_moves() {
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;

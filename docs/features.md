@@ -17,7 +17,8 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   jobs, cronjobs, PVC/PV, ingresses, endpoints, CustomResourceDefinitions), with
   a NAME/AGE fallback for everything else. STATUS columns use a fixed width of
   26 characters so status changes do not move adjacent columns. A configured
-  column width takes priority.
+  column width takes priority. Column widths use the full filtered list so
+  scrolling does not move the columns.
 - **Custom views** - define columns for any resource in the config file. An
   unknown custom resource picks up its CRD `additionalPrinterColumns`
   automatically. `w` toggles wide-only columns (kubectl `-o wide`). See
