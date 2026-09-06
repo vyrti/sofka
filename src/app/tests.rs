@@ -7773,6 +7773,31 @@ async fn sanitize_ships_with_sofka_and_confirms_before_deleting() {
 }
 
 #[tokio::test]
+async fn a_guardrail_can_deny_sanitize() {
+    let (mut app, _rx) = app_with_pod();
+    app.plugins = crate::plugins::bundled()
+        .into_iter()
+        .map(|p| p.expect("bundled package parses"))
+        .collect();
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["plugin:sanitize".into()],
+        deny: true,
+        reason: Some("cleanup goes through the owning controller".into()),
+        ..Default::default()
+    }];
+
+    plugin_command(&mut app, "sanitize");
+    assert_ne!(
+        app.mode,
+        Mode::Confirm,
+        "a denied action must not even confirm"
+    );
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("blocked by guardrail"), "{}", app.flash);
+    assert!(app.flash.contains("owning controller"), "{}", app.flash);
+}
+
+#[tokio::test]
 async fn sanitize_is_blocked_in_readonly_mode() {
     let (mut app, _rx) = app_with_pod();
     app.readonly = true;

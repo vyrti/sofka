@@ -2120,7 +2120,7 @@ mod explain;
 mod find;
 mod fleet;
 mod gitops;
-mod guardrails;
+pub(crate) mod guardrails;
 mod helpers;
 mod input;
 mod journal;

@@ -232,8 +232,10 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   It confirms before running, is blocked in read-only mode, and matches
   guardrails as `plugin:sanitize`. It never deletes a pod that is terminating,
   still has a running container, or was replaced since the scan.
-  The scope is the current namespace - **all namespaces when the view is** -
-  and the view filter does not narrow it.
+  The scope is the current namespace - **all namespaces when the view is**.
+  `-l`/`-f` filter terms narrow the scan server-side; a filter it cannot
+  reproduce exactly makes it refuse rather than delete more than the table
+  shows.
   See [Sanitize pods](../plugins/sanitize/README.md).
 
 ## External plugin packages

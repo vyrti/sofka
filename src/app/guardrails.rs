@@ -2,10 +2,11 @@ use super::*;
 
 /// How much confirmation an action needs, ordered weakest → strongest so the
 /// strongest matching guardrail wins.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ConfirmLevel {
     /// Run immediately, no confirmation (an action's default when nothing
     /// forces a prompt).
+    #[default]
     None,
     /// The ordinary y/n confirm dialog.
     Plain,
@@ -38,39 +39,16 @@ impl App {
         base: ConfirmLevel,
         all_namespaces: bool,
     ) -> Option<ConfirmLevel> {
-        let ctx = self.cluster.context.clone();
-        let mut level = base;
-        let mut deny: Option<String> = None;
-        let mut cap: Option<usize> = None;
+        let found = restrictions(
+            &self.guardrails,
+            &self.cluster.context,
+            action,
+            plural,
+            targets,
+            all_namespaces,
+        );
 
-        for g in &self.guardrails {
-            if !list_matches(&g.contexts, &ctx)
-                || !list_matches(&g.actions, action)
-                || !list_matches(&g.resources, plural)
-            {
-                continue;
-            }
-            // A namespace filter matches if any target is in a listed namespace.
-            if !all_namespaces
-                && !g.namespaces.is_empty()
-                && !targets
-                    .iter()
-                    .any(|(_, ns)| list_matches(&g.namespaces, ns))
-            {
-                continue;
-            }
-            if g.deny {
-                deny = Some(g.reason.clone().unwrap_or_default());
-            }
-            if let Some(m) = g.max_bulk {
-                cap = Some(cap.map_or(m, |c| c.min(m)));
-            }
-            if let Some(c) = &g.confirmation {
-                level = level.max(parse_level(c));
-            }
-        }
-
-        if let Some(reason) = deny {
+        if let Some(reason) = found.deny {
             let tail = if reason.is_empty() {
                 String::new()
             } else {
@@ -79,7 +57,7 @@ impl App {
             self.flash_warn(&format!("blocked by guardrail: {action} {plural}{tail}"));
             return None;
         }
-        if let Some(max) = cap
+        if let Some(max) = found.max_bulk
             && targets.len() > max
         {
             self.flash_warn(&format!(
@@ -88,7 +66,7 @@ impl App {
             ));
             return None;
         }
-        Some(level)
+        Some(base.max(found.confirmation))
     }
 
     /// Route an about-to-run action through its required confirmation. `Plain`
@@ -124,6 +102,58 @@ impl App {
             }
         }
     }
+}
+
+/// What the matching guardrails restrict, combined: any `deny` blocks, the
+/// smallest `max_bulk` applies, and the strongest `confirmation` wins.
+#[derive(Debug, Default)]
+pub(crate) struct Restrictions {
+    pub deny: Option<String>,
+    pub max_bulk: Option<usize>,
+    pub confirmation: ConfirmLevel,
+}
+
+/// Evaluate `[[guardrails]]` for one action without an [`App`], so a bundled
+/// adapter can apply the same rules to the set it is really about to act on.
+/// A `target = "context"` plugin is guarded before anything knows what it will
+/// match, so the runner can only weigh one placeholder target against
+/// `max_bulk`; the adapter knows the real count.
+pub(crate) fn restrictions(
+    guardrails: &[crate::config::Guardrail],
+    context: &str,
+    action: &str,
+    plural: &str,
+    targets: &[(String, String)],
+    all_namespaces: bool,
+) -> Restrictions {
+    let mut found = Restrictions::default();
+    for g in guardrails {
+        if !list_matches(&g.contexts, context)
+            || !list_matches(&g.actions, action)
+            || !list_matches(&g.resources, plural)
+        {
+            continue;
+        }
+        // A namespace filter matches if any target is in a listed namespace.
+        if !all_namespaces
+            && !g.namespaces.is_empty()
+            && !targets
+                .iter()
+                .any(|(_, ns)| list_matches(&g.namespaces, ns))
+        {
+            continue;
+        }
+        if g.deny {
+            found.deny = Some(g.reason.clone().unwrap_or_default());
+        }
+        if let Some(m) = g.max_bulk {
+            found.max_bulk = Some(found.max_bulk.map_or(m, |c| c.min(m)));
+        }
+        if let Some(c) = &g.confirmation {
+            found.confirmation = found.confirmation.max(parse_level(c));
+        }
+    }
+    found
 }
 
 fn parse_level(s: &str) -> ConfirmLevel {

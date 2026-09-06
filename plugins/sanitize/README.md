@@ -53,10 +53,19 @@ pod is usually a pod waiting for a node rather than a pod that failed.
   Restartable init containers (native sidecars) do not count. They support the
   workload rather than being it, and counting them would exempt a crash-looping
   pod from `states=stuck` purely for having a proxy injected.
-- A pod that was replaced between the scan and the delete. Each delete carries a
-  UID precondition, so if a StatefulSet has put a fresh `db-0` behind the name
-  that was dead a moment ago, the API rejects the delete and the report counts
-  it instead. Pod names are reusable; object identities are not.
+- A pod that stopped qualifying between the scan and the delete. Each pod is
+  re-read immediately before it is deleted and the selection is re-run against
+  what comes back, so a pod that was crash-looping when it was listed and has
+  since gone ready is left alone. The delete then carries preconditions for the
+  UID and the version just read, which covers both a replacement wearing the
+  same name — a StatefulSet putting a fresh `db-0` behind a name that was dead a
+  moment ago — and the object moving on in the meantime. Pod names are reusable;
+  object identities are not.
+
+  Re-reading costs one request per pod. Sanitizing a namespace with a very large
+  number of dead pods therefore needs a longer `timeout`, which is the price of
+  not deleting something that recovered while the run was working through the
+  list.
 
 ## Scope
 
@@ -64,9 +73,22 @@ The scope is the namespace the pods view is on. **In all-namespaces mode it acts
 across every namespace**, which for this command is a much larger blast radius
 than it sounds.
 
-**The view filter is ignored.** Filtering the table to `web-` and running
-`:sanitize` sanitizes the whole namespace, not the rows on screen. Use
-`dry_run=true` first if that distinction matters.
+The view filter is respected as far as it can be. `-l` and `-f` terms are
+Kubernetes selectors, so they are sent with the scan and narrow it exactly:
+
+```text
+/-l app=api        then  :sanitize      # only pods labelled app=api
+```
+
+The rest of the filter grammar — fuzzy text like `web-`, and comparisons like
+`restarts>=5` — is evaluated against rendered table cells inside sofka, which
+this command cannot reproduce. Rather than sanitize a wider set than the table
+is showing, **it refuses to run** and says so. Clear the filter, or express the
+narrowing with `-l`/`-f`.
+
+The scan is paged rather than fetched in one response, so sanitizing all
+namespaces on a large cluster does not pull the entire pod inventory into
+memory at once.
 
 ## Safety
 
@@ -77,6 +99,10 @@ than it sounds.
 - **Guardrails** match it as `plugin:sanitize`, so it can be denied, given a
   typed confirmation, or capped per context and namespace like any other
   destructive verb. See [Safety](../../docs/safety.md).
+  `max_bulk` is measured against the pods the run actually matched: the plugin
+  runner guards a `target = "context"` plugin before anything knows what it will
+  select, so the adapter re-checks the limit itself once it does, and deletes
+  nothing at all when the set is over.
 - **The action journal** records the run.
 
 ```toml
