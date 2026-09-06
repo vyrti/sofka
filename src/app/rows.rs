@@ -676,6 +676,7 @@ impl App {
         }
         self.clear_rows_cache();
         self.col_offset = 0;
+        self.col_scroll_max = 0;
     }
 
     /// The user-configured view matching the current kind, if any. Synthetic
@@ -719,19 +720,12 @@ impl App {
         self.flash_err = false;
     }
 
-    /// Scroll the table columns horizontally (←/→): the NAMESPACE/NAME
-    /// prefix stays anchored while the columns after it shift. Clamped so
-    /// the last column can always be reached and at least one scrollable
-    /// column stays visible.
+    /// Move the table by five terminal cells. Keep the name columns fixed.
     pub(super) fn scroll_columns(&mut self, delta: isize) {
-        let anchored = usize::from(self.show_namespace_column()) + 1;
-        let scrollable = self.display_headers().len().saturating_sub(anchored);
-        let max = scrollable.saturating_sub(1);
         self.col_offset = self
             .col_offset
-            .min(max)
-            .saturating_add_signed(delta)
-            .min(max);
+            .saturating_add_signed(delta * 5)
+            .min(self.col_scroll_max);
     }
 
     pub fn show_namespace_column(&self) -> bool {

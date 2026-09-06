@@ -58,7 +58,7 @@ pickers keep both characters available as input.
 | `C` / `U` / `D`                               | nodes: cordon / uncordon / drain                                                                                                                              |
 | `ctrl-d` / `ctrl-k`                           | delete / force-delete (marked rows, or current); in confirm: `f` toggles force, `c` cycles cascade (background → foreground → orphan)                         |
 | `w`                                           | toggle wide-only columns (kubectl `-o wide`), including node labels                                                                                           |
-| `←` / `→`                                     | scroll columns horizontally (NAMESPACE/NAME stay anchored) — for narrow panes                                                                                 |
+| `←` / `→`                                     | scroll sideways by 5 text positions; NAMESPACE/NAME stay fixed; arrows show more content                                                                      |
 | `:q`, `ctrl-c`                                | quit                                                                                                                                                          |
 | `?`                                           | help                                                                                                                                                          |
 | _(config)_                                    | plugin / bookmark / workspace key chords — `ctrl-`/`alt-`/`shift-`/`fN`; listed in `?` help                                                                   |

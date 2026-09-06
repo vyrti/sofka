@@ -217,9 +217,7 @@ impl App {
             }
             KeyCode::PageDown => self.move_page(1),
             KeyCode::PageUp => self.move_page(-1),
-            // Horizontal column scroll for narrow panes: the NAMESPACE/NAME
-            // prefix stays anchored, → hides the next column after it, ←
-            // brings one back.
+            // Move the viewport; keep NAMESPACE/NAME in place.
             KeyCode::Right => self.scroll_columns(1),
             KeyCode::Left => self.scroll_columns(-1),
             // k9s: SPACE marks/unmarks the current row for bulk actions, then
