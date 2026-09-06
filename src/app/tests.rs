@@ -6216,6 +6216,44 @@ async fn sort_picker_entries_follow_the_headers() {
     assert!(filtered.iter().any(|e| e == "AGE"), "{filtered:?}");
 }
 
+/// A context name carrying a combining accent has to match itself. An atom's
+/// needle is built from grapheme clusters, but the haystack came from a
+/// constructor that, once collapsing left pure ASCII, handed back the original
+/// bytes — so the accent's continuation bytes stayed in the haystack, the
+/// needle no longer had them, and the name filtered itself out of its own list.
+#[tokio::test]
+async fn context_picker_matches_a_name_with_a_combining_accent() {
+    let (mut app, _rx) = test_app();
+    app.mode = Mode::Contexts;
+    // `pre` + U+0301 COMBINING ACUTE ACCENT + `prod`.
+    let accented = "pre\u{0301}prod";
+    app.handle_msg(Msg::Contexts {
+        generation: app.generation,
+        list: vec![accented.into(), "staging".into()],
+    });
+
+    for c in accented.chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    assert_eq!(app.ctx_filter, accented);
+    assert_eq!(
+        app.filtered_contexts().to_vec(),
+        vec![accented.to_string()],
+        "a context name must match itself"
+    );
+
+    // The prefix ending at the accent matches it too.
+    for _ in 0..4 {
+        app.handle_key(press(KeyCode::Backspace)).unwrap();
+    }
+    assert_eq!(app.ctx_filter, "pre\u{0301}");
+    assert_eq!(
+        app.filtered_contexts().to_vec(),
+        vec![accented.to_string()],
+        "a prefix ending at the accent must still match"
+    );
+}
+
 #[tokio::test]
 async fn context_picker_enter_switches_to_filtered_selection() {
     let (mut app, _rx) = test_app();

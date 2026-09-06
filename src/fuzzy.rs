@@ -59,6 +59,26 @@ fn atom(needle: &str) -> Atom {
     )
 }
 
+/// The haystack in the form the matcher compares against.
+///
+/// Deliberately not `Utf32Str::new`. An atom's needle is always built from
+/// grapheme clusters, one `char` per cluster, so `pre\u{0301}prod` becomes the
+/// seven chars `preprod`. `Utf32Str::new` collapses the haystack the same way,
+/// but when the result is pure ASCII it then returns the *original* bytes
+/// instead of the collapsed chars — leaving the two continuation bytes of the
+/// combining accent in the haystack as if they were characters. The needle no
+/// longer has them, so a name like that stops matching even itself. Collapsing
+/// here keeps both sides on one sequence; the ASCII fast path is unaffected,
+/// because a string with no accent to collapse takes the branch above.
+fn utf32<'a>(text: &'a str, buf: &'a mut Vec<char>) -> Utf32Str<'a> {
+    if text.is_ascii() {
+        return Utf32Str::Ascii(text.as_bytes());
+    }
+    buf.clear();
+    buf.extend(nucleo_matcher::chars::graphemes(text));
+    Utf32Str::Unicode(&*buf)
+}
+
 impl Fuzzy {
     pub fn new() -> Self {
         Fuzzy {
@@ -84,8 +104,7 @@ impl Fuzzy {
             haystack: buf,
             ..
         } = &mut *inner;
-        atom.score(Utf32Str::new(haystack, buf), matcher)
-            .map(i64::from)
+        atom.score(utf32(haystack, buf), matcher).map(i64::from)
     }
 
     /// The char positions in `haystack` that `needle` matched, ascending, or
@@ -101,7 +120,7 @@ impl Fuzzy {
             ..
         } = &mut *inner;
         indices.clear();
-        atom.indices(Utf32Str::new(haystack, buf), matcher, indices)?;
+        atom.indices(utf32(haystack, buf), matcher, indices)?;
         // Reported in match order, which is not necessarily ascending, and can
         // repeat a position; callers highlight by walking them in order.
         indices.sort_unstable();
