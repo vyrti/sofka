@@ -20,10 +20,10 @@ uses. No Python, no kubectl, no extra runtime on `PATH`.
 :sanitize dry_run=true
 ```
 
-| Input     | Values                            | Default    |
-| --------- | --------------------------------- | ---------- |
-| `states`  | `terminal`, `stuck`, `all`        | `terminal` |
-| `dry_run` | `true`, `false`                   | `false`    |
+| Input     | Values                     | Default    |
+| --------- | -------------------------- | ---------- |
+| `states`  | `terminal`, `stuck`, `all` | `terminal` |
+| `dry_run` | `true`, `false`            | `false`    |
 
 `dry_run=true` reports the pods that match and deletes nothing. It still
 requires confirmation, because the package is declared mutating.
@@ -33,11 +33,11 @@ requires confirmation, because the package is declared mutating.
 The names are the STATUS values the pods view shows, so what you read in the
 table is what `states` selects.
 
-| `states`   | Deletes                                                                  |
-| ---------- | ------------------------------------------------------------------------ |
-| `terminal` | `Succeeded`, `Failed`, `Error`, `OOMKilled`, `ContainerStatusUnknown`.   |
+| `states`   | Deletes                                                                       |
+| ---------- | ----------------------------------------------------------------------------- |
+| `terminal` | `Succeeded`, `Failed`, `Error`, `OOMKilled`, `ContainerStatusUnknown`.        |
 | `stuck`    | The terminal set, and `CrashLoopBackOff`, `ImagePullBackOff`, `ErrImagePull`. |
-| `all`      | The stuck set, and `Pending`.                                            |
+| `all`      | The stuck set, and `Pending`.                                                 |
 
 `all` is the set k9s sanitizes. It is not the default here, because a `Pending`
 pod is usually a pod waiting for a node rather than a pod that failed.
@@ -103,6 +103,8 @@ memory at once.
   runner guards a `target = "context"` plugin before anything knows what it will
   select, so the adapter re-checks the limit itself once it does, and deletes
   nothing at all when the set is over.
+  Without a named kubeconfig context, guardrails use the context name `default`,
+  as they do in the app.
 - **The action journal** records the run.
 
 ```toml

@@ -7798,6 +7798,27 @@ async fn a_guardrail_can_deny_sanitize() {
 }
 
 #[tokio::test]
+async fn sanitize_checks_the_default_context_bulk_limit_before_confirmation() {
+    let (mut app, _rx) = app_with_pod();
+    app.cluster.context = "default".into();
+    app.plugins = crate::plugins::bundled()
+        .into_iter()
+        .map(|p| p.expect("bundled package parses"))
+        .collect();
+    app.guardrails = vec![crate::config::Guardrail {
+        contexts: vec!["default".into()],
+        actions: vec!["plugin:sanitize".into()],
+        max_bulk: Some(0),
+        ..Default::default()
+    }];
+
+    plugin_command(&mut app, "sanitize");
+    assert_ne!(app.mode, Mode::Confirm);
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("exceeds the max of 0"), "{}", app.flash);
+}
+
+#[tokio::test]
 async fn sanitize_is_blocked_in_readonly_mode() {
     let (mut app, _rx) = app_with_pod();
     app.readonly = true;

@@ -91,16 +91,22 @@ pub async fn run() -> Result<()> {
 /// The `[[guardrails]]` that apply to this run. The adapter is sofka, so it
 /// reads the same configuration the session did rather than being told.
 fn guardrails_for(request: &Value) -> Vec<crate::config::Guardrail> {
-    let context = request
-        .get("context")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let context = guardrail_context(request);
     let cluster = request
         .get("cluster")
         .and_then(Value::as_str)
         .unwrap_or_default();
     let (loader, _) = crate::config::ConfigLoader::load();
     loader.resolve(context, cluster).config.guardrails
+}
+
+fn guardrail_context(request: &Value) -> &str {
+    // Cluster::connect uses this name for guardrails without a named context.
+    // Keep the request context null so client_for still uses Config::infer.
+    request
+        .get("context")
+        .and_then(Value::as_str)
+        .unwrap_or("default")
 }
 
 async fn sanitize(
@@ -179,10 +185,7 @@ async fn sanitize(
         .collect();
     let limits = crate::app::guardrails::restrictions(
         guardrails,
-        request
-            .get("context")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
+        guardrail_context(request),
         "plugin:sanitize",
         "pods",
         &scoped,
@@ -731,6 +734,104 @@ mod tests {
             "{summary}"
         );
         assert_eq!(report["sections"][1]["title"], "Blocked");
+    }
+
+    #[tokio::test]
+    async fn a_context_bulk_limit_applies_without_a_named_context() {
+        for context in [Value::Null, json!("default"), json!("production")] {
+            let guardrail = crate::config::Guardrail {
+                contexts: vec![context.as_str().unwrap_or("default").into()],
+                actions: vec!["plugin:sanitize".into()],
+                max_bulk: Some(1),
+                ..Default::default()
+            };
+            let (client, seen) = mock_api(vec![(
+                "200 OK",
+                list_of(vec![
+                    failed("job-1", "uid-1", "rv-10"),
+                    failed("job-2", "uid-2", "rv-11"),
+                ]),
+            )])
+            .await;
+            let mut request = request("terminal", false);
+            request["context"] = context;
+            let report = sanitize(client, &request, &[guardrail]).await.unwrap();
+            assert_eq!(seen.lock().unwrap().len(), 1);
+            assert!(summary_of(&report).contains("exceeds the guardrail limit of 1"));
+            assert_eq!(report["sections"][1]["title"], "Blocked");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delete_conflict_or_missing_pod_is_not_counted_as_deleted() {
+        for (status, code, expected) in [
+            ("409 Conflict", 409, "1 changed since the scan"),
+            ("404 Not Found", 404, "1 already gone"),
+        ] {
+            let (client, seen) = mock_api(vec![
+                ("200 OK", list_of(vec![failed("job-1", "uid-1", "rv-10")])),
+                ("200 OK", failed("job-1", "uid-1", "rv-11").to_string()),
+                (
+                    status,
+                    json!({"kind": "Status", "status": "Failure", "code": code}).to_string(),
+                ),
+            ])
+            .await;
+            let report = sanitize(client, &request("terminal", false), &[])
+                .await
+                .unwrap();
+            let calls = seen.lock().unwrap().clone();
+            assert_eq!(calls.len(), 3);
+            assert_eq!(calls[2].0, "DELETE");
+            let summary = summary_of(&report);
+            assert!(summary.contains("0 deleted, 0 failed"), "{summary}");
+            assert!(summary.contains(expected), "{summary}");
+            assert_eq!(report["sections"].as_array().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_pre_delete_read_skips_the_pod_and_continues() {
+        let (client, seen) = mock_api(vec![
+            (
+                "200 OK",
+                list_of(vec![
+                    failed("job-1", "uid-1", "rv-10"),
+                    failed("job-2", "uid-2", "rv-11"),
+                ]),
+            ),
+            (
+                "403 Forbidden",
+                json!({"kind": "Status", "status": "Failure", "code": 403,
+                "reason": "Forbidden", "message": "cannot read job-1"})
+                .to_string(),
+            ),
+            ("200 OK", failed("job-2", "uid-2", "rv-11").to_string()),
+            (
+                "200 OK",
+                json!({"kind": "Status", "status": "Success"}).to_string(),
+            ),
+        ])
+        .await;
+        let report = sanitize(client, &request("terminal", false), &[])
+            .await
+            .unwrap();
+        let calls = seen.lock().unwrap().clone();
+        assert_eq!(calls.len(), 4);
+        let deletes: Vec<_> = calls
+            .iter()
+            .filter(|(method, ..)| method == "DELETE")
+            .collect();
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(
+            deletes[0].1.split('?').next(),
+            Some("/api/v1/namespaces/default/pods/job-2")
+        );
+        assert!(summary_of(&report).contains("1 deleted, 1 failed"));
+        assert_eq!(report["sections"][1]["title"], "Failed");
+        assert_eq!(report["sections"][1]["rows"][0][1], "job-1");
+        assert_eq!(report["sections"][2]["title"], "Deleted");
+        assert_eq!(report["sections"][2]["rows"][0][1], "job-2");
     }
 
     #[tokio::test]
