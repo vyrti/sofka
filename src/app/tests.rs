@@ -1753,6 +1753,76 @@ fn forward_context_matching_and_validation() {
 }
 
 #[tokio::test]
+async fn pod_status_changes_keep_column_positions_stable() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for width in [80, 120, 180] {
+        let (mut app, _rx) = test_app();
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for c in "pods".chars() {
+            app.handle_key(press(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.kind_plural, "pods");
+
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        let mut initial_columns = None;
+        for status in [
+            "Pending",
+            "ContainerCreating",
+            "Running",
+            "CrashLoopBackOff",
+            "CreateContainerConfigError",
+            "Running",
+        ] {
+            let state = if status == "Running" {
+                json!({"running": {}})
+            } else {
+                json!({"waiting": {"reason": status}})
+            };
+            apply(
+                &mut app,
+                json!({
+                    "apiVersion": "v1", "kind": "Pod",
+                    "metadata": {"name": "example", "namespace": "default"},
+                    "status": {
+                        "phase": "Running",
+                        "containerStatuses": [{
+                            "ready": status == "Running", "restartCount": 0,
+                            "state": state
+                        }]
+                    }
+                }),
+            );
+            terminal
+                .draw(|frame| crate::ui::draw(frame, &mut app))
+                .unwrap();
+            let hit = app.table_hit.borrow().clone().unwrap();
+            let status_index = app
+                .display_headers()
+                .iter()
+                .position(|header| header == "STATUS")
+                .unwrap();
+            let &(start, end, _) = hit
+                .cols
+                .iter()
+                .find(|(_, _, index)| *index == status_index)
+                .unwrap();
+            assert_eq!(end - start, 26, "status width at terminal width {width}");
+            let status_cell: String = (start..end)
+                .map(|x| terminal.backend().buffer()[(x, hit.rows_y)].symbol())
+                .collect();
+            assert_eq!(status_cell.trim(), status);
+            if let Some(ref columns) = initial_columns {
+                assert_eq!(&hit.cols, columns, "columns moved for {status} at {width}");
+            } else {
+                initial_columns = Some(hit.cols);
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn mouse_click_selects_row_header_click_sorts_wheel_moves() {
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
