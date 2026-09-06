@@ -553,8 +553,9 @@ async fn snapshot(app: &mut App, rx: &mut mpsc::Receiver<store::Msg>) -> Result<
 /// Whether a headless snapshot has everything it is going to draw: the watch's
 /// initial list, a report from the metrics poll when the CPU/MEM columns are
 /// shown (pods/nodes only), the pod counts behind the nodes view's PODS
-/// column, and the dashboard `PUP_DEMO` asked for. Deliberately narrow —
-/// anything not rendered by the frame must not hold the snapshot open.
+/// column, the CRD printer columns a custom resource draws, and the dashboard
+/// `PUP_DEMO` asked for. Deliberately narrow — anything not rendered by the
+/// frame must not hold the snapshot open.
 fn snapshot_ready(app: &App, metrics_reported: bool) -> bool {
     if !app.store.synced {
         return false;
@@ -576,6 +577,16 @@ fn snapshot_ready(app: &App, metrics_reported: bool) -> bool {
     // is the "has reported" state, and it is the same `None` the cell renders
     // from.
     if app.node_capacity_columns() && app.node_pods.is_none() {
+        return false;
+    }
+    // A custom resource's columns come from its CRD, fetched off-thread once
+    // the watch is already running. The list can sync well before that answer
+    // lands, so without this the quiet window closes on a bare NAME/AGE table
+    // that was about to gain its printer columns — and on a remembered sort
+    // that only becomes resolvable once they are known. The request reports
+    // either way, so a cluster with no CRD to read does not stall here beyond
+    // the round trip; the deadline still bounds it.
+    if app.printer_columns_pending.is_some() {
         return false;
     }
     match app.mode {

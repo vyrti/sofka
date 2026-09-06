@@ -6890,6 +6890,29 @@ async fn header_click_in_a_narrow_terminal_sorts_the_column_it_hits() {
     );
 }
 
+/// A custom resource's printer columns land after the watch has synced, so
+/// anything waiting for the finished table has to know the request is still
+/// out. The result clears that state whether the CRD was readable or not —
+/// a dropped failure would leave a snapshot waiting for the deadline.
+#[tokio::test]
+async fn printer_column_result_clears_the_pending_request() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("kustomizations");
+    app.printer_columns_pending = Some("kustomizations".into());
+
+    // "Nothing usable" — the shape a refused or missing CRD now reports.
+    app.handle_msg(Msg::PrinterColumns {
+        generation: app.generation,
+        plural: "kustomizations".into(),
+        view: Box::new(None),
+    });
+
+    assert!(
+        app.printer_columns_pending.is_none(),
+        "a failed fetch must report, or the snapshot waits out the deadline"
+    );
+}
+
 /// helm UPDATED is elapsed time, so a comparison filter has to read it live.
 /// Classifying it as cacheable let the filter compare against whatever the
 /// cell cache held when it was warmed, and a release the filter should now

@@ -384,6 +384,7 @@ impl App {
     /// watched version — a better automatic fallback than NAME/AGE. Results
     /// (including "nothing usable") are cached per plural for the session.
     fn maybe_fetch_printer_columns(&mut self, kind: &Kind) {
+        self.printer_columns_pending = None;
         let user_has_columns = self
             .active_user_view()
             .is_some_and(|v| !v.columns.is_empty());
@@ -404,13 +405,17 @@ impl App {
         let plural = self.kind_plural.clone();
         let tx = self.tx.clone();
         let genr = self.generation;
+        self.printer_columns_pending = Some(self.kind_plural.clone());
         let handle = tokio::spawn(async move {
             let api: Api<DynamicObject> = Api::all_with(client, &crd_kind.ar);
             // No CRD (aggregated API) or no permission → stay on NAME/AGE.
-            let Ok(crd) = api.get(&name).await else {
-                return;
+            // Reported rather than dropped: a caller waiting for the columns
+            // would otherwise wait for a message that never comes, and the
+            // per-session cache is documented to hold "nothing usable" too.
+            let view = match api.get(&name).await {
+                Ok(crd) => crate::views::printer_columns_view(&crd.data, &version),
+                Err(_) => None,
             };
-            let view = crate::views::printer_columns_view(&crd.data, &version);
             let _ = tx
                 .send(Msg::PrinterColumns {
                     generation: genr,
@@ -929,6 +934,9 @@ impl App {
                 view,
             } if generation == self.generation => {
                 let for_current = plural == self.kind_plural;
+                if self.printer_columns_pending.as_deref() == Some(plural.as_str()) {
+                    self.printer_columns_pending = None;
+                }
                 self.crd_views.insert(plural, *view);
                 if for_current {
                     self.refresh_view_spec();

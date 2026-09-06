@@ -1887,6 +1887,12 @@ pub struct App {
     /// CRD printer-column fallbacks fetched per plural for this cluster
     /// (`None` = fetched, nothing usable). Cleared on context switch.
     crd_views: HashMap<String, Option<crate::views::View>>,
+    /// The plural whose CRD printer columns are in flight, if any. A custom
+    /// resource's columns arrive after the watch has already synced, so a
+    /// caller that needs the finished table — the headless snapshot — has to
+    /// know the request is still outstanding. Cleared when the result lands,
+    /// success or failure alike.
+    pub printer_columns_pending: Option<String>,
     /// Wide mode (`w`): show wide-only columns.
     pub wide: bool,
     /// Compact mode (`ctrl-e`): collapse the header to one line and hide the
@@ -2089,6 +2095,7 @@ impl App {
             user_views: HashMap::new(),
             thresholds: crate::thresholds::Compiled::default(),
             crd_views: HashMap::new(),
+            printer_columns_pending: None,
             wide: false,
             compact: false,
             spec: crate::columns::build_spec("", None, None, false),
