@@ -287,29 +287,79 @@ fn port_number(spec: &Value, key: &str) -> Option<u16> {
         .and_then(|port| u16::try_from(port).ok())
 }
 
-/// Whether this entry says it speaks HTTP, by `appProtocol` or by the
-/// conventional port name.
-fn declares_http(spec: &Value) -> bool {
-    let declared = spec
-        .get("appProtocol")
+/// Protocols that are definitely not an HTTP endpoint worth benchmarking.
+const NON_HTTP_PROTOCOLS: &[&str] = &[
+    "grpc",
+    "tcp",
+    "udp",
+    "sctp",
+    "tls",
+    "redis",
+    "postgres",
+    "postgresql",
+    "mysql",
+    "mssql",
+    "mongodb",
+    "amqp",
+    "kafka",
+    "memcached",
+    "ldap",
+    "smtp",
+    "dns",
+];
+/// Ports conventionally used to serve HTTP when nothing else says so.
+const WELL_KNOWN_HTTP_PORTS: &[u16] = &[80, 443, 3000, 8000, 8008, 8080, 8443];
+
+/// What a port says it speaks, preferring the explicit field over the name.
+fn protocol_hint(spec: &Value) -> &str {
+    spec.get("appProtocol")
         .and_then(Value::as_str)
         .or_else(|| spec.get("name").and_then(Value::as_str))
-        .unwrap_or_default();
-    declared.eq_ignore_ascii_case("http") || declared.eq_ignore_ascii_case("https")
+        .unwrap_or_default()
 }
 
-/// Choose the port to benchmark. An explicit `port=N` wins and must exist,
-/// so a typo fails loudly instead of forwarding to nothing. Otherwise prefer
-/// a port that declares HTTP — a service exposing `grpc` before `http` would
-/// otherwise be benchmarked on the wrong one, and a TCP probe cannot tell the
-/// difference — and fall back to the first declared port.
+/// Kubernetes and Istio name ports by protocol with an optional suffix —
+/// `http-web`, `grpc-api` — so the prefix carries as much signal as the bare
+/// name, and matching only the bare name misses the common spelling.
+fn speaks(hint: &str, protocols: &[&str]) -> bool {
+    protocols.iter().any(|protocol| {
+        hint.eq_ignore_ascii_case(protocol)
+            || hint
+                .split_once('-')
+                .is_some_and(|(head, _)| head.eq_ignore_ascii_case(protocol))
+    })
+}
+
+/// How likely this port is to be the HTTP endpoint. Ranked rather than
+/// boolean: a port that says nothing still beats one that says `grpc`, and a
+/// conventional HTTP port number beats one that says nothing at all. No
+/// ranking can be complete, which is what `port=N` is for.
+fn http_affinity(spec: &Value, key: &str) -> u8 {
+    let hint = protocol_hint(spec);
+    if speaks(hint, &["http", "https"]) {
+        3
+    } else if speaks(hint, NON_HTTP_PROTOCOLS) {
+        0
+    } else if port_number(spec, key).is_some_and(|p| WELL_KNOWN_HTTP_PORTS.contains(&p)) {
+        2
+    } else {
+        1
+    }
+}
+
+/// Choose the port to benchmark. An explicit `port=N` wins and must exist, so
+/// a typo fails loudly instead of forwarding to nothing. Otherwise take the
+/// highest [`http_affinity`], earliest declaration breaking a tie — a TCP
+/// probe cannot tell a wrong choice from a right one, so the choice has to be
+/// made from what the object declares.
 fn choose_port<'a>(ports: &'a [Value], key: &str, wanted: Option<u16>) -> Option<&'a Value> {
     match wanted {
         Some(wanted) => ports.iter().find(|p| port_number(p, key) == Some(wanted)),
         None => ports
             .iter()
-            .find(|p| declares_http(p))
-            .or_else(|| ports.first()),
+            .enumerate()
+            .max_by_key(|(index, port)| (http_affinity(port, key), std::cmp::Reverse(*index)))
+            .map(|(_, port)| port),
     }
 }
 
@@ -464,12 +514,7 @@ fn pod_plan(name: &str, data: &Value, wanted: Option<u16>) -> Result<Plan, Strin
 /// `appProtocol` is the declared answer; the conventional port name and the
 /// well-known port are the fallbacks.
 fn port_scheme(port: u16, spec: &Value) -> &'static str {
-    let declared = spec
-        .get("appProtocol")
-        .and_then(Value::as_str)
-        .or_else(|| spec.get("name").and_then(Value::as_str))
-        .unwrap_or_default();
-    if declared.eq_ignore_ascii_case("https") || port == 443 || port == 8443 {
+    if speaks(protocol_hint(spec), &["https"]) || port == 443 || port == 8443 {
         "https"
     } else {
         "http"
@@ -1454,12 +1499,81 @@ mod tests {
     }
 
     #[test]
-    fn without_any_http_hint_the_first_declared_port_is_used() {
+    fn a_conventional_http_port_number_beats_an_earlier_unremarkable_one() {
         let obj = json!({
             "spec": {
                 "clusterIP": "10.96.0.12",
                 "ports": [{"port": 9000}, {"port": 8080}]
             }
+        });
+        let direct = plan("services", "web", &obj, None).unwrap().direct.unwrap();
+        assert_eq!(direct.port, 8080);
+    }
+
+    #[test]
+    fn nothing_to_distinguish_them_keeps_the_first_declared_port() {
+        let obj = json!({
+            "spec": {
+                "clusterIP": "10.96.0.12",
+                "ports": [{"port": 9000}, {"port": 9001}]
+            }
+        });
+        let direct = plan("services", "web", &obj, None).unwrap().direct.unwrap();
+        assert_eq!(direct.port, 9000);
+    }
+
+    #[test]
+    fn protocol_prefixed_port_names_are_understood() {
+        // Kubernetes and Istio spell these `http-web` / `grpc-api`, not `http`.
+        let obj = json!({
+            "spec": {
+                "clusterIP": "10.96.0.12",
+                "ports": [
+                    {"name": "grpc-api", "port": 9000},
+                    {"name": "http-web", "port": 7070}
+                ]
+            }
+        });
+        let direct = plan("services", "web", &obj, None).unwrap().direct.unwrap();
+        assert_eq!(direct.port, 7070);
+        assert_eq!(direct.scheme, "http");
+
+        let secure = json!({
+            "spec": {
+                "clusterIP": "10.96.0.12",
+                "ports": [{"name": "https-web", "port": 7443}]
+            }
+        });
+        assert_eq!(
+            plan("services", "web", &secure, None)
+                .unwrap()
+                .direct
+                .unwrap()
+                .scheme,
+            "https"
+        );
+    }
+
+    #[test]
+    fn a_port_that_names_no_protocol_still_beats_one_that_names_a_non_http_protocol() {
+        // The HTTP endpoint here says nothing at all, and its number is not
+        // conventional either — but `grpc` is a definite no, so it loses.
+        let obj = json!({
+            "spec": {
+                "clusterIP": "10.96.0.12",
+                "ports": [{"name": "grpc", "port": 9000}, {"name": "web", "port": 7070}]
+            }
+        });
+        let direct = plan("services", "web", &obj, None).unwrap().direct.unwrap();
+        assert_eq!(direct.port, 7070);
+    }
+
+    #[test]
+    fn a_lone_non_http_port_is_still_benchmarked() {
+        // Ranking only orders candidates; it never leaves the object without
+        // one. Benchmarking grpc will fail, but with oha's error, not ours.
+        let obj = json!({
+            "spec": {"clusterIP": "10.96.0.12", "ports": [{"name": "grpc", "port": 9000}]}
         });
         let direct = plan("services", "web", &obj, None).unwrap().direct.unwrap();
         assert_eq!(direct.port, 9000);

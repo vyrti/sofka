@@ -75,11 +75,12 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   nothing answers does sofka reuse a running `f` port-forward, or open a
   temporary one that is torn down with the run. Defaults to a deliberately gentle
   10s / 20 connections, capped at 5m and 200k connections, and validated before
-  any process starts. On a multi-port object the port that declares HTTP (by
-  `appProtocol` or the conventional port name) is preferred over the first
-  declared one; `port=N` overrides that, and must name a port the object
-  actually declares. Availability is checked at startup and rescanned by
-  `:reload`.
+  any process starts. On a multi-port object the ports are ranked rather than
+  taken in order: one that declares HTTP wins (`appProtocol` or a port name
+  like `http` or `http-web`), then a conventional HTTP port number, then any
+  port that does not declare a non-HTTP protocol such as `grpc`. `port=N`
+  overrides the ranking, and must name a port the object actually declares.
+  Availability is checked at startup and rescanned by `:reload`.
 - **Live CPU and MEM columns** for pods and nodes from the metrics API, colored
   on unusual values. Nodes also get **%CPU and %MEM of allocatable**
   (`status.allocatable` - the pool the scheduler hands out), colored by the
