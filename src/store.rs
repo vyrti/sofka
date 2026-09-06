@@ -88,6 +88,7 @@ pub enum Msg {
     },
     /// Captured output of an `output = "popup"` plugin run.
     PluginOutput {
+        run: u64,
         generation: u64,
         claim: StatusClaim,
         title: String,
@@ -98,6 +99,7 @@ pub enum Msg {
     /// Completion notice for an `output = "background"` plugin run (single or
     /// bulk): how many jobs succeeded and the failures (label + reason).
     PluginBulkDone {
+        run: u64,
         generation: u64,
         claim: StatusClaim,
         name: String,
@@ -453,6 +455,10 @@ impl Store {
 
     pub fn get(&self, key: &str) -> Option<&DynamicObject> {
         self.items.get(key).map(AsRef::as_ref)
+    }
+
+    pub(crate) fn shared(&self, key: &str) -> Option<Arc<DynamicObject>> {
+        self.items.get(key).cloned()
     }
 
     pub fn key(&self, key: &str) -> Option<&RowKey> {

@@ -267,6 +267,7 @@ impl App {
         self.applied_filter_labels = filter_labels;
         self.applied_filter_fields = filter_fields;
         self.clear_progress_flash();
+        self.stop_plugins();
         self.generation += 1;
         self.gen_flag.store(self.generation, Ordering::SeqCst);
         for t in self.tasks.drain(..) {
@@ -783,6 +784,7 @@ impl App {
     pub(super) fn bump_generation(&mut self) {
         self.stop_event_stream();
         self.clear_progress_flash();
+        self.stop_plugins();
         self.generation += 1;
         self.gen_flag.store(self.generation, Ordering::SeqCst);
         for t in self.tasks.drain(..) {
@@ -1022,12 +1024,15 @@ impl App {
                 self.clear_claimed_status(claim);
             }
             Msg::PluginOutput {
+                run,
                 generation,
                 claim,
                 title,
                 lines,
                 warn,
-            } if generation == self.generation => {
+            } if generation == self.generation && run == self.plugin_run => {
+                self.plugin_task = None;
+                self.plugin_claim = None;
                 self.detail = Scrollable {
                     title,
                     lines: lines.into(),
@@ -1040,12 +1045,15 @@ impl App {
                 }
             }
             Msg::PluginBulkDone {
+                run,
                 generation,
                 claim,
                 name,
                 ok,
                 failed,
-            } if generation == self.generation => {
+            } if generation == self.generation && run == self.plugin_run => {
+                self.plugin_task = None;
+                self.plugin_claim = None;
                 if failed.is_empty() {
                     self.set_claimed_status(claim, format!("plugin {name}: {ok} ok"), false);
                 } else {

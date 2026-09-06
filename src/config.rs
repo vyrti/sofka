@@ -784,9 +784,27 @@ pub struct Skin {
 /// output = "popup"          # capture into a scrollable view (not the terminal)
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Plugin {
     /// Key chord that triggers the plugin (see [`crate::keys::KeyChord`]).
+    #[serde(default)]
     pub key: String,
+    /// Optional command-palette name, independent of the executable.
+    pub palette: Option<String>,
+    #[serde(default)]
+    pub requires: Vec<String>,
+    pub install: Option<String>,
+    #[serde(default)]
+    pub inputs: std::collections::BTreeMap<String, crate::plugins::Input>,
+    /// `context` runs once without requiring a selected row; default `selection`.
+    pub target: Option<String>,
+    /// Declare traffic generation even when no Kubernetes objects are mutated.
+    #[serde(default)]
+    pub network_load: bool,
+    /// Remote port (or an input placeholder) to forward for the selected pod/service.
+    pub port_forward: Option<String>,
+    #[serde(skip)]
+    pub package_dir: Option<PathBuf>,
     pub name: String,
     pub command: String,
     #[serde(default)]
@@ -1059,14 +1077,16 @@ pub fn bookmark_warnings(bookmarks: &[Bookmark]) -> Vec<String> {
 pub fn plugin_warnings(plugins: &[Plugin]) -> Vec<String> {
     let mut warns = Vec::new();
     for p in plugins {
-        if let Err(e) = crate::keys::KeyChord::parse(&p.key) {
+        if !(p.key.is_empty() && p.palette.is_some())
+            && let Err(e) = crate::keys::KeyChord::parse(&p.key)
+        {
             warns.push(format!("plugin {:?}: invalid key — {e}", p.name));
         }
         if let Some(o) = &p.output
-            && !matches!(o.as_str(), "terminal" | "popup" | "background")
+            && !matches!(o.as_str(), "terminal" | "popup" | "background" | "report")
         {
             warns.push(format!(
-                "plugin {:?}: unknown output {o:?} (expected terminal/popup/background) — using terminal",
+                "plugin {:?}: unknown output {o:?} (expected terminal/popup/background/report) — using terminal",
                 p.name
             ));
         }
@@ -1206,13 +1226,16 @@ impl ConfigLoader {
 
         // A type mismatch introduced by an override drops back to the base
         // config (validated at load time) rather than losing everything.
-        let config = merged.try_into().unwrap_or_else(|e| {
+        let mut config: Config = merged.try_into().unwrap_or_else(|e| {
             warnings.push(format!("ignoring cluster overrides: {e}"));
             self.base
                 .clone()
                 .and_then(|b| b.try_into().ok())
                 .unwrap_or_default()
         });
+        if let Some(dir) = &self.dir {
+            crate::plugins::load_packages(&dir.join("plugins"), &mut config.plugins, &mut warnings);
+        }
         let skin_override = overlay
             .get("skin")
             .and_then(|s| s.get("name"))

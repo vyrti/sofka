@@ -3334,6 +3334,7 @@ async fn every_async_result_is_scoped_to_its_own_operation() {
     assert_eq!(app.flash, "deleting 3 pods…");
 
     app.handle_msg(Msg::PluginBulkDone {
+        run: app.plugin_run,
         generation: app.generation,
         claim: find,
         name: "sync".into(),
@@ -9939,4 +9940,382 @@ async fn filtering_matches_a_naive_fuzzy_pass() {
 
         assert_eq!(got, want, "filter {pat:?} diverged from a naive fuzzy pass");
     }
+}
+
+// Plugin packages exercise the same palette/key path as installed adapters.
+fn plugin_command(app: &mut App, command: &str) {
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in command.chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+}
+
+fn named_plugin(command: &str, args: &[&str]) -> crate::config::Plugin {
+    crate::config::Plugin {
+        name: "Example".into(),
+        palette: Some("example-plugin".into()),
+        command: command.into(),
+        args: args.iter().map(|s| (*s).into()).collect(),
+        mutating: Some(false),
+        ..Default::default()
+    }
+}
+
+async fn plugin_result(rx: &mut Receiver<Msg>) -> Msg {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let msg = rx.recv().await.expect("plugin channel closed");
+            if matches!(msg, Msg::PluginOutput { .. } | Msg::PluginBulkDone { .. }) {
+                return msg;
+            }
+        }
+    })
+    .await
+    .expect("plugin did not finish")
+}
+
+#[tokio::test]
+async fn plugin_palette_validates_inputs_and_preserves_literal_arguments() {
+    let (mut app, _rx) = app_with_pod();
+    let mut plugin = named_plugin("echo", &["${input.count}", "${input.value}"]);
+    plugin.inputs = toml::from_str(
+        r#"
+        [count]
+        type = "integer"
+        default = "20"
+        min = 1
+        max = 100
+        [value]
+        type = "string"
+        default = "$NAME"
+    "#,
+    )
+    .unwrap();
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin count=101");
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("outside range"), "{}", app.flash);
+    plugin_command(&mut app, "example-plugin typo=1");
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("unknown input"));
+    plugin_command(&mut app, "exampl-plug count=3 value=literal");
+    let Some(Suspend::Shell(argv)) = app.pending.take() else {
+        panic!("completion dropped plugin input");
+    };
+    assert_eq!(argv, ["echo", "3", "literal"]);
+    plugin_command(&mut app, "example-plugin count=4 value=$(false)");
+    let Some(Suspend::Shell(argv)) = app.pending.take() else {
+        panic!("plugin not invoked");
+    };
+    assert_eq!(argv, ["echo", "4", "$(false)"]);
+    plugin_command(&mut app, "example-plugin");
+    let Some(Suspend::Shell(argv)) = app.pending.take() else {
+        panic!("plugin not invoked");
+    };
+    assert_eq!(argv, ["echo", "20", "$NAME"]);
+}
+
+#[tokio::test]
+async fn plugin_commands_respect_scope_dependencies_and_builtin_precedence() {
+    let (mut app, _rx) = app_with_pod();
+    let mut plugin = named_plugin("echo", &[]);
+    plugin.requires = vec!["sofka-missing-dependency-test-7941".into()];
+    plugin.install = Some("Install the example tool".into());
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("Install the example tool"));
+    app.plugins[0].requires.clear();
+    app.plugins[0].scopes = vec!["services".into()];
+    plugin_command(&mut app, "example-plugin");
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("does not apply"));
+    app.plugins[0].scopes.clear();
+    app.plugins[0].palette = Some("pods".into());
+    plugin_command(&mut app, "pods");
+    assert!(app.pending.is_none(), "resource names win");
+    app.plugins[0].palette = Some("q".into());
+    plugin_command(&mut app, "q");
+    assert!(app.should_quit);
+    assert!(app.pending.is_none(), "built-ins win");
+}
+
+#[tokio::test]
+async fn network_load_plugins_confirm_and_obey_readonly_and_guardrails() {
+    let (mut app, _rx) = app_with_pod();
+    let mut plugin = named_plugin("echo", &[]);
+    plugin.network_load = true;
+    app.plugins = vec![plugin];
+    app.readonly = true;
+    plugin_command(&mut app, "example-plugin");
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("generates network load"));
+    app.readonly = false;
+    plugin_command(&mut app, "example-plugin");
+    assert_eq!(app.mode, Mode::Confirm);
+    assert!(app.pending.is_none());
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    assert!(app.pending.take().is_some());
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["plugin:*".into()],
+        deny: true,
+        ..Default::default()
+    }];
+    plugin_command(&mut app, "example-plugin");
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("blocked by guardrail"));
+    app.guardrails[0].deny = false;
+    app.guardrails[0].confirmation = Some("type-resource-name".into());
+    plugin_command(&mut app, "example-plugin");
+    assert_eq!(app.mode, Mode::Prompt);
+    app.handle_key(press(KeyCode::Char('a'))).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(app.pending.is_some());
+}
+
+#[tokio::test]
+async fn context_plugin_runs_without_selection_and_receives_request() {
+    let (mut app, mut rx) = test_app();
+    let mut plugin = named_plugin("/bin/cat", &[]);
+    plugin.target = Some("context".into());
+    plugin.output = Some("popup".into());
+    plugin.package_dir = Some(std::env::temp_dir());
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    let Msg::PluginOutput { lines, .. } = plugin_result(&mut rx).await else {
+        panic!("missing output");
+    };
+    let request: Value = serde_json::from_str(&lines.join("\n")).unwrap();
+    assert_eq!(request["schema_version"], 1);
+    assert!(request["object"].is_null());
+    assert_eq!(request["namespace"], app.namespace);
+}
+
+#[tokio::test]
+async fn package_report_renders_tables_and_remains_searchable() {
+    let (mut app, mut rx) = app_with_pod();
+    let report = r#"{"schema_version":1,"title":"Scan","sections":[{"title":"Findings","columns":["Resource","Severity"],"rows":[["api","high"]]}]}"#;
+    let mut plugin = named_plugin("/bin/echo", &[report]);
+    plugin.output = Some("report".into());
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    app.handle_msg(plugin_result(&mut rx).await);
+    assert_eq!(app.mode, Mode::Detail);
+    assert!(app.detail.lines.iter().any(|s| s == "api | high"));
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    app.handle_key(press(KeyCode::Char('h'))).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.detail.filter, "h");
+}
+
+#[tokio::test]
+async fn invalid_report_is_a_visible_failure() {
+    let (mut app, mut rx) = app_with_pod();
+    let mut plugin = named_plugin("/bin/echo", &[r#"{"schema_version":8,"title":"Future"}"#]);
+    plugin.output = Some("report".into());
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    app.handle_msg(plugin_result(&mut rx).await);
+    assert!(app.flash_err);
+    assert!(
+        app.detail
+            .lines
+            .iter()
+            .any(|s| s.contains("unsupported report"))
+    );
+}
+
+#[tokio::test]
+async fn cancelling_and_replacing_plugins_rejects_stale_results() {
+    let (mut app, _rx) = app_with_pod();
+    let mut plugin = named_plugin("/bin/sleep", &["20"]);
+    plugin.output = Some("popup".into());
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    let run = app.plugin_run;
+    let claim = current_claim(&app);
+    assert!(app.plugin_task.is_some());
+    plugin_command(&mut app, "plugin-cancel");
+    assert!(app.plugin_task.is_none());
+    app.handle_msg(Msg::PluginOutput {
+        run,
+        generation: app.generation,
+        claim,
+        title: "stale".into(),
+        lines: vec!["old result".into()],
+        warn: None,
+    });
+    assert_eq!(app.mode, Mode::Table);
+    plugin_command(&mut app, "example-plugin");
+    let first = app.plugin_run;
+    plugin_command(&mut app, "example-plugin");
+    assert!(app.plugin_run > first);
+    app.handle_key(press(KeyCode::Char('y'))).unwrap();
+    assert_eq!(app.mode, Mode::Detail);
+    assert!(app.plugin_task.is_none(), "opening YAML cancels work");
+}
+
+#[tokio::test]
+async fn context_switch_and_quit_cancel_plugin_tasks() {
+    let (mut app, _rx) = app_with_pod();
+    let mut plugin = named_plugin("/bin/sleep", &["20"]);
+    plugin.output = Some("popup".into());
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    plugin_command(&mut app, "services");
+    assert!(app.plugin_task.is_none());
+    app.plugins[0].target = Some("context".into());
+    plugin_command(&mut app, "example-plugin");
+    app.handle_key(ctrl(KeyCode::Char('c'))).unwrap();
+    assert!(app.should_quit);
+    assert!(app.plugin_task.is_none());
+}
+
+#[tokio::test]
+async fn plugin_package_reload_loads_valid_packages_and_isolates_invalid_ones() {
+    let dir = std::env::temp_dir().join(format!("sofka-plugin-reload-{}", std::process::id()));
+    let package = dir.join("plugins/example");
+    let broken = dir.join("plugins/broken");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(
+        package.join("plugin.toml"),
+        r#"
+        schema_version = 1
+        [plugin]
+        name = "Example"
+        palette = "example-plugin"
+        command = "/bin/cat"
+        output = "popup"
+        target = "context"
+        mutating = false
+    "#,
+    )
+    .unwrap();
+    std::fs::write(broken.join("plugin.toml"), "not valid TOML").unwrap();
+    let (mut app, mut rx) = test_app();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    plugin_command(&mut app, "reload");
+    assert_eq!(app.plugins.len(), 1);
+    assert!(app.config_warnings.iter().any(|w| w.contains("broken")));
+    plugin_command(&mut app, "example-plugin");
+    app.handle_msg(plugin_result(&mut rx).await);
+    assert!(
+        app.detail
+            .lines
+            .iter()
+            .any(|s| s.contains("schema_version"))
+    );
+    std::fs::remove_file(package.join("plugin.toml")).unwrap();
+    plugin_command(&mut app, "reload");
+    assert!(app.plugins.is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn plugin_forward_uses_selected_target_and_requires_valid_port_before_launch() {
+    let (mut app, _rx) = app_with_pod();
+    let mut plugin = named_plugin("/bin/cat", &[]);
+    plugin.output = Some("report".into());
+    plugin.package_dir = Some(std::env::temp_dir());
+    plugin.port_forward = Some("8080".into());
+    plugin.confirm = true;
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    assert_eq!(app.mode, Mode::Confirm);
+    let Some(ConfirmAction::Plugin { jobs, .. }) = &app.confirm_action else {
+        panic!("missing preview");
+    };
+    let forward = jobs[0].forward.as_ref().unwrap();
+    assert_eq!(forward.remote, 8080);
+    assert!(forward.argv.ends_with(&[
+        "port-forward".into(),
+        "-n".into(),
+        "default".into(),
+        "pod/a".into()
+    ]));
+    assert_eq!(
+        jobs[0].object.as_ref().unwrap().metadata.name.as_deref(),
+        Some("a")
+    );
+    assert!(app.confirm_label.contains("port-forward=pods/a:8080"));
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    app.plugins[0].port_forward = Some("0".into());
+    plugin_command(&mut app, "example-plugin");
+    assert!(app.plugin_task.is_none());
+    assert!(app.flash.contains("1 to 65535"));
+}
+
+#[tokio::test]
+async fn context_plugin_cannot_bypass_namespace_guardrails_in_all_namespaces_mode() {
+    let (mut app, _rx) = test_app();
+    let mut plugin = named_plugin("echo", &[]);
+    plugin.target = Some("context".into());
+    app.plugins = vec![plugin];
+    app.namespace.clear();
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["plugin:*".into()],
+        namespaces: vec!["restricted".into()],
+        deny: true,
+        ..Default::default()
+    }];
+    plugin_command(&mut app, "example-plugin");
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("blocked by guardrail"));
+}
+
+#[tokio::test]
+async fn package_request_uses_the_selected_snapshot_and_limits_large_objects() {
+    let (mut app, mut rx) = app_with_pod();
+    let mut plugin = named_plugin("/bin/cat", &[]);
+    plugin.package_dir = Some(std::env::temp_dir());
+    plugin.output = Some("popup".into());
+    app.plugins = vec![plugin];
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"a","namespace":"default","labels":{"revision":"old"}}}),
+    );
+    plugin_command(&mut app, "example-plugin");
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"a","namespace":"default","labels":{"revision":"new"}}}),
+    );
+    let Msg::PluginOutput { lines, .. } = plugin_result(&mut rx).await else {
+        panic!("missing request");
+    };
+    let request: Value = serde_json::from_str(&lines.join("\n")).unwrap();
+    assert_eq!(request["object"]["metadata"]["labels"]["revision"], "old");
+    apply(
+        &mut app,
+        json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"a","namespace":"default"},"spec":{"large":"x".repeat(crate::plugins::MAX_BYTES)}}),
+    );
+    plugin_command(&mut app, "example-plugin");
+    app.handle_msg(plugin_result(&mut rx).await);
+    assert!(app.flash_err);
+    assert!(
+        app.detail
+            .lines
+            .iter()
+            .any(|s| s.contains("request exceeds 1 MiB"))
+    );
+}
+
+#[tokio::test]
+async fn plugin_timeout_is_visible_through_the_command_path() {
+    let (mut app, mut rx) = app_with_pod();
+    let mut plugin = named_plugin("/bin/sleep", &["30"]);
+    plugin.output = Some("popup".into());
+    plugin.timeout = Some("1s".into());
+    app.plugins = vec![plugin];
+    plugin_command(&mut app, "example-plugin");
+    app.handle_msg(plugin_result(&mut rx).await);
+    assert!(app.flash_err);
+    assert!(
+        app.detail
+            .lines
+            .iter()
+            .any(|s| s.contains("timed out after 1s"))
+    );
+    assert!(app.plugin_task.is_none());
 }
