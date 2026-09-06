@@ -821,6 +821,99 @@ async fn ctrl_f_and_ctrl_b_page_document_views() {
 }
 
 #[tokio::test]
+async fn document_scroll_keeps_the_last_page_filled() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut app, _rx) = test_app();
+    app.mode = Mode::Detail;
+    app.detail = Scrollable {
+        title: "document".into(),
+        lines: (0..30).map(|i| format!("line {i}")).collect(),
+        ..Default::default()
+    };
+
+    // A 24-row terminal leaves 13 content rows after the standard header,
+    // footer, prompt, and document border.
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+    app.handle_key(press(KeyCode::Char('G'))).unwrap();
+    assert_eq!(app.detail.scroll, 17, "bottom keeps a full viewport");
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    assert_eq!(app.detail.scroll, 17, "cannot scroll past the last page");
+    app.handle_key(press(KeyCode::Char('k'))).unwrap();
+    assert_eq!(
+        app.detail.scroll, 16,
+        "up moves immediately from the bottom"
+    );
+
+    app.detail = Scrollable {
+        title: "short document".into(),
+        lines: (0..10).map(|i| format!("line {i}")).collect(),
+        ..Default::default()
+    };
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    app.handle_key(press(KeyCode::Char('G'))).unwrap();
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    assert_eq!(app.detail.scroll, 0, "a short document never scrolls");
+
+    // A single source line may occupy more display rows than the viewport.
+    // ANSI sequences consume zero columns in both the cached layout and the
+    // rendered rows, so they cannot hide the line's tail from navigation.
+    app.detail = Scrollable {
+        title: "wrapped document".into(),
+        lines: vec![format!(
+            "{}{}LAST\x1b[0m",
+            "\x1b[31m".repeat(20),
+            "x".repeat(18 * 19)
+        )]
+        .into(),
+        wrap: true,
+        ..Default::default()
+    };
+    let mut term = Terminal::new(TestBackend::new(20, 24)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    app.handle_key(press(KeyCode::Char('G'))).unwrap();
+    assert_eq!(app.detail.scroll, 7, "bottom uses wrapped display rows");
+    app.handle_key(press(KeyCode::Char('j'))).unwrap();
+    assert_eq!(app.detail.scroll, 7, "wrapped bottom remains clamped");
+
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let buffer = term.backend().buffer();
+    let screen = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        screen.contains("LAST"),
+        "last wrapped row missing:\n{screen}"
+    );
+
+    app.detail = Scrollable {
+        title: "tabbed document".into(),
+        lines: vec![format!(
+            "{}{}TABS",
+            "\t".repeat(18 * 10),
+            "x".repeat(18 * 19)
+        )]
+        .into(),
+        wrap: true,
+        ..Default::default()
+    };
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    app.handle_key(press(KeyCode::Char('G'))).unwrap();
+    assert_eq!(
+        app.detail.scroll, 7,
+        "tabs must not inflate the wrapped bottom offset"
+    );
+}
+
+#[tokio::test]
 async fn switching_kind_resets_stale_selection_to_top() {
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
@@ -904,11 +997,10 @@ async fn table_cell_cache_invalidates_on_apply() {
         }),
     );
     {
-        let rows = app.rows();
+        let rows = app.rows_keyed();
         app.ensure_table_cell_cache(&rows);
-        let key = row_key(rows[0]);
         let cache = app.table_cell_cache();
-        let (cells, _) = cache.get(&key).unwrap();
+        let (cells, _) = cache.get(rows[0].0).unwrap();
         assert_eq!(cells[2], "Pending");
     }
 
@@ -925,11 +1017,10 @@ async fn table_cell_cache_invalidates_on_apply() {
             "status": {"phase": "Running"}
         }),
     );
-    let rows = app.rows();
+    let rows = app.rows_keyed();
     app.ensure_table_cell_cache(&rows);
-    let key = row_key(rows[0]);
     let cache = app.table_cell_cache();
-    let (cells, _) = cache.get(&key).unwrap();
+    let (cells, _) = cache.get(rows[0].0).unwrap();
     assert_eq!(cells[2], "Running");
 }
 
@@ -4730,6 +4821,58 @@ async fn sort_by_numeric_column_and_invert() {
 }
 
 #[tokio::test]
+async fn name_sort_uses_natural_numeric_segments() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for name in ["pod-10", "pod-2", "pod-11", "pod-0", "pod-9", "pod-1"] {
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": name, "namespace": "default"}
+            }),
+        );
+    }
+    let names = |app: &App| -> Vec<String> {
+        app.rows()
+            .iter()
+            .map(|object| object.metadata.name.clone().unwrap())
+            .collect()
+    };
+
+    assert_eq!(
+        names(&app),
+        ["pod-0", "pod-1", "pod-2", "pod-9", "pod-10", "pod-11"]
+    );
+
+    app.handle_key(press(KeyCode::Char('S'))).unwrap();
+    app.sort_picker_state.select(Some(1));
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.sort_column, Some(0));
+    assert_eq!(
+        names(&app),
+        ["pod-0", "pod-1", "pod-2", "pod-9", "pod-10", "pod-11"]
+    );
+
+    app.handle_key(press(KeyCode::Char('I'))).unwrap();
+    assert_eq!(
+        names(&app),
+        ["pod-11", "pod-10", "pod-9", "pod-2", "pod-1", "pod-0"]
+    );
+}
+
+#[test]
+fn natural_comparison_handles_leading_zeroes_and_large_numbers() {
+    assert_eq!(natural_cmp("pod-2", "pod-02"), std::cmp::Ordering::Less);
+    assert_eq!(natural_cmp("pod-02a", "pod-2b"), std::cmp::Ordering::Less);
+    assert_eq!(
+        natural_cmp("pod-99999999999999999999", "pod-100000000000000000000"),
+        std::cmp::Ordering::Less
+    );
+}
+
+#[tokio::test]
 async fn sorted_order_updates_when_an_object_changes() {
     // Sort keys are cached per resourceVersion; an update must invalidate the
     // changed row's cached key (via invalidate_row) and re-sort with the new
@@ -5159,6 +5302,32 @@ fn pod_metrics_are_split_by_container() {
         ]
     );
     assert_eq!(usage_of(&metrics, false), (175, 80 * 1024 * 1024));
+
+    // The poll totals the per-container pass instead of re-parsing every
+    // quantity through `usage_of`; the two must not drift apart.
+    let summed = container_usage_of(&metrics)
+        .into_iter()
+        .fold((0i64, 0i64), |acc, (_, (cpu, mem))| {
+            (acc.0 + cpu, acc.1 + mem)
+        });
+    assert_eq!(summed, usage_of(&metrics, false));
+
+    // Missing and malformed quantities degrade to zero on both paths.
+    let ragged = obj(json!({
+        "apiVersion": "metrics.k8s.io/v1beta1",
+        "kind": "PodMetrics",
+        "metadata": {"name": "ragged", "namespace": "default"},
+        "containers": [
+            {"name": "app", "usage": {"cpu": "10m"}},
+            {"name": "broken", "usage": {"cpu": "nonsense", "memory": "8Mi"}}
+        ]
+    }));
+    let summed = container_usage_of(&ragged)
+        .into_iter()
+        .fold((0i64, 0i64), |acc, (_, (cpu, mem))| {
+            (acc.0 + cpu, acc.1 + mem)
+        });
+    assert_eq!(summed, usage_of(&ragged, false));
 }
 
 #[tokio::test]
@@ -7813,11 +7982,10 @@ async fn user_view_overlays_columns_and_applies_initial_sort() {
     assert_eq!(rows[0].metadata.name.as_deref(), Some("old"));
 
     // Cells come from the JSON Pointers; the status column drives coloring.
-    let rows = app.rows();
+    let rows = app.rows_keyed();
     app.ensure_table_cell_cache(&rows);
-    let key = row_key(rows[1]);
     let cache = app.table_cell_cache();
-    let (cells, status_idx) = cache.get(&key).unwrap();
+    let (cells, status_idx) = cache.get(rows[1].0).unwrap();
     assert_eq!(cells[0], "new");
     assert_eq!(cells[1], "False");
     // Humanized future timestamp ("in 27000d"-ish, drifting with wall time).
@@ -7878,11 +8046,10 @@ async fn user_view_adds_provider_label_columns_to_curated_nodes() {
         }),
     );
 
-    let rows = app.rows();
+    let rows = app.rows_keyed();
     app.ensure_table_cell_cache(&rows);
-    let key = row_key(rows[0]);
     let cache = app.table_cell_cache();
-    let (cells, _) = cache.get(&key).unwrap();
+    let (cells, _) = cache.get(rows[0].0).unwrap();
     assert_eq!(cells[4], "v1.33.4");
     assert_eq!(&cells[5..9], ["general", "eu-west-1a", "m7i.large", "spot"]);
 }
@@ -8355,6 +8522,62 @@ async fn status_filter_matches_status_column() {
     app.filter = "status!=CrashLoopBackOff".into();
     app.invalidate_rows();
     assert_eq!(row_names(&app), ["healthy"]);
+}
+
+/// A comparison term reads the shared per-revision cell cache, so a row whose
+/// compared column changed has to fall out of the filter on the next rebuild —
+/// this is the case a stale cached cell would silently get wrong.
+#[tokio::test]
+async fn cmp_filter_follows_a_changed_cell() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
+        "status": {"phase": "Running", "containerStatuses": [
+            {"ready": true, "restartCount": 0, "state": {"running": {}}}
+        ]}}),
+    );
+    type_filter(&mut app, "status=Running");
+    assert_eq!(row_names(&app), ["web"]);
+
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": "web", "namespace": "default", "resourceVersion": "2"},
+        "status": {"phase": "Pending", "containerStatuses": [
+            {"ready": false, "restartCount": 0, "state": {"waiting": {"reason": "Pending"}}}
+        ]}}),
+    );
+    assert!(row_names(&app).is_empty(), "{:?}", row_names(&app));
+
+    app.filter = "status=Pending".into();
+    app.invalidate_rows();
+    assert_eq!(row_names(&app), ["web"]);
+}
+
+/// The 1s tick redraws for a reason, not on principle: housekeeping says
+/// whether it changed anything, and a static document view has nothing that
+/// moves with the clock.
+#[tokio::test]
+async fn housekeeping_reports_whether_a_tick_changed_anything() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    assert!(!app.static_between_events(), "a table shows ages");
+    app.mode = Mode::Detail;
+    assert!(app.static_between_events());
+
+    app.flash = "deleted web".into();
+    app.flash_err = false;
+    // First call only records the new flash — it was already drawn.
+    assert!(!app.expire_flash());
+    app.flash_since = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    // Now it expires, which does change the status line.
+    assert!(app.expire_flash());
+    assert!(app.flash.is_empty());
+    assert!(!app.expire_flash());
+    assert!(!app.reap_port_forwards());
 }
 
 #[tokio::test]
@@ -9247,7 +9470,7 @@ async fn unchanged_row_order_reuses_shared_keys_on_content_updates() {
         })
     };
     apply(&mut app, pod_state("1", "Pending"));
-    let rows = app.rows();
+    let rows = app.rows_keyed();
     app.ensure_table_cell_cache(&rows);
     drop(rows);
 
@@ -9395,6 +9618,82 @@ async fn view_cache_evicts_least_recently_used() {
 /// A view-count cap is not a memory cap: two 2,000-pod views cost twice one.
 /// The object bound is what keeps a big cluster's cache from multiplying, so
 /// a large view must evict earlier than `VIEW_CACHE_MAX` would.
+/// The view-cache byte budget is only as good as its size estimate: it exists
+/// to tell a view of Pods from a view of Secrets carrying megabyte payloads,
+/// which an object count cannot.
+#[test]
+fn view_size_estimate_tracks_payload_not_object_count() {
+    let light = obj(json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": "web", "namespace": "default"},
+        "status": {"phase": "Running"}
+    }));
+    let heavy = obj(json!({
+        "apiVersion": "v1", "kind": "Secret",
+        "metadata": {
+            "name": "sh.helm.release.v1.app.v1",
+            "namespace": "default",
+            "annotations": {"payload": "x".repeat(64 * 1024)},
+        },
+        "data": {"release": "y".repeat(256 * 1024)}
+    }));
+
+    let light_bytes = crate::app::helpers::approx_object_bytes(&light);
+    let heavy_bytes = crate::app::helpers::approx_object_bytes(&heavy);
+    assert!(
+        heavy_bytes > light_bytes * 100,
+        "a 320 KiB object must not price like a bare pod: {heavy_bytes} vs {light_bytes}"
+    );
+}
+
+/// A snapshot is rarely uniform, and the objects worth evicting for are the
+/// rare heavy ones. Pricing a view from a sample of a couple of dozen misses
+/// them almost every time — a thousand small ConfigMaps beside five megabyte
+/// Secrets would be priced at the ConfigMaps' mean and kept indefinitely — so
+/// every object is measured.
+#[test]
+fn view_size_estimate_counts_the_heavy_tail_of_a_skewed_view() {
+    let mut items = crate::store::Items::new();
+    for i in 0..1_000 {
+        let o = obj(json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": format!("small-{i}"), "namespace": "default"},
+            "data": {"key": "value"}
+        }));
+        items.insert(crate::store::row_key(&o).into(), std::sync::Arc::new(o));
+    }
+    let payload = "y".repeat(1024 * 1024);
+    for i in 0..5 {
+        let o = obj(json!({
+            "apiVersion": "v1", "kind": "Secret",
+            "metadata": {"name": format!("huge-{i}"), "namespace": "default"},
+            "data": {"release": payload}
+        }));
+        items.insert(crate::store::row_key(&o).into(), std::sync::Arc::new(o));
+    }
+
+    let measured = crate::app::lifecycle::view_bytes(&items);
+    assert!(
+        measured > 5 * 1024 * 1024,
+        "the five megabyte Secrets must be counted, not sampled past: {measured}"
+    );
+    // And the small objects are not what drives it.
+    let small_only: usize = items
+        .values()
+        .filter(|o| {
+            o.metadata
+                .name
+                .as_deref()
+                .is_some_and(|n| n.starts_with("small-"))
+        })
+        .map(|o| crate::app::helpers::approx_object_bytes(o))
+        .sum();
+    assert!(
+        measured > small_only * 5,
+        "a sampled mean of the small objects would have priced this at ~{small_only}"
+    );
+}
+
 #[tokio::test]
 async fn view_cache_evicts_on_total_objects_not_just_view_count() {
     let (mut app, _rx) = test_app();
@@ -9600,6 +9899,195 @@ async fn log_index_tracks_appends_incrementally() {
             assert_index_matches_naive(&mut logs, w, "append");
         }
     }
+}
+
+/// Retention trims from the front on every batch once the buffer is full. The
+/// index rebases instead of rebuilding, so it has to land on exactly what a
+/// rebuild would have produced — otherwise the viewport and the scroll anchor
+/// drift apart silently.
+#[tokio::test]
+async fn log_index_survives_front_trimming() {
+    let mut logs = LogsView::default();
+    for w in [0usize, 20] {
+        for filter in ["", "keep"] {
+            logs.view.clear_lines();
+            logs.set_filter(filter.to_string());
+            logs.view.lines.extend((0..120).map(|i| {
+                let tag = if i % 3 == 0 { "keep" } else { "drop" };
+                format!("line {i} {tag} with padding text long enough to wrap")
+            }));
+            assert_index_matches_naive(&mut logs, w, "seed");
+
+            for trim in [1usize, 7, 40] {
+                logs.trim_front(trim);
+                assert_index_matches_naive(&mut logs, w, "trim");
+                logs.view.lines.extend(
+                    (0..10).map(|i| {
+                        format!("appended {i} keep with padding text long enough to wrap")
+                    }),
+                );
+                assert_index_matches_naive(&mut logs, w, "append after trim");
+            }
+
+            // Trimming everything leaves an empty, still-consistent index.
+            let all = logs.view.lines.len();
+            logs.trim_front(all);
+            assert_index_matches_naive(&mut logs, w, "trim to empty");
+        }
+    }
+}
+
+/// The rebase has to be a *rebase*: a `trim_front` that quietly reset the index
+/// would leave every other test in this file passing, because the next refresh
+/// would rebuild the right answer anyway. So check the index directly, before
+/// any refresh — it must already describe the trimmed buffer.
+#[tokio::test]
+async fn log_index_rebases_without_rebuilding() {
+    let mut logs = LogsView::default();
+    for w in [0usize, 24] {
+        logs.view.clear_lines();
+        logs.set_filter("keep".into());
+        logs.view.lines.extend((0..100).map(|i| {
+            let tag = if i % 3 == 0 { "keep" } else { "drop" };
+            format!("line {i} {tag} with padding text long enough to wrap")
+        }));
+        logs.refresh_index(w);
+
+        logs.trim_front(30);
+        // No refresh_index() call here: this is the state the trim left behind.
+        let (want_shown, want_total) = naive_log_index(&logs, w);
+        let idx = logs.index();
+        let got: Vec<u32> = (0..idx.shown_len())
+            .map(|i| idx.line_at(i).unwrap() as u32)
+            .collect();
+        assert_eq!(got, want_shown, "rebased shown lines (wrap {w})");
+        assert_eq!(
+            idx.total_rows(),
+            want_total,
+            "rebased total rows (wrap {w})"
+        );
+        assert!(
+            idx.shown_len() > 0,
+            "fixture must leave matches behind, or this proves nothing"
+        );
+    }
+}
+
+/// The shapes that are easy to get wrong once indices are being shifted rather
+/// than recomputed: trimming past the end, trimming an index that was never
+/// built, and trimming when nothing matches the filter.
+#[tokio::test]
+async fn log_index_trim_handles_degenerate_input() {
+    let mut logs = LogsView::default();
+
+    // Trimming more than the buffer holds.
+    logs.view
+        .lines
+        .extend((0..10).map(|i| format!("line {i} keep")));
+    logs.set_filter("keep".into());
+    logs.refresh_index(0);
+    logs.trim_front(1_000);
+    assert_eq!(logs.view.lines.len(), 0);
+    assert_index_matches_naive(&mut logs, 0, "over-trim");
+
+    // Trimming an index that was never folded in (nothing consumed yet).
+    logs.view.clear_lines();
+    logs.set_filter(String::new());
+    logs.view
+        .lines
+        .extend((0..40).map(|i| format!("line {i} padding")));
+    logs.trim_front(15);
+    assert_index_matches_naive(&mut logs, 0, "trim before first refresh");
+
+    // Trimming while the filter matches nothing at all.
+    logs.view.clear_lines();
+    logs.set_filter("zzz-no-match".into());
+    logs.view
+        .lines
+        .extend((0..40).map(|i| format!("line {i} padding")));
+    logs.refresh_index(12);
+    assert_eq!(logs.index().shown_len(), 0);
+    logs.trim_front(20);
+    assert_index_matches_naive(&mut logs, 12, "trim with no matches");
+
+    // Trimming exactly the matched prefix, so every shown entry falls away.
+    logs.view.clear_lines();
+    logs.set_filter("keep".into());
+    logs.view
+        .lines
+        .extend((0..20).map(|i| format!("line {i} {}", if i < 10 { "keep" } else { "other" })));
+    logs.refresh_index(0);
+    assert_eq!(logs.index().shown_len(), 10);
+    logs.trim_front(10);
+    assert_eq!(
+        logs.index().shown_len(),
+        0,
+        "all matches were in the prefix"
+    );
+    assert_index_matches_naive(&mut logs, 0, "trim the whole matched prefix");
+}
+
+/// The steady state 026 is about: a stream running against a full retention
+/// buffer, where every batch trims. Driven through the real message path, with
+/// a filter and wrapping on, so the index is rebased hundreds of times in a row
+/// and must still agree with a rebuild — and a surviving line's display row
+/// must move down by exactly the rows that were dropped, which is what the
+/// paused scroll anchor is shifted by.
+#[tokio::test]
+async fn log_index_stays_correct_through_a_saturated_stream() {
+    let (mut app, _rx) = test_app();
+    app.logs_cfg.buffer = 200;
+    app.logs.wrap = true;
+    app.logs.set_filter("keep".into());
+    let wrap_width = 30;
+
+    for batch in 0..60 {
+        app.handle_msg(Msg::LogLines {
+            generation: app.log_gen,
+            lines: (0..25)
+                .map(|i| {
+                    let tag = if (batch + i) % 3 == 0 { "keep" } else { "drop" };
+                    format!("batch {batch} line {i} {tag} padding text that wraps")
+                })
+                .collect(),
+        });
+
+        // Rows of the lines about to be dropped by the *next* batch, and where
+        // a line that will survive sits right now.
+        let before = app.logs.refresh_index(wrap_width);
+        let survivor_pos = before.shown_len().saturating_sub(1);
+        let survivor_line = before.line_at(survivor_pos);
+        let survivor_row = before.start_row(survivor_pos);
+        let len_before = app.logs.view.lines.len();
+
+        assert_index_matches_naive(&mut app.logs, wrap_width, "saturated batch");
+
+        if let Some(line) = survivor_line
+            && len_before >= app.logs_cfg.buffer
+        {
+            // Find that same source line after the next trim and check it moved
+            // by exactly the dropped rows.
+            let dropped_lines = 25.min(len_before);
+            let dropped_rows: usize = app
+                .logs
+                .view
+                .lines
+                .iter()
+                .take(dropped_lines)
+                .filter(|l| app.logs.matches(l))
+                .map(|l| crate::ui::wrapped_height(l, wrap_width))
+                .sum();
+            if line >= dropped_lines {
+                assert!(
+                    survivor_row >= dropped_rows,
+                    "a surviving line cannot start above the rows dropped before it"
+                );
+            }
+        }
+    }
+
+    assert_eq!(app.logs.view.lines.len(), 200, "buffer held at its cap");
+    assert_index_matches_naive(&mut app.logs, wrap_width, "end of stream");
 }
 
 #[tokio::test]

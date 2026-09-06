@@ -5,7 +5,7 @@
 //! re-scope the previous view), and `esc` pops back.
 
 use std::borrow::Cow;
-use std::cell::{Ref, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -44,6 +44,35 @@ impl App {
     #[cfg(feature = "bench")]
     pub fn bench_invalidate_rows(&self) {
         self.invalidate_rows();
+    }
+
+    /// Put a bench fixture into the state real navigation leaves behind:
+    /// the resolved `Kind` installed and the view spec built for it. Seeding
+    /// `kind_plural` alone leaves `spec` built from an empty plural, so every
+    /// cached cell, comparison filter and header measured through it belongs
+    /// to `DEFAULT_COLUMNS` rather than the kind's real layout.
+    /// Fold a metrics list exactly as the poll does — `metrics_maps` is
+    /// `pub(super)`; this exposes it to `benchsupport` under the bench feature.
+    #[cfg(feature = "bench")]
+    pub fn bench_metrics_maps(
+        list: &[kube::core::DynamicObject],
+        is_node: bool,
+    ) -> lifecycle::MetricsMaps {
+        lifecycle::metrics_maps(list, is_node)
+    }
+
+    /// Price a view snapshot the way caching one does. `view_bytes` is
+    /// `pub(super)`; this exposes it to `benchsupport` under the bench feature.
+    #[cfg(feature = "bench")]
+    pub fn bench_view_bytes(items: &crate::store::Items) -> usize {
+        lifecycle::view_bytes(items)
+    }
+
+    #[cfg(feature = "bench")]
+    pub fn bench_install_kind(&mut self, plural: &str) {
+        self.kind = self.cluster.resolve(plural);
+        self.kind_plural = plural.to_string();
+        self.refresh_view_spec();
     }
 }
 
@@ -415,14 +444,16 @@ enum PromptKind {
 pub struct Scrollable {
     pub title: String,
     pub lines: VecDeque<String>,
-    /// Scroll offset in display rows. `usize` on purpose: a paused log buffer
-    /// (100k lines, wrapped) far exceeds `u16`; views that hand this to a
-    /// ratatui `Paragraph` clamp at the edge instead.
+    /// Vertical scroll offset in rendered display rows. `usize` on purpose: a
+    /// paused wrapped log buffer can far exceed `u16`.
     pub scroll: usize,
+    /// Cached document layout from the last draw. Logs keep their equivalent
+    /// viewport and wrapping index in [`LogsView`] instead.
+    viewport: Option<DocumentViewport>,
     /// Horizontal scroll offset in columns, for views (`describe`, events) whose
     /// lines run past the right edge. Ignored while `wrap` is on.
     pub hscroll: usize,
-    /// Word-wrap toggle. When on, long lines fold instead of being clipped, and
+    /// Line-wrap toggle. When on, long lines fold instead of being clipped, and
     /// horizontal scrolling is disabled.
     pub wrap: bool,
     /// Case-insensitive substring search (`/`), vim-style: the full document
@@ -445,6 +476,10 @@ pub struct Scrollable {
     /// YAML view with a `/` search active that was thousands of allocations
     /// at up to 62 Hz.
     match_cache: RefCell<Option<MatchCache>>,
+    /// Widest line in display columns, with the revision and line count it was
+    /// measured at. Horizontal scrolling clamps against it, and recomputing it
+    /// meant walking and char-counting the whole document on every ←/→.
+    widest: Cell<Option<(u64, usize, usize)>>,
 }
 
 struct MatchCache {
@@ -452,6 +487,54 @@ struct MatchCache {
     revision: u64,
     line_count: usize,
     matches: Vec<usize>,
+}
+
+struct DocumentViewport {
+    width: usize,
+    height: usize,
+    wrap: bool,
+    revision: u64,
+    line_count: usize,
+    /// Cumulative display-row end for every source line — built only when
+    /// wrapping. Without wrap every line is exactly one row, so the table
+    /// would just be `[1, 2, 3, …]`: an allocation and a fill proportional to
+    /// the document for something three arithmetic operations answer.
+    ends: Vec<usize>,
+}
+
+impl DocumentViewport {
+    fn total_rows(&self) -> usize {
+        if !self.wrap {
+            return self.line_count;
+        }
+        self.ends.last().copied().unwrap_or(0)
+    }
+
+    fn line_at_row(&self, row: usize) -> usize {
+        if !self.wrap {
+            return row.min(self.line_count);
+        }
+        self.ends.partition_point(|&end| end <= row)
+    }
+
+    fn line_start(&self, line: usize) -> usize {
+        if !self.wrap {
+            return line;
+        }
+        line.checked_sub(1)
+            .and_then(|i| self.ends.get(i).copied())
+            .unwrap_or(0)
+    }
+
+    /// How many source lines finish strictly before display row `row`.
+    /// Unwrapped, line `i` ends at row `i + 1`, so this is `row - 1` clamped —
+    /// the same answer the cumulative table used to be searched for.
+    fn lines_before_row(&self, row: usize) -> usize {
+        if !self.wrap {
+            return row.saturating_sub(1).min(self.line_count);
+        }
+        self.ends.partition_point(|&line_end| line_end < row)
+    }
 }
 
 /// One command-palette suggestion — a built-in command (`:ctx`, `:pulse`), a
@@ -638,14 +721,107 @@ impl Scrollable {
         Self::default()
     }
     pub fn scroll_by(&mut self, delta: i32) {
-        let max = self.lines.len().saturating_sub(1) as i64;
+        let max = self.max_scroll() as i64;
         self.scroll = (self.scroll as i64 + delta as i64).clamp(0, max) as usize;
     }
+
+    pub(crate) fn scroll_to_bottom(&mut self) {
+        self.scroll = self.max_scroll();
+    }
+
+    pub(crate) fn set_viewport(&mut self, width: usize, height: usize) {
+        let width = width.max(1);
+        let stale = self.viewport.as_ref().is_none_or(|viewport| {
+            viewport.width != width
+                || viewport.wrap != self.wrap
+                || viewport.revision != self.revision
+                || viewport.line_count != self.lines.len()
+        });
+        if stale {
+            let mut rows = 0usize;
+            let ends: Vec<usize> = if self.wrap {
+                self.lines
+                    .iter()
+                    .map(|line| {
+                        rows = rows.saturating_add(crate::ui::wrapped_height(line, width));
+                        rows
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            self.viewport = Some(DocumentViewport {
+                width,
+                height,
+                wrap: self.wrap,
+                revision: self.revision,
+                line_count: self.lines.len(),
+                ends,
+            });
+        } else if let Some(viewport) = self.viewport.as_mut() {
+            viewport.height = height;
+        }
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    pub(crate) fn visible_source_window(&self) -> (usize, usize, usize) {
+        let Some(viewport) = self.viewport.as_ref() else {
+            let start = self.scroll.min(self.lines.len());
+            return (start, self.lines.len(), 0);
+        };
+        if viewport.height == 0 {
+            return (0, 0, 0);
+        }
+
+        let start = viewport.line_at_row(self.scroll).min(self.lines.len());
+        let row_offset = self.scroll.saturating_sub(viewport.line_start(start));
+        let visible_end = self.scroll.saturating_add(viewport.height);
+        let end = viewport
+            .lines_before_row(visible_end)
+            .saturating_add(1)
+            .min(self.lines.len());
+        (start, end, row_offset)
+    }
+
+    fn max_scroll(&self) -> usize {
+        self.viewport.as_ref().map_or_else(
+            || self.lines.len().saturating_sub(1),
+            |viewport| viewport.total_rows().saturating_sub(viewport.height),
+        )
+    }
+
+    fn scroll_to_line(&mut self, line: usize) {
+        let row = self
+            .viewport
+            .as_ref()
+            .map_or(line, |viewport| viewport.line_start(line));
+        self.scroll = row.min(self.max_scroll());
+    }
+
+    fn source_line_at_scroll(&self) -> usize {
+        self.viewport
+            .as_ref()
+            .map_or(self.scroll, |viewport| viewport.line_at_row(self.scroll))
+    }
+
     /// Scroll horizontally by `delta` columns, clamped to the widest line. A
     /// no-op while wrapping, since wrapped lines have no off-screen right edge.
     pub fn scroll_h(&mut self, delta: i32) {
         if self.wrap {
             return;
+        }
+        let max = self.widest_line().saturating_sub(1) as i64;
+        self.hscroll = (self.hscroll as i64 + delta as i64).clamp(0, max) as usize;
+    }
+    /// Chars in the longest line, cached against the document's revision and
+    /// line count so a held ←/→ does not rescan the whole document per press.
+    fn widest_line(&self) -> usize {
+        let line_count = self.lines.len();
+        if let Some((revision, count, widest)) = self.widest.get()
+            && revision == self.revision
+            && count == line_count
+        {
+            return widest;
         }
         let widest = self
             .lines
@@ -653,15 +829,26 @@ impl Scrollable {
             .map(|l| l.chars().count())
             .max()
             .unwrap_or(0);
-        let max = widest.saturating_sub(1) as i64;
-        self.hscroll = (self.hscroll as i64 + delta as i64).clamp(0, max) as usize;
+        self.widest.set(Some((self.revision, line_count, widest)));
+        widest
     }
-    /// Toggle word wrap. Turning it on resets the horizontal offset so the view
+
+    /// Toggle line wrap. Turning it on resets the horizontal offset so the view
     /// snaps back to the left margin. Returns the new state.
     pub fn toggle_wrap(&mut self) -> bool {
+        let current_line = self.source_line_at_scroll();
+        let dimensions = self
+            .viewport
+            .as_ref()
+            .map(|viewport| (viewport.width, viewport.height));
         self.wrap = !self.wrap;
         if self.wrap {
             self.hscroll = 0;
+        }
+        self.viewport = None;
+        if let Some((width, height)) = dimensions {
+            self.set_viewport(width, height);
+            self.scroll_to_line(current_line);
         }
         self.wrap
     }
@@ -687,14 +874,20 @@ impl Scrollable {
     /// Drop `n` lines from the front (log-buffer trimming). Shifts every
     /// index, so it bumps the revision.
     pub fn drain_front(&mut self, n: usize) {
+        // Clamped: retention only ever asks for the overflow, but "drop more
+        // than is there" is a reasonable request to make of a buffer and it
+        // should mean "drop everything", not panic.
+        let n = n.min(self.lines.len());
         self.lines.drain(0..n);
         self.revision = self.revision.wrapping_add(1);
+        self.viewport = None;
     }
 
     /// Drop every line.
     pub fn clear_lines(&mut self) {
         self.lines.clear();
         self.revision = self.revision.wrapping_add(1);
+        self.viewport = None;
     }
 
     /// Replace the document, invalidating the search-match cache.
@@ -704,8 +897,18 @@ impl Scrollable {
     /// live view — a refreshed events list — where the new document can have
     /// the same line count as the old one.
     pub fn replace_lines(&mut self, lines: VecDeque<String>) {
+        let dimensions = self
+            .viewport
+            .as_ref()
+            .map(|viewport| (viewport.width, viewport.height));
         self.lines = lines;
         self.revision = self.revision.wrapping_add(1);
+        self.viewport = None;
+        if let Some((width, height)) = dimensions {
+            self.set_viewport(width, height);
+        } else {
+            self.scroll = self.scroll.min(self.max_scroll());
+        }
     }
 
     /// Line indices (0-based) containing the active search query, matched
@@ -714,8 +917,49 @@ impl Scrollable {
     /// Memoized: this is called once per frame from `doc_title` and again per
     /// keypress from `n`/`N`, always over the whole document.
     pub fn match_lines(&self) -> Vec<usize> {
+        self.ensure_match_cache();
+        self.match_cache
+            .borrow()
+            .as_ref()
+            .map(|c| c.matches.clone())
+            .unwrap_or_default()
+    }
+
+    /// How many lines match the active search — read from the cache without
+    /// copying it. The title bar asks for this on every frame.
+    pub fn match_count(&self) -> usize {
+        self.ensure_match_cache();
+        self.match_cache
+            .borrow()
+            .as_ref()
+            .map_or(0, |c| c.matches.len())
+    }
+
+    /// The source line of the `i`th match.
+    pub fn match_line(&self, i: usize) -> Option<usize> {
+        self.ensure_match_cache();
+        let cache = self.match_cache.borrow();
+        cache.as_ref()?.matches.get(i).copied()
+    }
+
+    /// Position of the first match at or after `line`, wrapping to the first
+    /// match when none follow. Binary search: the match list is ascending, and
+    /// this used to copy the whole thing and walk it.
+    fn match_pos_at_or_after(&self, line: usize) -> usize {
+        self.ensure_match_cache();
+        let cache = self.match_cache.borrow();
+        let Some(c) = cache.as_ref() else {
+            return 0;
+        };
+        let pos = c.matches.partition_point(|&m| m < line);
+        if pos == c.matches.len() { 0 } else { pos }
+    }
+
+    /// Rebuild the match cache if the filter, revision or line count moved.
+    fn ensure_match_cache(&self) {
         if self.filter.is_empty() {
-            return Vec::new();
+            self.match_cache.borrow_mut().take();
+            return;
         }
         let line_count = self.lines.len();
         if let Some(c) = self.match_cache.borrow().as_ref()
@@ -723,7 +967,7 @@ impl Scrollable {
             && c.line_count == line_count
             && c.filter == self.filter
         {
-            return c.matches.clone();
+            return;
         }
 
         // Plain case-insensitive substring — deliberately *not* `LogMatcher`,
@@ -743,29 +987,29 @@ impl Scrollable {
             filter: self.filter.clone(),
             revision: self.revision,
             line_count,
-            matches: matches.clone(),
+            matches,
         });
-        matches
     }
 
     /// Finalize a search: scroll to the first match at or after the current
     /// position (wrapping to the first if none follow), so `⏎` lands on a hit
     /// without disturbing the rest of the document. No-op with no matches.
     pub fn focus_first_match(&mut self) {
-        let matches = self.match_lines();
-        if matches.is_empty() {
+        if self.match_count() == 0 {
             return;
         }
-        let pos = matches.iter().position(|&i| i >= self.scroll).unwrap_or(0);
+        let current_line = self.source_line_at_scroll();
+        let pos = self.match_pos_at_or_after(current_line);
         self.match_idx = pos;
-        self.scroll = matches[pos];
+        if let Some(line) = self.match_line(pos) {
+            self.scroll_to_line(line);
+        }
     }
 
     /// Step to the next (`forward`) or previous match, wrapping around, and
     /// scroll it into view. No-op with no matches.
     pub fn step_match(&mut self, forward: bool) {
-        let matches = self.match_lines();
-        let n = matches.len();
+        let n = self.match_count();
         if n == 0 {
             return;
         }
@@ -775,7 +1019,9 @@ impl Scrollable {
         } else {
             (cur + n - 1) % n
         };
-        self.scroll = matches[self.match_idx];
+        if let Some(line) = self.match_line(self.match_idx) {
+            self.scroll_to_line(line);
+        }
     }
 }
 
@@ -849,6 +1095,47 @@ impl LogIndex {
             return row.min(self.shown.len());
         }
         self.ends.partition_point(|&end| (end as usize) <= row)
+    }
+
+    /// Drop the first `n` buffer lines from the index without rebuilding it.
+    ///
+    /// Retention trims from the front on every appended batch once the buffer
+    /// is full, and each trim used to invalidate the whole index — so a
+    /// saturated buffer re-filtered and re-measured every retained line on
+    /// every batch, which is the opposite of incremental. Here the entries
+    /// that fall away are dropped and the rest are rebased, which touches only
+    /// what the index already holds and never looks at the text again.
+    ///
+    /// Indices stay `u32` and are shifted rather than stored absolutely: the
+    /// shift is a flat pass over a few hundred kilobytes at worst, and
+    /// absolute ids would either double the index or need overflow handling.
+    fn trim_front(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let drop = self.shown.partition_point(|&i| (i as usize) < n);
+        let dropped_rows = if self.wrap_width == 0 {
+            drop
+        } else {
+            match drop.checked_sub(1) {
+                Some(last) => self.ends.get(last).copied().unwrap_or(0) as usize,
+                None => 0,
+            }
+        };
+        self.shown.drain(..drop);
+        let shift = n as u32;
+        for i in &mut self.shown {
+            *i -= shift;
+        }
+        if self.wrap_width > 0 {
+            self.ends.drain(..drop);
+            let rows = dropped_rows as u32;
+            for e in &mut self.ends {
+                *e -= rows;
+            }
+        }
+        self.total_rows -= dropped_rows;
+        self.consumed = self.consumed.saturating_sub(n);
     }
 
     fn reset(&mut self, filter: &str, wrap_width: usize, revision: u64) {
@@ -941,6 +1228,22 @@ impl LogsView {
         &self.index
     }
 
+    /// Drop `n` lines from the front of the buffer, carrying the index across
+    /// instead of invalidating it.
+    ///
+    /// `Scrollable::drain_front` bumps the revision — line indices below it
+    /// have shifted, so anything holding them must know — and the index used
+    /// to answer that by rebuilding from scratch. It can rebase instead, so
+    /// the revision it is now consistent with is recorded here.
+    pub fn trim_front(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.view.drain_front(n);
+        self.index.trim_front(n);
+        self.index.revision = self.view.revision();
+    }
+
     /// Bring the filter/wrap index up to date with the buffer.
     ///
     /// Rebuilds only when the filter, wrap width, or buffer revision changed;
@@ -1022,12 +1325,65 @@ impl SortKey {
         use std::cmp::Ordering;
         match (self, other) {
             (SortKey::Num(a), SortKey::Num(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-            (SortKey::Text(a), SortKey::Text(b)) => a.cmp(b),
+            (SortKey::Text(a), SortKey::Text(b)) => natural_cmp(a, b),
             // Mixed kinds shouldn't occur within one column; keep it stable.
             (SortKey::Num(_), SortKey::Text(_)) => Ordering::Less,
             (SortKey::Text(_), SortKey::Num(_)) => Ordering::Greater,
         }
     }
+}
+
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let (mut ai, mut bi) = (0, 0);
+
+    while ai < a.len() && bi < b.len() {
+        if a[ai].is_ascii_digit() && b[bi].is_ascii_digit() {
+            let a_end = digit_run_end(a, ai);
+            let b_end = digit_run_end(b, bi);
+            let a_sig = significant_digits(&a[ai..a_end]);
+            let b_sig = significant_digits(&b[bi..b_end]);
+            let ord = a_sig.len().cmp(&b_sig.len()).then_with(|| a_sig.cmp(b_sig));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            ai = a_end;
+            bi = b_end;
+        } else {
+            let ord = a[ai].cmp(&b[bi]);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            ai += 1;
+            bi += 1;
+        }
+    }
+
+    match (ai == a.len(), bi == b.len()) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (true, true) => a.len().cmp(&b.len()).then_with(|| a.cmp(b)),
+        (false, false) => unreachable!(),
+    }
+}
+
+fn digit_run_end(bytes: &[u8], start: usize) -> usize {
+    let mut end = start;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    end
+}
+
+fn significant_digits(digits: &[u8]) -> &[u8] {
+    let first = digits
+        .iter()
+        .position(|digit| *digit != b'0')
+        .unwrap_or(digits.len());
+    &digits[first..]
 }
 
 /// Maximum previous object revisions retained for the session diff.
@@ -1040,27 +1396,55 @@ const PREV_REVISIONS_MAX: usize = 256;
 /// drilling away and back keeps the baseline.
 #[derive(Default)]
 pub(super) struct PrevRevisions {
-    map: HashMap<(String, String), Arc<DynamicObject>>,
-    order: VecDeque<(String, String)>,
+    /// Keyed by `"{kind}/{key}"` behind an `Rc` so the map and the eviction
+    /// order share one string. A `(String, String)` tuple key cannot be looked
+    /// up borrowed, which meant every read allocated two strings just to hash
+    /// them, and every write allocated two more and then cloned the tuple
+    /// before finding out the entry already existed — on the watch path, for
+    /// every applied object.
+    map: HashMap<Rc<str>, Arc<DynamicObject>>,
+    order: VecDeque<Rc<str>>,
+    /// Scratch buffer for building a lookup key without allocating.
+    probe: RefCell<String>,
 }
 
 impl PrevRevisions {
+    fn probe_key(&self, kind: &str, key: &str) -> std::cell::RefMut<'_, String> {
+        let mut probe = self.probe.borrow_mut();
+        probe.clear();
+        probe.push_str(kind);
+        probe.push('/');
+        probe.push_str(key);
+        probe
+    }
+
     pub(super) fn insert(&mut self, kind: &str, key: &str, obj: Arc<DynamicObject>) {
-        let k = (kind.to_string(), key.to_string());
-        if self.map.insert(k.clone(), obj).is_none() {
-            self.order.push_back(k);
-            while self.order.len() > PREV_REVISIONS_MAX {
-                if let Some(oldest) = self.order.pop_front() {
-                    self.map.remove(&oldest);
-                }
+        // Disjoint field borrows: the probe is read while the map is written.
+        let PrevRevisions { map, order, probe } = self;
+        let mut probe = probe.borrow_mut();
+        probe.clear();
+        probe.push_str(kind);
+        probe.push('/');
+        probe.push_str(key);
+        // The common case by far: the same object updated again.
+        if let Some(slot) = map.get_mut(probe.as_str()) {
+            *slot = obj;
+            return;
+        }
+        let owned: Rc<str> = Rc::from(probe.as_str());
+        drop(probe);
+        map.insert(Rc::clone(&owned), obj);
+        order.push_back(owned);
+        while order.len() > PREV_REVISIONS_MAX {
+            if let Some(oldest) = order.pop_front() {
+                map.remove(&oldest);
             }
         }
     }
 
     pub(super) fn get(&self, kind: &str, key: &str) -> Option<&DynamicObject> {
-        self.map
-            .get(&(kind.to_string(), key.to_string()))
-            .map(Arc::as_ref)
+        let probe = self.probe_key(kind, key);
+        self.map.get(probe.as_str()).map(Arc::as_ref)
     }
 }
 
@@ -1137,6 +1521,17 @@ impl TableCellCache<'_> {
     }
 }
 
+/// A retained view snapshot and what it costs to keep.
+///
+/// The size is measured once, when the snapshot is cached, because that is the
+/// only moment its contents change — eviction then just adds up numbers
+/// instead of re-examining objects.
+pub(super) struct CachedView {
+    pub(super) items: crate::store::Items,
+    /// Approximate retained bytes (see [`helpers::approx_object_bytes`]).
+    pub(super) bytes: usize,
+}
+
 /// Maximum root views kept in the `[`/`]` history.
 const HISTORY_MAX: usize = 50;
 
@@ -1150,6 +1545,14 @@ const VIEW_CACHE_MAX: usize = 8;
 /// roughly eight times one snapshot. Objects are `Arc`-shared with the live
 /// store, so the live view is nearly free; this bounds the *departed* ones.
 const VIEW_CACHE_MAX_OBJECTS: usize = 10_000;
+
+/// Third bound, and the one that actually tracks memory: retained bytes across
+/// all snapshots. An object count is not a memory cap either — ten thousand
+/// ConfigMaps or Helm storage Secrets are worth orders of magnitude more than
+/// ten thousand Pods, so the same count can mean a few megabytes or a few
+/// gigabytes. Estimated rather than measured (see [`App::approx_view_bytes`]),
+/// so it is a guard rail, not an accountant.
+const VIEW_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Identity of a watch scope, used to key cached view snapshots. Two visits
 /// with the same key list exactly the same server-side set, so the previous
@@ -1239,7 +1642,7 @@ pub struct App {
     /// Snapshots of recently-left views: shown instantly (marked syncing) when
     /// the user navigates back, while the fresh watch relists in the
     /// background. Bounded by [`VIEW_CACHE_MAX`]; cleared on context switch.
-    view_cache: HashMap<ViewKey, crate::store::Items>,
+    view_cache: HashMap<ViewKey, CachedView>,
     /// LRU order for [`Self::view_cache`] (front = oldest).
     view_cache_order: VecDeque<ViewKey>,
     /// Browser-style history of root views for `[`/`]`: every root switch
@@ -1562,6 +1965,9 @@ pub struct App {
     /// Scratch buffer for the fuzzy filter's "namespace name" haystack, reused
     /// across rows so the filter pass doesn't allocate a `String` per object.
     hay_buf: RefCell<String>,
+    /// Scratch buffer for the `"{namespace}/{name}"` metrics-map key, reused
+    /// for the same reason: it is built per visible row per frame.
+    metrics_key_buf: RefCell<String>,
 
     /// Compiled log provider from `[providers.logs]`, re-resolved on context
     /// switch and `:reload` so each cluster can point at its own backend.
@@ -1757,6 +2163,7 @@ impl App {
             should_quit: false,
             matcher: SkimMatcherV2::default(),
             hay_buf: RefCell::new(String::new()),
+            metrics_key_buf: RefCell::new(String::new()),
             rows_cache: RefCell::new(RowsCache {
                 dirty: true,
                 keys: Vec::new(),
