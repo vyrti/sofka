@@ -825,10 +825,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                     "CPU" | "MEM" => ColWidth::Exact(8),
                     "%CPU" | "%MEM" => ColWidth::Exact(5),
                     "PODS" => ColWidth::Exact(5),
-                    // Caps, not fixed: room for the long pod reasons
-                    // (ContainerCreating, CrashLoopBackOff…) when they occur,
-                    // shrink to the visible values when they don't.
-                    "STATUS" => ColWidth::Cap(19),
+                    // Keep status changes from moving the other columns.
+                    // Allow room for CreateContainerConfigError.
+                    "STATUS" => ColWidth::Exact(26),
                     "READY" | "RESTARTS" => ColWidth::Cap(10),
                     // CRD view: group domains run long (e.g.
                     // "kustomize.toolkit.fluxcd.io"), so GROUP/KIND/VERSIONS
