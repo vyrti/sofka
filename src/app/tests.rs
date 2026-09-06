@@ -11308,3 +11308,255 @@ async fn check_unknown_inline_fields(location: &str) {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+fn faults_test_pod(name: &str) -> Value {
+    json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": name, "namespace": "default", "resourceVersion": "1"},
+        "spec": {"containers": [{"name": "app"}]},
+        "status": {
+            "phase": "Running",
+            "conditions": [{"type": "Ready", "status": "True"}],
+            "containerStatuses": [{"name": "app", "ready": true, "restartCount": 0,
+                                   "state": {"running": {}}}]
+        }
+    })
+}
+
+#[tokio::test]
+async fn ctrl_z_filters_pod_faults() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let healthy = faults_test_pod("healthy");
+    let mut cases = vec![(healthy.clone(), false)];
+    for phase in ["Pending", "Failed", "Unknown", "Succeeded"] {
+        let mut pod = faults_test_pod(phase);
+        pod["status"] = json!({"phase": phase});
+        cases.push((pod, phase != "Succeeded"));
+    }
+    for reason in [
+        "CrashLoopBackOff",
+        "ImagePullBackOff",
+        "ErrImagePull",
+        "ContainerCreating",
+    ] {
+        let mut pod = faults_test_pod(reason);
+        pod["status"]["containerStatuses"][0]["state"] = json!({"waiting": {"reason": reason}});
+        cases.push((pod, true));
+    }
+    let mut unready = faults_test_pod("unready");
+    unready["status"]["conditions"][0]["status"] = json!("False");
+    cases.push((unready, true));
+    let mut container_unready = faults_test_pod("container-unready");
+    container_unready["status"]["containerStatuses"][0]["ready"] = json!(false);
+    cases.push((container_unready, true));
+    let mut missing = faults_test_pod("missing-status");
+    missing["status"]["containerStatuses"] = json!([]);
+    cases.push((missing, true));
+    let mut terminating = faults_test_pod("terminating");
+    terminating["metadata"]["deletionTimestamp"] = json!("2026-09-06T00:00:00Z");
+    cases.push((terminating, true));
+    let mut gate = faults_test_pod("gate");
+    gate["spec"]["readinessGates"] = json!([{"conditionType": "example.com/ready"}]);
+    cases.push((gate, true));
+    for (name, sidecar, ready, faulty) in [
+        ("init-complete", false, true, false),
+        ("init-failed", false, false, true),
+        ("sidecar-ready", true, true, false),
+        ("sidecar-unready", true, false, true),
+    ] {
+        let mut pod = faults_test_pod(name);
+        pod["spec"]["initContainers"] = json!([{"name": "init"}]);
+        let state = if sidecar {
+            pod["spec"]["initContainers"][0]["restartPolicy"] = json!("Always");
+            json!({"running": {}})
+        } else {
+            json!({"terminated": {"exitCode": if ready { 0 } else { 1 }}})
+        };
+        pod["status"]["initContainerStatuses"] =
+            json!([{"name": "init", "ready": ready, "state": state}]);
+        cases.push((pod, faulty));
+    }
+    for (pod, _) in &cases {
+        apply(&mut app, pod.clone());
+    }
+    assert_eq!(app.row_count(), cases.len());
+    app.handle_key(press(KeyCode::End)).unwrap();
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    let names = row_names(&app);
+    for (pod, faulty) in &cases {
+        let name = pod["metadata"]["name"].as_str().unwrap();
+        assert_eq!(names.iter().any(|n| n == name), *faulty, "{name}");
+    }
+    assert_eq!(app.table_state.selected(), Some(0));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(screen.contains("[faults]"));
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.row_count(), cases.len());
+}
+
+#[tokio::test]
+async fn faults_filter_combines_with_text_and_tracks_watch_updates() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let mut pod = faults_test_pod("api");
+    apply(&mut app, pod.clone());
+    let mut other = faults_test_pod("other");
+    other["status"]["phase"] = json!("Pending");
+    apply(&mut app, other);
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(row_names(&app), ["other"]);
+    pod["metadata"]["resourceVersion"] = json!("2");
+    pod["status"]["conditions"][0]["status"] = json!("False");
+    apply(&mut app, pod.clone());
+    assert_eq!(row_names(&app), ["api", "other"]);
+    type_filter(&mut app, "api");
+    assert_eq!(row_names(&app), ["api"]);
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.filter, "api");
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    pod["metadata"]["resourceVersion"] = json!("3");
+    pod["status"]["conditions"][0]["status"] = json!("True");
+    apply(&mut app, pod);
+    assert!(row_names(&app).is_empty());
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(row_names(&app), ["other"]);
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "services".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.kind_plural, "services");
+    assert!(!app.faults_filter_active());
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Service",
+        "metadata": {"name": "service", "namespace": "default"}}),
+    );
+    assert_eq!(row_names(&app), ["service"]);
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert!(app.faults_only);
+}
+
+#[tokio::test]
+async fn configured_ctrl_z_actions_take_precedence_over_faults() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    app.bookmarks = vec![crate::config::Bookmark {
+        key: Some("ctrl-z".into()),
+        name: "services".into(),
+        resource: "services".into(),
+        ..Default::default()
+    }];
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.kind_plural, "services");
+    assert!(!app.faults_only);
+
+    app.bookmarks.clear();
+    app.switch_kind("pods");
+    app.workspaces = vec![crate::config::Workspace {
+        key: Some("ctrl-z".into()),
+        name: "ops".into(),
+        context: None,
+        views: vec![crate::config::WorkspaceView {
+            name: "services".into(),
+            resource: "services".into(),
+            ..Default::default()
+        }],
+    }];
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.kind_plural, "services");
+    assert!(!app.faults_only);
+
+    app.workspaces.clear();
+    app.switch_kind("pods");
+    app.readonly = true;
+    app.plugins = vec![crate::config::Plugin {
+        key: "ctrl-z".into(),
+        name: "custom".into(),
+        command: "true".into(),
+        scopes: vec!["pods".into()],
+        ..Default::default()
+    }];
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert!(app.flash.contains("read-only"));
+    assert!(!app.faults_only);
+    app.plugins[0].scopes = vec!["services".into()];
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert!(app.faults_only);
+}
+
+#[tokio::test]
+async fn faults_watch_changes_preserve_pod_identity_or_clear_selection() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for name in ["b", "c", "d"] {
+        let mut pod = faults_test_pod(name);
+        pod["metadata"]["uid"] = json!(name);
+        pod["status"]["phase"] = json!("Pending");
+        apply(&mut app, pod);
+    }
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    assert_eq!(
+        app.selected_ref().unwrap().metadata.name.as_deref(),
+        Some("c")
+    );
+
+    let mut earlier = faults_test_pod("a");
+    earlier["status"]["phase"] = json!("Pending");
+    apply(&mut app, earlier);
+    assert_eq!(app.table_state.selected(), Some(2));
+    assert_eq!(
+        app.selected_ref().unwrap().metadata.name.as_deref(),
+        Some("c")
+    );
+
+    let mut recovered = faults_test_pod("b");
+    recovered["metadata"]["uid"] = json!("b");
+    recovered["metadata"]["resourceVersion"] = json!("2");
+    apply(&mut app, recovered);
+    assert_eq!(app.table_state.selected(), Some(1));
+    assert_eq!(
+        app.selected_ref().unwrap().metadata.name.as_deref(),
+        Some("c")
+    );
+
+    let mut recovered = faults_test_pod("c");
+    recovered["metadata"]["uid"] = json!("c");
+    recovered["metadata"]["resourceVersion"] = json!("2");
+    apply(&mut app, recovered);
+    assert!(app.selected_ref().is_none());
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.table_state.selected(), None);
+    app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+    assert_ne!(app.mode, Mode::Confirm);
+
+    app.handle_key(press(KeyCode::End)).unwrap();
+    assert_eq!(
+        app.selected_ref().unwrap().metadata.name.as_deref(),
+        Some("d")
+    );
+    let mut replacement = faults_test_pod("d");
+    replacement["metadata"]["uid"] = json!("replacement");
+    replacement["metadata"]["resourceVersion"] = json!("2");
+    replacement["status"]["phase"] = json!("Pending");
+    apply(&mut app, replacement);
+    assert_eq!(app.table_state.selected(), None);
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    let key = row_key(app.selected_ref().unwrap());
+    app.handle_msg(Msg::Deleted {
+        generation: app.generation,
+        key,
+    });
+    assert_eq!(app.table_state.selected(), None);
+}

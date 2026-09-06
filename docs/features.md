@@ -44,6 +44,14 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   inverse match, `-l`/`-f` label and field selectors (evaluated server-side on
   ⏎), and typed column comparisons (`status=CrashLoopBackOff`, `cpu>500m`,
   `memory>1Gi`, `restarts>=5`, `age<2h`). Space-separated terms AND together.
+- **Toggle faults** (`Ctrl+Z`, pods only) shows pending, failed, unknown,
+  terminating, and running pods that are not ready. Completed pods are hidden.
+  The table title shows `[faults]` while the filter is on. It works with the
+  text filter and current namespace or drill scope. Press `Ctrl+Z` again to
+  turn it off. The setting stays on for pod views during the session and does
+  not filter other resource types. Configured `Ctrl+Z` bookmark, workspace,
+  and matching plugin actions take precedence. Live updates keep the selected
+  pod selected. If it leaves the list or its UID changes, selection is cleared.
 - **Global fuzzy find** (`:find <text>`) - search object names across the common
   kinds (workloads, pods, services, config, ingresses, jobs, storage, nodes,
   namespaces, Flux objects) in every namespace at once, concurrently. Results
