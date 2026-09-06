@@ -1979,6 +1979,10 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             "switch kind and namespace at once (all/* = all namespaces)",
         ),
         bind("[ · ]", "view history — back · forward"),
+        bind(
+            "Tab · ⇧Tab",
+            "next · previous resource in this namespace (workspace views when open)",
+        ),
         bind(":ctx · :pulse", "switch context · cluster-health dashboard"),
         bind(
             ":fleet",
@@ -3443,10 +3447,21 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
         _ => {
             // Per-resource verbs live in the header hint column when it
             // fits; only repeat the full line when the header dropped it.
-            let hint = if header_hints_fit(frame.area().width) {
-                "  :resource  /filter  S:sort I:invert  w:wide  space:mark  [ ]:history  0:all-ns  ?:help"
+            let cycle = if app.mode != Mode::Table {
+                ""
+            } else if app.active_workspace.is_some() {
+                "Tab/⇧Tab: workspace  "
             } else {
-                "  :resource  /filter  S:sort I:invert  w:wide  ⏎drill  y:yaml d:describe l:logs e:edit s:shell/scale i:image r:restart f:fwd ^d:del  ?:help"
+                "Tab/⇧Tab: resources  "
+            };
+            let hint = if header_hints_fit(frame.area().width) {
+                format!(
+                    "  {cycle}:resource  /filter  S:sort I:invert  w:wide  space:mark  [ ]:history  0:all-ns  ?:help"
+                )
+            } else {
+                format!(
+                    "  {cycle}:resource  /filter  S:sort I:invert  w:wide  ⏎drill  y:yaml d:describe l:logs e:edit s:shell/scale i:image r:restart f:fwd ^d:del  ?:help"
+                )
             };
             Line::from(Span::styled(hint, theme::dim()))
         }

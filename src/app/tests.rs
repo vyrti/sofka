@@ -7601,7 +7601,7 @@ async fn workspace_opens_first_view_and_tab_cycles() {
             },
         ],
     }];
-    assert!(app.open_workspace_named("ops"));
+    app.handle_key(ctrl(KeyCode::Char('w'))).unwrap();
     assert_eq!(app.kind_plural, "pods");
     assert_eq!(app.namespace, "checkout");
     assert!(app.flash.contains("[1/2]"));
@@ -7609,6 +7609,7 @@ async fn workspace_opens_first_view_and_tab_cycles() {
     // Tab advances to the second view; wraps back on the third press.
     app.handle_key(press(KeyCode::Tab)).unwrap();
     assert_eq!(app.kind_plural, "deployments");
+    assert_eq!(app.namespace, "checkout");
     assert!(app.flash.contains("[2/2]"));
     app.handle_key(press(KeyCode::Tab)).unwrap();
     assert_eq!(app.kind_plural, "pods");
@@ -7617,13 +7618,175 @@ async fn workspace_opens_first_view_and_tab_cycles() {
     // Shift-Tab goes back.
     app.handle_key(press(KeyCode::BackTab)).unwrap();
     assert_eq!(app.kind_plural, "deployments");
+    assert_eq!(app.namespace, "checkout");
+}
+
+fn resource_cycle_app() -> (App, Receiver<Msg>) {
+    let (mut app, rx) = test_app();
+    for (group, kind, plural) in [
+        ("apps", "StatefulSet", "statefulsets"),
+        ("apps", "DaemonSet", "daemonsets"),
+        ("", "ConfigMap", "configmaps"),
+        ("networking.k8s.io", "Ingress", "ingresses"),
+        ("", "PersistentVolumeClaim", "persistentvolumeclaims"),
+    ] {
+        app.cluster.register_kind(group, kind, plural, true);
+    }
+    (app, rx)
 }
 
 #[tokio::test]
-async fn tab_is_a_noop_without_an_active_workspace() {
+async fn tab_cycles_common_resources_in_both_directions_and_keeps_namespace() {
+    let resources = [
+        "pods",
+        "services",
+        "deployments",
+        "statefulsets",
+        "daemonsets",
+        "secrets",
+        "configmaps",
+        "ingresses",
+        "persistentvolumeclaims",
+        "pods",
+    ];
+    for namespace in ["checkout", ""] {
+        let (mut app, _rx) = resource_cycle_app();
+        app.switch_kind_ns("pods", Some(namespace));
+        for expected in &resources[1..] {
+            app.handle_key(press(KeyCode::Tab)).unwrap();
+            assert_eq!(app.kind_plural, *expected);
+            assert_eq!(app.namespace, namespace);
+            assert!(app.active_workspace.is_none());
+        }
+        for expected in resources[..resources.len() - 1].iter().rev() {
+            app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+                .unwrap();
+            assert_eq!(app.kind_plural, *expected);
+            assert_eq!(app.namespace, namespace);
+        }
+    }
+}
+
+#[tokio::test]
+async fn tab_cycle_tracks_palette_navigation_namespace_changes_and_history() {
+    let (mut app, _rx) = resource_cycle_app();
+    app.switch_kind_ns("pods", Some("checkout"));
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for ch in "deployments payments".chars() {
+        app.handle_key(press(KeyCode::Char(ch))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.kind_plural, "deployments");
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    assert_eq!(app.kind_plural, "statefulsets");
+    assert_eq!(app.namespace, "payments");
+    app.handle_key(press(KeyCode::Char('['))).unwrap();
+    assert_eq!(app.kind_plural, "deployments");
+    app.handle_key(press(KeyCode::Char(']'))).unwrap();
+    assert_eq!(app.kind_plural, "statefulsets");
+    app.handle_key(press(KeyCode::Char('0'))).unwrap();
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    assert_eq!(app.kind_plural, "daemonsets");
+    assert_eq!(app.namespace, "");
+}
+
+#[tokio::test]
+async fn tab_cycle_enters_from_resources_outside_the_default_set() {
+    for (key, expected) in [
+        (KeyCode::Tab, "pods"),
+        (KeyCode::BackTab, "persistentvolumeclaims"),
+    ] {
+        let (mut app, _rx) = resource_cycle_app();
+        app.switch_kind_ns("jobs", Some("checkout"));
+        app.handle_key(press(key)).unwrap();
+        assert_eq!(app.kind_plural, expected);
+        assert_eq!(app.namespace, "checkout");
+    }
+}
+
+#[tokio::test]
+async fn tab_cycle_clears_drill_scope_and_filter() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind_ns("deployments", Some("checkout"));
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "apps/v1", "kind": "Deployment",
+            "metadata": {"name": "web", "namespace": "checkout"},
+            "spec": {"selector": {"matchLabels": {"app": "web"}}}
+        }),
+    );
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.labels.as_deref(), Some("app=web"));
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.filter, "w");
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    assert_eq!(app.kind_plural, "services");
+    assert_eq!(app.namespace, "checkout");
+    assert!(app.filter.is_empty());
+    assert!(app.labels.is_none());
+    assert!(app.fields.is_none());
+    assert!(app.owner.is_none());
+    assert!(app.scope_label.is_none());
+    assert!(app.stack.is_empty());
+}
+
+#[tokio::test]
+async fn resource_cycle_hint_is_visible_and_changes_for_a_workspace() {
+    use ratatui::{Terminal, backend::TestBackend};
+
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
-    assert!(!app.cycle_workspace(true));
+    app.workspaces = vec![crate::config::Workspace {
+        key: Some("ctrl-w".into()),
+        name: "ops".into(),
+        views: vec![crate::config::WorkspaceView {
+            name: "Pods".into(),
+            resource: "pods".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }];
+    for (key, expected) in [
+        (press(KeyCode::Tab), "Tab/⇧Tab: resources"),
+        (ctrl(KeyCode::Char('w')), "Tab/⇧Tab: workspace"),
+    ] {
+        app.handle_key(key).unwrap();
+        for width in [60, 160] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::draw(frame, &mut app))
+                .unwrap();
+            let screen: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                screen.contains(expected),
+                "missing {expected} at width {width}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn tab_cycle_skips_undiscovered_kinds() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    app.handle_key(press(KeyCode::Tab)).unwrap();
+    assert_eq!(app.kind_plural, "secrets");
+    app.handle_key(press(KeyCode::BackTab)).unwrap();
+    assert_eq!(app.kind_plural, "deployments");
+    app.switch_kind("pods");
+    app.handle_key(press(KeyCode::BackTab)).unwrap();
+    assert_eq!(app.kind_plural, "secrets");
+    app.handle_key(press(KeyCode::Tab)).unwrap();
     assert_eq!(app.kind_plural, "pods");
 }
 
