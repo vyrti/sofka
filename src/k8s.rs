@@ -19,6 +19,27 @@ use tokio::task::JoinHandle;
 
 use crate::store::{Msg, row_key};
 
+pub(crate) fn build_client(config: Config) -> Result<Client, kube::Error> {
+    let layer =
+        tower::util::MapRequestLayer::new(|mut request: http::Request<kube::client::Body>| {
+            let watch = request.uri().query().is_some_and(|query| {
+                form_urlencoded::parse(query.as_bytes())
+                    .any(|(key, value)| key == "watch" && value == "true")
+            });
+            if watch {
+                // Watch responses can contain multiple gzip members, which the client cannot decode.
+                request.headers_mut().insert(
+                    http::header::ACCEPT_ENCODING,
+                    http::HeaderValue::from_static("identity"),
+                );
+            }
+            request
+        });
+    Ok(kube::client::ClientBuilder::try_from(config)?
+        .with_layer(&layer)
+        .build())
+}
+
 /// A resolvable Kubernetes resource type.
 #[derive(Clone)]
 pub struct Kind {
@@ -131,7 +152,7 @@ impl Cluster {
     ) -> Result<Self> {
         let cluster_url = config.cluster_url.to_string();
         let default_namespace = config.default_namespace.clone();
-        let client = Client::try_from(config).context("building kube client")?;
+        let client = build_client(config).context("building kube client")?;
         let version_client = client.clone();
 
         let cluster_name = cluster_name_for(&context).unwrap_or_default();

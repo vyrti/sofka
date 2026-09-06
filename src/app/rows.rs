@@ -51,6 +51,7 @@ impl App {
         cache.dirty = true;
         cache.keys.clear();
         cache.cells.clear();
+        cache.column_widths = None;
         cache.sort_keys.clear();
         cache.helm_latest = None;
     }
@@ -68,6 +69,7 @@ impl App {
     pub(super) fn invalidate_row_contents(&self, key: &str) {
         let mut cache = self.rows_cache.borrow_mut();
         cache.cells.remove(key);
+        cache.column_widths = None;
         cache.sort_keys.remove(key);
         if !self.filter.is_empty()
             || self.sort_column.is_some()
@@ -444,6 +446,7 @@ impl App {
         if !cache.dirty {
             return;
         }
+        cache.column_widths = None;
 
         let headers = self.display_headers();
         let sort_header = self
@@ -694,6 +697,53 @@ impl App {
     /// Every display-ordered row with its canonical store key.
     pub(crate) fn rows_keyed(&self) -> Vec<(&RowKey, &DynamicObject)> {
         self.rows_window_keyed(0, usize::MAX)
+    }
+
+    /// Measure the full filtered list once per data or view change.
+    /// Scrolling reuses these widths and renders only the rows on screen.
+    pub(crate) fn table_column_widths(&self) -> Vec<u16> {
+        use unicode_width::UnicodeWidthStr;
+
+        self.ensure_rows_cache();
+        let headers = self.display_headers();
+        let mut cache = self.rows_cache.borrow_mut();
+        if let Some(widths) = &cache.column_widths
+            && Rc::ptr_eq(&widths.headers, &headers)
+        {
+            return widths.needed.clone();
+        }
+
+        let width = |s: &str| u16::try_from(s.width()).unwrap_or(u16::MAX);
+        let mut needed: Vec<u16> = headers.iter().map(|h| width(h)).collect();
+        let show_ns = self.show_namespace_column();
+        let ns_off = usize::from(show_ns);
+        let now = crate::columns::now_secs();
+        let RowsCache { keys, cells, .. } = &mut *cache;
+        for key in keys.iter() {
+            let Some(obj) = self.store.get(key.as_ref()) else {
+                continue;
+            };
+            if show_ns {
+                needed[0] =
+                    needed[0].max(width(obj.metadata.namespace.as_deref().unwrap_or_default()));
+            }
+            let entry = self.cell_entry(key, obj, cells, now);
+            for (i, cell) in entry.cells.iter().enumerate() {
+                let cell_width =
+                    if let Some(value) = self.spec.volatile(obj, &self.kind_plural, i, now) {
+                        // Reserve space for elapsed times as the clock advances.
+                        width(&value).max(7)
+                    } else {
+                        width(cell)
+                    };
+                needed[i + ns_off] = needed[i + ns_off].max(cell_width);
+            }
+        }
+        cache.column_widths = Some(TableWidthCache {
+            headers,
+            needed: needed.clone(),
+        });
+        needed
     }
 
     pub(crate) fn ensure_table_cell_cache(&self, rows: &[(&RowKey, &DynamicObject)]) {

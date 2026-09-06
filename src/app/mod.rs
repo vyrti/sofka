@@ -1365,6 +1365,7 @@ struct RowsCache {
     dirty: bool,
     keys: Vec<RowKey>,
     cells: crate::store::FastMap<RowKey, CellCacheEntry>,
+    column_widths: Option<TableWidthCache>,
     /// Computed primary sort keys, valid per (sort header, resourceVersion) —
     /// a rebuild touches every object, but only changed rows re-extract.
     sort_keys: crate::store::FastMap<RowKey, SortKeyEntry>,
@@ -1372,6 +1373,11 @@ struct RowsCache {
     /// version it was computed from. A rebuild staled by a filter keystroke or
     /// a sort toggle leaves the store untouched, so the dedup still holds.
     helm_latest: Option<(u64, crate::store::FastSet<RowKey>)>,
+}
+
+struct TableWidthCache {
+    headers: Rc<[String]>,
+    needed: Vec<u16>,
 }
 
 struct CellCacheEntry {
@@ -2087,6 +2093,7 @@ impl App {
                 dirty: true,
                 keys: Vec::new(),
                 cells: crate::store::FastMap::default(),
+                column_widths: None,
                 sort_keys: crate::store::FastMap::default(),
                 helm_latest: None,
             }),

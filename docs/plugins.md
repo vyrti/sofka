@@ -7,6 +7,10 @@ To create a package, see [Create a plugin package](plugin-authoring.md).
 Packages support named commands, validated inputs, JSON reports, and managed port-forwards.
 Enter `:plugin-cancel` to stop the active plugin run.
 
+For core plugins maintained and shipped by the sofka project, Rust is the preferred language.
+External plugins can use any programming language that follows the plugin protocol.
+See [Language choice](plugin-authoring.md#language-choice).
+
 `[[plugins]]` assigns an external command to a key or palette command. `key` is a **chord**: a single
 character (`"g"`), a modifier combination (`"ctrl-g"`, `"alt-x"`, `"shift-b"`), or
 a function or named key (`"f5"`, `"ctrl-f2"`). A built-in key wins over a plugin

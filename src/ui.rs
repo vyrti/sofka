@@ -642,6 +642,10 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let offset = app.table_state.offset();
     let selected = app.table_state.selected();
 
+    let mut needed = app.table_column_widths();
+    if let Some(i) = sort_col {
+        needed[i] = needed[i].max(cell_width(&headers[i]).saturating_add(2));
+    }
     let visible_objects = app.rows_window_keyed(offset, visible_rows);
     app.ensure_table_cell_cache(&visible_objects);
     let cell_cache = app.table_cell_cache();
@@ -652,21 +656,10 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     // reading per volatile cell and could show two rows a second apart.
     let now = crate::columns::now_secs();
 
-    // Widest visible value per display column (headers count too, plus the
-    // sort arrow on the active sort column). Drives the content-aware widths
-    // below so a narrow window trims padding, not data (#166).
-    let mut needed: Vec<u16> = headers
-        .iter()
-        .enumerate()
-        .map(|(i, h)| {
-            let arrow = if Some(i) == sort_col { 2 } else { 0 };
-            cell_width(h) + arrow
-        })
-        .collect();
-
-    // Scrolled-away columns are never drawn, so their values must not be
-    // formatted or measured either. STATUS/READY are the exception: the row
-    // color reads them, but their cached text is already there to borrow.
+    // Scrolled-away columns are never drawn, so their values are not
+    // formatted either. Widths are measured separately, over the whole list,
+    // so they stay put while scrolling. STATUS/READY are the exception: the
+    // row color reads them, but their cached text is already there to borrow.
     let shown = |idx: Option<usize>| idx.is_some_and(&col_visible);
     let cpu_shown = shown(cpu_idx);
     let mem_shown = shown(mem_idx);
@@ -746,16 +739,6 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                         true => TableCellText::Owned(columns::fmt_pct(node_pcts.1)),
                         false => TableCellText::Borrowed(""),
                     });
-                }
-            }
-            for (i, c) in cells.iter().enumerate() {
-                // Only visible columns are sized: `col_rules` below reads
-                // `needed` for those alone.
-                if !col_visible(i) {
-                    continue;
-                }
-                if let Some(n) = needed.get_mut(i) {
-                    *n = (*n).max(cell_width(c.as_str()));
                 }
             }
             // Combined colorer: the whole row takes a k9s-style status tint
@@ -840,7 +823,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     // Content-aware column widths (#166): every column asks for its widest
-    // visible value, the rules below bound or weight that ask, and
+    // value in the filtered list, the rules below bound or weight that ask, and
     // `distribute_column_widths` splits the frame. A `Fill`-style layout is
     // deliberately avoided — it hands NAME padding it doesn't need while a
     // long EXTERNAL-IP next to it gets silently trimmed.
@@ -869,10 +852,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                     "CPU" | "MEM" => ColWidth::Exact(8),
                     "%CPU" | "%MEM" => ColWidth::Exact(5),
                     "PODS" => ColWidth::Exact(5),
-                    // Caps, not fixed: room for the long pod reasons
-                    // (ContainerCreating, CrashLoopBackOff…) when they occur,
-                    // shrink to the visible values when they don't.
-                    "STATUS" => ColWidth::Cap(19),
+                    // Keep status changes from moving the other columns.
+                    // Allow room for CreateContainerConfigError.
+                    "STATUS" => ColWidth::Exact(26),
                     "READY" | "RESTARTS" => ColWidth::Cap(10),
                     // CRD view: group domains run long (e.g.
                     // "kustomize.toolkit.fluxcd.io"), so GROUP/KIND/VERSIONS

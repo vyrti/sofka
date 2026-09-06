@@ -10,11 +10,15 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   aliases (`po`, `dp`, `svc`, `no`, `cm`, `sts`, `ds`, `ks`, `hr`, …) and correct
   precedence - core `pods` wins over `pods.metrics.k8s.io`.
 - **Live watch** of any kind through `kube::runtime::watcher`, streamed into an
-  in-memory store.
+  in-memory store. Watch requests use uncompressed responses to avoid gzip
+  stream errors. List requests retain gzip compression.
 - **Curated columns** for common kinds (pods, deployments, replicasets,
   statefulsets, daemonsets, services, nodes, namespaces, configmaps, secrets,
   jobs, cronjobs, PVC/PV, ingresses, endpoints, CustomResourceDefinitions), with
-  a NAME/AGE fallback for everything else.
+  a NAME/AGE fallback for everything else. STATUS columns use a fixed width of
+  26 characters so status changes do not move adjacent columns. A configured
+  column width takes priority. Column widths use the full filtered list so
+  scrolling does not move the columns.
 - **Custom views** - define columns for any resource in the config file. An
   unknown custom resource picks up its CRD `additionalPrinterColumns`
   automatically. `w` toggles wide-only columns (kubectl `-o wide`). See

@@ -2884,7 +2884,7 @@ dependencies = [
 
 [[package]]
 name = "sofka"
-version = "0.24.2"
+version = "0.24.4"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2915,6 +2915,7 @@ dependencies = [
  "terminal-colorsaurus",
  "tokio",
  "toml",
+ "tower",
  "unicode-width",
 ]
 

@@ -272,13 +272,12 @@ async fn await_counts(rx: &mut Receiver<Msg>, want: &[(&str, usize)]) {
     assert!(seen.is_ok(), "never saw counts {want:?}");
 }
 
-/// A stand-in API server that gzip-encodes its list response and records the
-/// request headers it was asked with. Enabling the `gzip` cargo feature is the
-/// entire change: kube installs its decompression layer inside
-/// `Client::try_from`, which is what `Cluster::from_config` calls — so nothing
-/// in this repo constructs the middleware. That makes it worth pinning from the
-/// outside rather than trusting the feature flag.
-async fn mock_gzip_api() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+/// Serve compressed lists and one watch, with one gzip member per event when requested.
+async fn mock_gzip_api() -> (
+    String,
+    Arc<std::sync::Mutex<Vec<String>>>,
+    mpsc::Sender<String>,
+) {
     use std::io::Write;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -295,12 +294,15 @@ async fn mock_gzip_api() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
     let addr = listener.local_addr().expect("local addr");
     let headers = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = Arc::clone(&headers);
+    let (frame_tx, frame_rx) = mpsc::channel::<String>(16);
+    let frames = Arc::new(tokio::sync::Mutex::new(Some(frame_rx)));
     tokio::spawn(async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else {
                 return;
             };
             let seen = Arc::clone(&seen);
+            let frames = Arc::clone(&frames);
             tokio::spawn(async move {
                 let (r, mut w) = sock.split();
                 let mut reader = BufReader::new(r);
@@ -308,19 +310,53 @@ async fn mock_gzip_api() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
                 if reader.read_line(&mut request_line).await.unwrap_or(0) == 0 {
                     return;
                 }
+                let mut gzip = false;
                 loop {
                     let mut header = String::new();
                     if reader.read_line(&mut header).await.unwrap_or(0) == 0 || header == "\r\n" {
                         break;
                     }
+                    gzip |= header.trim().eq_ignore_ascii_case("accept-encoding: gzip");
                     seen.lock()
                         .unwrap()
                         .push(header.trim().to_ascii_lowercase());
                 }
-                // A watch would be answered uncompressed by a real apiserver;
-                // this mock only has to serve the list the watcher opens with.
                 if request_line.contains("watch=true") {
-                    std::future::pending::<()>().await;
+                    let encoding = if gzip {
+                        "content-encoding: gzip\r\n"
+                    } else {
+                        ""
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n{encoding}\r\n"
+                    );
+                    w.write_all(head.as_bytes()).await.unwrap();
+                    let Some(mut rx) = frames.lock().await.take() else {
+                        std::future::pending::<()>().await;
+                        return;
+                    };
+                    while let Some(frame) = rx.recv().await {
+                        let mut body = format!("{frame}\n").into_bytes();
+                        if gzip {
+                            let mut enc = flate2::write::GzEncoder::new(
+                                Vec::new(),
+                                flate2::Compression::fast(),
+                            );
+                            enc.write_all(&body).unwrap();
+                            body = enc.finish().unwrap();
+                        }
+                        if w.write_all(format!("{:x}\r\n", body.len()).as_bytes())
+                            .await
+                            .is_err()
+                            || w.write_all(&body).await.is_err()
+                            || w.write_all(b"\r\n").await.is_err()
+                        {
+                            return;
+                        }
+                        w.flush().await.unwrap();
+                    }
+                    let _ = w.write_all(b"0\r\n\r\n").await;
+                    return;
                 }
                 let mut enc =
                     flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -335,7 +371,7 @@ async fn mock_gzip_api() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
             });
         }
     });
-    (format!("http://{addr}"), headers)
+    (format!("http://{addr}"), headers, frame_tx)
 }
 
 /// A `Cluster` whose client talks to `url` instead of a real API server.
@@ -345,7 +381,7 @@ fn mock_cluster(url: &str) -> Cluster {
     // this test is about the app's fallback, not the client's retries.
     config.default_retry = false;
     let mut cluster = Cluster::fake();
-    cluster.client = Client::try_from(config).expect("mock client");
+    cluster.client = crate::k8s::build_client(config).expect("mock client");
     cluster.cluster_url = url.into();
     cluster
 }
@@ -506,14 +542,10 @@ async fn node_pods_backs_off_when_the_initial_list_keeps_failing() {
     );
 }
 
-/// Compression is transparent: the `gzip` cargo feature is the only change, and
-/// it has to survive a dependency bump that reshuffles kube's client stack.
-/// Both halves are checked — the request advertises gzip, and a gzip-encoded
-/// body is inflated before deserialization. Without the feature the second
-/// assertion fails first, because serde is handed the raw deflate stream.
+/// List requests still negotiate and decode gzip through the production client.
 #[tokio::test]
 async fn the_client_negotiates_and_inflates_gzip() {
-    let (url, headers) = mock_gzip_api().await;
+    let (url, headers, _frames) = mock_gzip_api().await;
     let (tx, mut rx) = mpsc::channel(1024);
     let mut app = App::new(mock_cluster(&url), tx);
 
@@ -526,6 +558,78 @@ async fn the_client_negotiates_and_inflates_gzip() {
     assert!(
         seen.iter().any(|h| h == "accept-encoding: gzip"),
         "client did not ask for gzip; headers: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn refresh_keeps_pod_updates_and_deletes_working_with_gzip_available() {
+    let (url, headers, frames) = mock_gzip_api().await;
+    let (tx, mut rx) = mpsc::channel(1024);
+    let mut app = App::new(mock_cluster(&url), tx);
+    app.kind = app.cluster.resolve("pods");
+    app.kind_plural = "pods".into();
+    app.namespace = "default".into();
+    app.handle_key(press(KeyCode::Char('r'))).unwrap();
+
+    let mut pod = json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": "a", "namespace": "default", "resourceVersion": "1"},
+        "status": {"phase": "Pending"}
+    });
+    let bookmark = json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"resourceVersion": "1", "annotations": {"k8s.io/initial-events-end": "true"}}
+    });
+    for (event, object) in [
+        ("ADDED", pod.clone()),
+        ("BOOKMARK", bookmark),
+        ("MODIFIED", {
+            pod["metadata"]["resourceVersion"] = json!("2");
+            pod["status"]["phase"] = json!("Running");
+            pod.clone()
+        }),
+        ("DELETED", pod),
+    ] {
+        frames
+            .send(json!({"type": event, "object": object}).to_string())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let msg = rx.recv().await.expect("watch channel closed");
+                if let Msg::Error { error, .. } = &msg {
+                    panic!("watch failed: {error}");
+                }
+                let received = matches!(
+                    (&msg, event),
+                    (Msg::Applied { .. }, "ADDED" | "MODIFIED")
+                        | (Msg::Synced { .. }, "BOOKMARK")
+                        | (Msg::Deleted { .. }, "DELETED")
+                );
+                app.handle_msg(msg);
+                if received {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("watch event timeout");
+        match event {
+            "ADDED" => assert!(app.store.get("default/a").is_some()),
+            "MODIFIED" => assert_eq!(
+                app.store.get("default/a").unwrap().data["status"]["phase"],
+                "Running"
+            ),
+            "DELETED" => assert!(app.store.get("default/a").is_none()),
+            _ => {}
+        }
+    }
+    assert!(
+        headers
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|h| h == "accept-encoding: identity")
     );
 }
 
@@ -1644,6 +1748,183 @@ fn forward_context_matching_and_validation() {
     assert!(warnings.iter().any(|w| w.contains("empty name")));
     assert!(warnings.iter().any(|w| w.contains("not LOCAL:REMOTE")));
     assert!(warnings.iter().any(|w| w.contains("duplicate name")));
+}
+
+#[tokio::test]
+async fn pod_status_changes_keep_column_positions_stable() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for width in [80, 120, 180] {
+        let (mut app, _rx) = test_app();
+        app.handle_key(press(KeyCode::Char(':'))).unwrap();
+        for c in "pods".chars() {
+            app.handle_key(press(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.kind_plural, "pods");
+
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        let mut initial_columns = None;
+        for status in [
+            "Pending",
+            "ContainerCreating",
+            "Running",
+            "CrashLoopBackOff",
+            "CreateContainerConfigError",
+            "Running",
+        ] {
+            let state = if status == "Running" {
+                json!({"running": {}})
+            } else {
+                json!({"waiting": {"reason": status}})
+            };
+            apply(
+                &mut app,
+                json!({
+                    "apiVersion": "v1", "kind": "Pod",
+                    "metadata": {"name": "example", "namespace": "default"},
+                    "status": {
+                        "phase": "Running",
+                        "containerStatuses": [{
+                            "ready": status == "Running", "restartCount": 0,
+                            "state": state
+                        }]
+                    }
+                }),
+            );
+            terminal
+                .draw(|frame| crate::ui::draw(frame, &mut app))
+                .unwrap();
+            let hit = app.table_hit.borrow().clone().unwrap();
+            let status_index = app
+                .display_headers()
+                .iter()
+                .position(|header| header == "STATUS")
+                .unwrap();
+            let &(start, end, _) = hit
+                .cols
+                .iter()
+                .find(|(_, _, index)| *index == status_index)
+                .unwrap();
+            assert_eq!(end - start, 26, "status width at terminal width {width}");
+            let status_cell: String = (start..end)
+                .map(|x| terminal.backend().buffer()[(x, hit.rows_y)].symbol())
+                .collect();
+            assert_eq!(status_cell.trim(), status);
+            if let Some(ref columns) = initial_columns {
+                assert_eq!(&hit.cols, columns, "columns moved for {status} at {width}");
+            } else {
+                initial_columns = Some(hit.cols);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn scrolling_pods_keeps_column_positions_stable() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for (width, height) in [(80, 24), (120, 32), (180, 48), (220, 52)] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("pods");
+        app.namespace.clear();
+        for i in 0..90 {
+            let namespace = if i == 0 { "a-long-namespace" } else { "z" };
+            let name = if i == 89 {
+                "pod-89-with-a-much-longer-name-than-the-other-pods".to_string()
+            } else {
+                format!("pod-{i:02}")
+            };
+            apply(
+                &mut app,
+                json!({
+                    "apiVersion": "v1", "kind": "Pod",
+                    "metadata": {"name": name, "namespace": namespace},
+                    "status": {"phase": "Running"}
+                }),
+            );
+        }
+        app.handle_key(press(KeyCode::Home)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let initial = app.table_hit.borrow().clone().unwrap();
+        let header = |terminal: &Terminal<TestBackend>| -> String {
+            (0..width)
+                .map(|x| terminal.backend().buffer()[(x, initial.header_y)].symbol())
+                .collect()
+        };
+        let initial_header = header(&terminal);
+
+        for key in [KeyCode::Down, KeyCode::Up] {
+            for _ in 0..89 {
+                app.handle_key(press(key)).unwrap();
+                terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+                assert_eq!(
+                    app.table_hit.borrow().as_ref().unwrap().cols,
+                    initial.cols,
+                    "columns moved at {width}x{height}, offset {}",
+                    app.table_state.offset()
+                );
+                assert_eq!(header(&terminal), initial_header);
+            }
+            if key == KeyCode::Down {
+                assert!(app.table_state.offset() > 0);
+                assert_eq!(app.table_state.selected(), Some(89));
+            }
+        }
+        assert_eq!(app.table_state.offset(), 0);
+    }
+}
+
+#[tokio::test]
+async fn table_widths_follow_offscreen_updates_filters_and_view_changes() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let pod = |i: usize, node: &str| {
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": format!("pod-{i:02}"), "namespace": "default"},
+            "spec": {"nodeName": node},
+            "status": {"phase": "Running"}
+        })
+    };
+    for i in 0..40 {
+        apply(&mut app, pod(i, "node"));
+    }
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(180, 24)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let initial = app.table_hit.borrow().clone().unwrap().cols;
+
+    apply(
+        &mut app,
+        pod(39, "node-with-a-much-longer-name-outside-the-viewport"),
+    );
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let updated = app.table_hit.borrow().clone().unwrap().cols;
+    assert_ne!(updated, initial, "an updated row must change the widths");
+    app.handle_key(press(KeyCode::End)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.table_hit.borrow().as_ref().unwrap().cols, updated);
+
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "pod-00".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.row_count(), 1);
+    assert_eq!(app.table_hit.borrow().as_ref().unwrap().cols, initial);
+
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert!(!app.display_headers().iter().any(|h| h == "NODE"));
+    assert_eq!(
+        app.table_hit.borrow().as_ref().unwrap().cols.len(),
+        app.display_headers().len()
+    );
 }
 
 #[tokio::test]

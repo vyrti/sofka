@@ -3,11 +3,23 @@
 A plugin package adds an external tool to sofka.
 The package contains a manifest and, if necessary, an adapter.
 An adapter is a program that changes tool output into a sofka report.
-The adapter can use any programming language.
+The plugin protocol supports adapters in any programming language.
 
 sofka supplies resource data, process control, output limits, and report display.
 The package supplies tool commands and result interpretation.
 A new package does not require changes to sofka's Rust code.
+
+## Language choice
+
+For core plugins maintained and shipped by the sofka project, prefer Rust.
+This keeps the implementation consistent with sofka and reduces the need for extra language runtimes.
+Rust is a preference, not a requirement of the plugin protocol.
+
+External plugins can use any programming language.
+They must follow the same manifest, request, report, and execution rules.
+
+The Python example below shows how to use the protocol.
+It does not set the language preference for core plugins.
 
 ## Terms
 
