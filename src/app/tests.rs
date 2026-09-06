@@ -9604,6 +9604,50 @@ async fn palette_query_scopes_first_watch_and_supports_history() {
     assert!(!app.filter_server_side());
 }
 
+/// Deferred navigations are mutually exclusive: a bookmark, workspace or
+/// palette query that starts a context switch owns what lands when it
+/// completes, and must not leave an earlier one armed to fire later.
+#[tokio::test]
+async fn a_deferred_navigation_disarms_the_one_it_replaces() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("deployments");
+    let land = |app: &mut App, ctx: &str| {
+        let mut cluster = Cluster::fake();
+        cluster.context = ctx.into();
+        app.handle_msg(Msg::ContextSwitched {
+            generation: app.generation,
+            name: ctx.into(),
+            result: Ok(Box::new(cluster)),
+        });
+    };
+
+    // A bookmark for another context defers behind an async switch.
+    app.apply_bookmark(crate::config::Bookmark {
+        name: "svc".into(),
+        resource: "services".into(),
+        context: Some("west".into()),
+        ..Default::default()
+    });
+    assert!(app.pending_bookmark.is_some());
+
+    // Before it lands, the user asks for something else somewhere else.
+    type_resource_query(&mut app, "pods -n prod --context east /-l app=api");
+    assert!(
+        app.pending_bookmark.is_none(),
+        "displaced bookmark stays armed"
+    );
+    assert!(app.pending_resource_query.is_some());
+
+    land(&mut app, "east");
+    assert_eq!(app.kind_plural, "pods");
+    assert_eq!(app.applied_filter_labels.as_deref(), Some("app=api"));
+
+    // A later, unrelated switch must not resurrect the displaced bookmark.
+    app.switch_context("west".into());
+    land(&mut app, "west");
+    assert_eq!(app.kind_plural, "pods");
+}
+
 #[tokio::test]
 async fn palette_query_waits_for_context_and_rejects_invalid_input() {
     let (mut app, _rx) = test_app();

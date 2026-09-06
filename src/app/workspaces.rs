@@ -51,8 +51,8 @@ impl App {
         if let Some(ctx) = ws.context.clone()
             && ctx != self.cluster.context
         {
-            self.pending_workspace = Some(ws);
             self.switch_context(ctx);
+            self.pending_workspace = Some(ws);
             return;
         }
         self.start_workspace(ws);

@@ -37,8 +37,8 @@ impl App {
         if let Some(ctx) = bm.context.clone()
             && ctx != self.cluster.context
         {
-            self.pending_bookmark = Some(bm);
             self.switch_context(ctx);
+            self.pending_bookmark = Some(bm);
             return;
         }
         self.apply_bookmark_local(bm);
