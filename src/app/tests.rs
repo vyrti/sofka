@@ -9604,6 +9604,44 @@ async fn palette_query_scopes_first_watch_and_supports_history() {
     assert!(!app.filter_server_side());
 }
 
+/// Land an async context switch the way `Msg::ContextSwitched` does.
+fn land_context(app: &mut App, name: &str) {
+    let mut cluster = Cluster::fake();
+    cluster.context = name.into();
+    app.handle_msg(Msg::ContextSwitched {
+        generation: app.generation,
+        name: name.into(),
+        result: Ok(Box::new(cluster)),
+    });
+}
+
+/// Choose `name` in the context switcher, through the switcher's own keys.
+fn pick_context(app: &mut App, name: &str) {
+    let mut list = vec![app.cluster.context.clone(), name.to_string()];
+    list.sort();
+    list.dedup();
+    app.mode = Mode::Contexts;
+    app.handle_msg(Msg::Contexts {
+        generation: app.generation,
+        list,
+    });
+    for c in name.chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+}
+
+/// A bookmark on a chord, so `handle_key` is what triggers it.
+fn bind_bookmark(app: &mut App, resource: &str, context: &str) {
+    app.bookmarks = vec![crate::config::Bookmark {
+        key: Some("ctrl-y".into()),
+        name: "bm".into(),
+        resource: resource.into(),
+        context: Some(context.into()),
+        ..Default::default()
+    }];
+}
+
 /// The no-op branch of a context re-select starts no switch, so it must not
 /// disarm a navigation that an in-flight one still owns.
 #[tokio::test]
@@ -9611,28 +9649,24 @@ async fn a_noop_context_reselect_keeps_an_inflight_navigation() {
     let (mut app, _rx) = test_app();
     app.switch_kind("deployments");
     let home = app.cluster.context.clone();
-    app.apply_bookmark(crate::config::Bookmark {
-        name: "svc".into(),
-        resource: "services".into(),
-        context: Some("west".into()),
-        ..Default::default()
-    });
+    bind_bookmark(&mut app, "services", "west");
+
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
+    assert!(
+        app.pending_bookmark.is_some(),
+        "chord did not arm the bookmark"
+    );
     let inflight = app.generation;
 
     // Re-selecting the context we are already on does nothing at all.
-    app.switch_context(home);
+    pick_context(&mut app, &home);
+    assert_eq!(app.generation, inflight);
     assert!(
         app.pending_bookmark.is_some(),
         "in-flight bookmark disarmed"
     );
 
-    let mut cluster = Cluster::fake();
-    cluster.context = "west".into();
-    app.handle_msg(Msg::ContextSwitched {
-        generation: inflight,
-        name: "west".into(),
-        result: Ok(Box::new(cluster)),
-    });
+    land_context(&mut app, "west");
     assert_eq!(app.kind_plural, "services");
 }
 
@@ -9643,23 +9677,10 @@ async fn a_noop_context_reselect_keeps_an_inflight_navigation() {
 async fn a_deferred_navigation_disarms_the_one_it_replaces() {
     let (mut app, _rx) = test_app();
     app.switch_kind("deployments");
-    let land = |app: &mut App, ctx: &str| {
-        let mut cluster = Cluster::fake();
-        cluster.context = ctx.into();
-        app.handle_msg(Msg::ContextSwitched {
-            generation: app.generation,
-            name: ctx.into(),
-            result: Ok(Box::new(cluster)),
-        });
-    };
+    bind_bookmark(&mut app, "services", "west");
 
-    // A bookmark for another context defers behind an async switch.
-    app.apply_bookmark(crate::config::Bookmark {
-        name: "svc".into(),
-        resource: "services".into(),
-        context: Some("west".into()),
-        ..Default::default()
-    });
+    // The bookmark defers behind an async switch to its own context.
+    app.handle_key(ctrl(KeyCode::Char('y'))).unwrap();
     assert!(app.pending_bookmark.is_some());
 
     // Before it lands, the user asks for something else somewhere else.
@@ -9670,14 +9691,18 @@ async fn a_deferred_navigation_disarms_the_one_it_replaces() {
     );
     assert!(app.pending_resource_query.is_some());
 
-    land(&mut app, "east");
+    land_context(&mut app, "east");
     assert_eq!(app.kind_plural, "pods");
     assert_eq!(app.applied_filter_labels.as_deref(), Some("app=api"));
 
     // A later, unrelated switch must not resurrect the displaced bookmark.
-    app.switch_context("west".into());
-    land(&mut app, "west");
-    assert_eq!(app.kind_plural, "pods");
+    pick_context(&mut app, "west");
+    land_context(&mut app, "west");
+    assert!(app.pending_bookmark.is_none());
+    assert_ne!(
+        app.kind_plural, "services",
+        "stale bookmark fired on a later switch"
+    );
 }
 
 #[tokio::test]
