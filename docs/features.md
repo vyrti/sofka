@@ -79,7 +79,8 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   taken in order: one that declares HTTP wins (`appProtocol` or a port name
   like `http` or `http-web`), then a conventional HTTP port number, then any
   port that does not declare a non-HTTP protocol such as `grpc`. `port=N`
-  overrides the ranking, and must name a port the object actually declares.
+  overrides the ranking, and must name a port the object actually declares; a
+  run that gets no HTTP response back says so, and points at `port=N`.
   Availability is checked at startup and rescanned by `:reload`.
 - **Live CPU and MEM columns** for pods and nodes from the metrics API, colored
   on unusual values. Nodes also get **%CPU and %MEM of allocatable**

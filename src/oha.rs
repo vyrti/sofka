@@ -1068,10 +1068,9 @@ fn parse_reader(reader: impl Read, header: &Header) -> Result<ReportView, String
 }
 
 fn format_report(envelope: Envelope, header: &Header) -> ReportView {
-    let requests = envelope
-        .status_codes
-        .total
-        .saturating_add(envelope.errors.total);
+    // Status codes are the only proof anything spoke HTTP back.
+    let responded = envelope.status_codes.total;
+    let requests = responded.saturating_add(envelope.errors.total);
     // A run with no completed requests reports no rate; downstream formatting
     // (the title and the status flash) needs a real number, not NaN.
     let rps = if envelope.summary.requests_per_sec.is_finite() {
@@ -1118,6 +1117,17 @@ fn format_report(envelope: Envelope, header: &Header) -> ReportView {
 
     render_distribution(&mut lines, "Status codes", envelope.status_codes);
     render_distribution(&mut lines, "Errors", envelope.errors);
+
+    // Not one HTTP response is the shape a wrong port takes. Reachability
+    // proves only that something is listening, never that it speaks HTTP, so
+    // on a multi-port object this is the likeliest explanation — and the one
+    // the reader cannot infer from a report full of connection errors.
+    if responded == 0 {
+        lines.push_static("Hint");
+        lines.push_static("  Nothing answered HTTP. If this object exposes more than one port,");
+        lines.push_static("  the one benchmarked may not be its HTTP endpoint — name it with");
+        lines.push_static("  `:oha port=N`.");
+    }
 
     let truncated = lines.truncated;
     ReportView {
@@ -1287,6 +1297,9 @@ mod tests {
         assert!(body.contains("p99:         -"), "{body}");
         assert!(body.contains("average:     -"), "{body}");
         assert!(body.contains("aborted due to deadline: 5"), "{body}");
+        // Nothing spoke HTTP back, so the report says what that usually means.
+        assert!(body.contains("Nothing answered HTTP"), "{body}");
+        assert!(body.contains(":oha port=N"), "{body}");
     }
 
     #[test]
@@ -1728,6 +1741,30 @@ mod tests {
         let report = parse_reader(json.as_bytes(), &header()).unwrap();
         assert!(!report.lines.iter().any(|l| l == "Errors"));
         assert_eq!(report.requests, 5);
+    }
+
+    #[test]
+    fn a_run_that_got_real_responses_is_not_second_guessed() {
+        // Even an all-5xx run answered HTTP, so the port was right and the
+        // hint would only mislead.
+        let json = r#"{"summary":{"successRate":0.0},"statusCodeDistribution":{"503":12},"errorDistribution":{}}"#;
+        let report = parse_reader(json.as_bytes(), &header()).unwrap();
+        assert_eq!(report.requests, 12);
+        assert!(
+            !report.lines.iter().any(|l| l == "Hint"),
+            "{:?}",
+            report.lines
+        );
+    }
+
+    #[test]
+    fn a_run_with_only_transport_errors_is_hinted() {
+        let json = r#"{"summary":{"successRate":0.0},"statusCodeDistribution":{},"errorDistribution":{"invalid HTTP version parsed":40}}"#;
+        let report = parse_reader(json.as_bytes(), &header()).unwrap();
+        assert_eq!(report.requests, 40);
+        let body = report.lines.join("\n");
+        assert!(body.contains("invalid HTTP version parsed: 40"), "{body}");
+        assert!(body.contains("Nothing answered HTTP"), "{body}");
     }
 
     #[test]
