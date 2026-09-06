@@ -798,6 +798,21 @@ impl App {
     }
 
     pub fn handle_msg(&mut self, msg: Msg) {
+        let preserve_selection = self.faults_filter_active()
+            && matches!(
+                &msg,
+                Msg::Applied { generation, .. }
+                    | Msg::Deleted { generation, .. }
+                    | Msg::Reset { generation }
+                    | Msg::Synced { generation }
+                    if *generation == self.generation
+            );
+        let selected_pod = if preserve_selection {
+            self.selected_ref()
+                .map(|o| (crate::store::row_key(o), o.metadata.uid.clone()))
+        } else {
+            None
+        };
         match msg {
             Msg::Reset { generation } if generation == self.generation => {
                 // With rows on screen (cached snapshot or established watch)
@@ -1291,6 +1306,20 @@ impl App {
                 }
             },
             _ => {} // stale generation, drop
+        }
+        if preserve_selection {
+            let index = selected_pod.and_then(|(key, uid)| {
+                self.ensure_rows_cache();
+                if self.store.get(&key)?.metadata.uid != uid {
+                    return None;
+                }
+                self.rows_cache
+                    .borrow()
+                    .keys
+                    .iter()
+                    .position(|k| k.as_ref() == key)
+            });
+            self.table_state.select(index);
         }
     }
 }

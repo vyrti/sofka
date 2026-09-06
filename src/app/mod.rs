@@ -1555,12 +1555,12 @@ pub struct App {
     /// `None` for the natural namespace/name order.
     pub sort_column: Option<usize>,
     pub sort_desc: bool,
-    /// Horizontal column scroll: how many columns after the anchored
-    /// NAMESPACE/NAME prefix are hidden off the left edge (←/→ in the
-    /// table). Clamped by `draw_table`, since the header set can change
-    /// underneath it; reset when the view spec is rebuilt.
+    /// Horizontal offset in terminal cells after NAMESPACE/NAME.
+    /// The renderer clamps this when the viewport or columns change.
     pub col_offset: usize,
+    pub col_scroll_max: usize,
     pub filter: String,
+    pub faults_only: bool,
     /// Parsed form of `filter`, refreshed lazily when the string changes so
     /// neither row matching nor rendering reparses it per frame.
     filter_cache: RefCell<FilterCache>,
@@ -1940,7 +1940,9 @@ impl App {
             sort_column: None,
             sort_desc: false,
             col_offset: 0,
+            col_scroll_max: 0,
             filter: String::new(),
+            faults_only: false,
             filter_cache: RefCell::new(FilterCache {
                 raw: String::new(),
                 parsed: crate::filter::parse(""),
@@ -2143,7 +2145,7 @@ mod explain;
 mod find;
 mod fleet;
 mod gitops;
-mod guardrails;
+pub(crate) mod guardrails;
 mod helpers;
 mod input;
 mod journal;

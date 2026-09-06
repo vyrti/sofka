@@ -51,7 +51,14 @@ a warning in the app - they never take down the TUI.
 
 Custom columns also overlay sofka's curated core-resource views. Pods already
 show `IP` and `NODE` after toggling wide mode with `w`, and nodes always show
-`VERSION`. Extra node topology and provisioning details can come from labels:
+`VERSION`. Press `w` in the nodes view to show `LABELS` as comma-separated
+`key=value` pairs in key order. Nodes without labels show `<none>`.
+Use `/` to find text in the visible labels. To filter by an exact label, press
+`/`, enter `-l karpenter.sh/nodepool=default`, then press Enter. Label selectors
+also work with wide mode off. Use the label key and value for your cluster.
+
+Custom columns can show individual labels or annotations. Extra node topology
+and provisioning details can come from labels:
 
 ```toml
 # Karpenter example; adjust provider-specific NODEPOOL and TYPE label names.

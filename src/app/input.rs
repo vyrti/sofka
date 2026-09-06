@@ -59,6 +59,22 @@ impl App {
                     self.start_watch();
                     return Ok(());
                 }
+                KeyCode::Char('z')
+                    if self.mode == Mode::Table
+                        && self.kind_plural == "pods"
+                        && key.modifiers == KeyModifiers::CONTROL =>
+                {
+                    if self.try_bookmark_key(key)
+                        || self.try_workspace_key(key)
+                        || self.try_plugin_key(key)
+                    {
+                        return Ok(());
+                    }
+                    self.faults_only = !self.faults_only;
+                    self.invalidate_rows();
+                    self.table_state.select(Some(0));
+                    return Ok(());
+                }
                 KeyCode::Char('f')
                     if self.mode == Mode::Table && key.modifiers == KeyModifiers::CONTROL =>
                 {
@@ -201,9 +217,7 @@ impl App {
             }
             KeyCode::PageDown => self.move_page(1),
             KeyCode::PageUp => self.move_page(-1),
-            // Horizontal column scroll for narrow panes: the NAMESPACE/NAME
-            // prefix stays anchored, → hides the next column after it, ←
-            // brings one back.
+            // Move the viewport; keep NAMESPACE/NAME in place.
             KeyCode::Right => self.scroll_columns(1),
             KeyCode::Left => self.scroll_columns(-1),
             // k9s: SPACE marks/unmarks the current row for bulk actions, then

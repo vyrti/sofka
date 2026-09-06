@@ -160,14 +160,7 @@ pub fn read_package(dir: &Path) -> Result<Plugin, String> {
     if bytes.len() > MAX_BYTES {
         return Err("manifest exceeds 1 MiB".into());
     }
-    let manifest: Manifest =
-        toml::from_str(std::str::from_utf8(&bytes).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-    if manifest.schema_version != 1 {
-        return Err("unsupported schema_version (expected 1)".into());
-    }
-    let mut plugin = manifest.plugin;
-    validate_plugin(&plugin)?;
+    let mut plugin = parse_manifest(std::str::from_utf8(&bytes).map_err(|e| e.to_string())?)?;
     if plugin.command.starts_with("./") {
         let command = dir
             .join(&plugin.command)
@@ -188,6 +181,40 @@ pub fn read_package(dir: &Path) -> Result<Plugin, String> {
     }
     plugin.package_dir = Some(dir);
     Ok(plugin)
+}
+
+/// Parse and validate a `plugin.toml`, wherever it came from.
+pub fn parse_manifest(text: &str) -> Result<Plugin, String> {
+    let manifest: Manifest = toml::from_str(text).map_err(|e| e.to_string())?;
+    if manifest.schema_version != 1 {
+        return Err("unsupported schema_version (expected 1)".into());
+    }
+    validate_plugin(&manifest.plugin)?;
+    Ok(manifest.plugin)
+}
+
+/// The manifest of every package sofka ships. Kept as real files under
+/// `plugins/` so `--validate-plugin` covers them like any other package.
+const BUNDLED: &[(&str, &str)] = &[("sanitize", include_str!("../plugins/sanitize/plugin.toml"))];
+
+/// The packages sofka ships, with `command` pointed at the running executable.
+/// The adapters live in this binary, so a normal install has nothing to copy
+/// and needs no extra language runtime on PATH.
+pub fn bundled() -> Vec<Result<Plugin, String>> {
+    let exe = std::env::current_exe();
+    BUNDLED
+        .iter()
+        .map(|(name, text)| {
+            let mut plugin = parse_manifest(text).map_err(|e| format!("bundled {name}: {e}"))?;
+            let exe = exe
+                .as_ref()
+                .map_err(|e| format!("bundled {name}: locating the sofka binary: {e}"))?;
+            plugin.command = exe.to_string_lossy().into_owned();
+            plugin.requires = vec![plugin.command.clone()];
+            plugin.bundled = true;
+            Ok(plugin)
+        })
+        .collect()
 }
 
 pub fn validate_plugin(plugin: &Plugin) -> Result<(), String> {

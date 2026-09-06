@@ -807,6 +807,10 @@ pub struct Plugin {
     pub port_forward: Option<String>,
     #[serde(skip)]
     pub package_dir: Option<PathBuf>,
+    /// Set for a package sofka ships, whose adapter is this binary. Such a
+    /// plugin speaks the request/report protocol without a package directory.
+    #[serde(skip)]
+    pub bundled: bool,
     pub name: String,
     pub command: String,
     #[serde(default)]
@@ -1237,6 +1241,20 @@ impl ConfigLoader {
         });
         if let Some(dir) = &self.dir {
             crate::plugins::load_packages(&dir.join("plugins"), &mut config.plugins, &mut warnings);
+        }
+        // Last, so an inline entry or a user package of the same name wins and
+        // a user can replace a shipped plugin without editing sofka.
+        for bundled in crate::plugins::bundled() {
+            match bundled {
+                Ok(p) => {
+                    if !config.plugins.iter().any(|old| {
+                        old.name == p.name || (p.palette.is_some() && old.palette == p.palette)
+                    }) {
+                        config.plugins.push(p);
+                    }
+                }
+                Err(e) => warnings.push(e),
+            }
         }
         let skin_override = overlay
             .get("skin")
