@@ -195,7 +195,9 @@ API request latency
 
 `watch` is time to response headers - the stream itself stays open for the life
 of the view. Percentiles are bucket upper bounds (powers of two), so read them
-as "at most"; `AVG` and `MAX` are exact.
+as "at most"; `AVG` and `MAX` are exact. `ERRORS` includes requests canceled
+before response headers (for example by a timeout), transport failures, and 5xx
+responses. A 4xx response is not counted as a latency error.
 
 ### Structured logging
 

@@ -96,20 +96,28 @@ where
             method = request.method(),
             path = path
         );
-        Metered {
-            inner: self.inner.call(request),
-            op,
-            start: Instant::now(),
-        }
+        Metered::new(self.inner.call(request), op)
     }
 }
 
-/// The in-flight half of [`Meter`]: records the elapsed time once, when the
-/// response (or the error) arrives.
+/// The in-flight half of [`Meter`]: records the elapsed time once, either when
+/// the response arrives or when its caller cancels the request.
 struct Metered<F> {
     inner: F,
     op: Op,
     start: Instant,
+    completed: bool,
+}
+
+impl<F> Metered<F> {
+    fn new(inner: F, op: Op) -> Self {
+        Self {
+            inner,
+            op,
+            start: Instant::now(),
+            completed: false,
+        }
+    }
 }
 
 impl<F, B, E> Future for Metered<F>
@@ -126,6 +134,7 @@ where
             Poll::Pending => return Poll::Pending,
             Poll::Ready(result) => result,
         };
+        this.completed = true;
         let elapsed = this.start.elapsed();
         let ok = result
             .as_ref()
@@ -146,6 +155,22 @@ where
             ),
         }
         Poll::Ready(result)
+    }
+}
+
+impl<F> Drop for Metered<F> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        let elapsed = self.start.elapsed();
+        crate::diagnostics::record(self.op, elapsed, false);
+        crate::log_warn!(
+            "request.cancelled",
+            op = self.op.as_str(),
+            ms = elapsed.as_millis()
+        );
     }
 }
 
@@ -732,23 +757,28 @@ fn current_context_name() -> Option<String> {
     kubeconfig.current_context
 }
 
-/// The current kubeconfig context, its cluster name, and API-server URL, read
-/// offline (no connection). For `--info`. `None` when there's no kubeconfig or
-/// no current context. The server URL never carries credentials.
-pub fn current_context_info() -> Option<(String, String, String)> {
-    let kubeconfig = kube::config::Kubeconfig::read().ok()?;
-    let context = kubeconfig.current_context.clone()?;
+/// A requested kubeconfig context (or the current one when none was requested),
+/// its cluster name, and API-server URL, read offline. For `sofka info` when no
+/// live connection is available. The server URL never carries credentials.
+pub fn context_info(requested: Option<&str>) -> Option<(String, String, String)> {
+    let kubeconfig = kube::config::Kubeconfig::read().ok();
+    context_info_from(kubeconfig.as_ref(), requested)
+}
+
+fn context_info_from(
+    kubeconfig: Option<&kube::config::Kubeconfig>,
+    requested: Option<&str>,
+) -> Option<(String, String, String)> {
+    let context = requested
+        .map(str::to_owned)
+        .or_else(|| kubeconfig.and_then(|config| config.current_context.clone()))?;
     let cluster_name = kubeconfig
-        .contexts
-        .iter()
-        .find(|c| c.name == context)
+        .and_then(|config| config.contexts.iter().find(|c| c.name == context))
         .and_then(|c| c.context.as_ref())
         .map(|c| c.cluster.clone())
         .unwrap_or_default();
     let server = kubeconfig
-        .clusters
-        .iter()
-        .find(|c| c.name == cluster_name)
+        .and_then(|config| config.clusters.iter().find(|c| c.name == cluster_name))
         .and_then(|c| c.cluster.as_ref())
         .and_then(|c| c.server.clone())
         .unwrap_or_default();
@@ -955,6 +985,88 @@ impl Cluster {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn exec_latency() -> (u64, u64, f64) {
+        crate::diagnostics::latency_summary()
+            .into_iter()
+            .find(|summary| summary.op == Op::Exec)
+            .map(|summary| (summary.count, summary.errors, summary.max_ms))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn meter_records_completed_and_cancelled_requests_once() {
+        let _guard = crate::diagnostics::LATENCY_TEST_LOCK.lock().unwrap();
+        let before = exec_latency();
+        let waker = futures_util::task::noop_waker_ref();
+        let mut cx = TaskContext::from_waker(waker);
+
+        let mut completed = Metered::new(
+            std::future::ready(Ok::<_, std::io::Error>(http::Response::new(()))),
+            Op::Exec,
+        );
+        assert!(matches!(
+            Pin::new(&mut completed).poll(&mut cx),
+            Poll::Ready(Ok(_))
+        ));
+        drop(completed);
+        let after_completed = exec_latency();
+        assert_eq!(after_completed.0, before.0 + 1);
+        assert_eq!(after_completed.1, before.1);
+
+        let mut cancelled = Metered::new(
+            std::future::pending::<Result<http::Response<()>, std::io::Error>>(),
+            Op::Exec,
+        );
+        assert!(Pin::new(&mut cancelled).poll(&mut cx).is_pending());
+        std::thread::sleep(Duration::from_millis(2));
+        drop(cancelled);
+        let after_cancelled = exec_latency();
+        assert_eq!(after_cancelled.0, after_completed.0 + 1);
+        assert_eq!(after_cancelled.1, after_completed.1 + 1);
+        assert!(after_cancelled.2 >= 1.0, "max {}", after_cancelled.2);
+    }
+
+    #[test]
+    fn offline_context_info_prefers_the_requested_context() {
+        let kubeconfig: Kubeconfig = serde_yaml::from_str(
+            r#"
+current-context: dev
+contexts:
+  - name: dev
+    context: { cluster: dev-cluster }
+  - name: prod
+    context: { cluster: prod-cluster }
+clusters:
+  - name: dev-cluster
+    cluster: { server: https://dev.example }
+  - name: prod-cluster
+    cluster: { server: https://prod.example }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            context_info_from(Some(&kubeconfig), Some("prod")),
+            Some((
+                "prod".into(),
+                "prod-cluster".into(),
+                "https://prod.example".into()
+            ))
+        );
+        assert_eq!(
+            context_info_from(Some(&kubeconfig), None),
+            Some((
+                "dev".into(),
+                "dev-cluster".into(),
+                "https://dev.example".into()
+            ))
+        );
+        assert_eq!(
+            context_info_from(None, Some("prod")),
+            Some(("prod".into(), String::new(), String::new()))
+        );
+    }
 
     #[test]
     fn expired_watch_errors_are_benign() {

@@ -668,7 +668,7 @@ async fn run_info(
             c.cluster_name.clone(),
             c.cluster_url.clone(),
         ),
-        None => k8s::current_context_info()
+        None => k8s::context_info(args.context.as_deref())
             .unwrap_or_else(|| ("(none)".into(), String::new(), String::new())),
     };
 

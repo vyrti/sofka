@@ -204,6 +204,9 @@ impl Stats {
 
 static STATS: [Stats; Op::ALL.len()] = [const { Stats::new() }; Op::ALL.len()];
 
+#[cfg(test)]
+pub(crate) static LATENCY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Record one completed request. Four relaxed atomic adds and a max — cheap
 /// enough to run unconditionally, so the numbers are there when someone asks
 /// for them rather than only after turning something on.
@@ -227,10 +230,10 @@ fn bucket(micros: u64) -> usize {
 pub struct OpSummary {
     pub op: Op,
     pub count: u64,
-    /// Transport failures and 5xx responses. A 4xx is the API server answering
-    /// correctly — a missing CRD, an RBAC denial — and the UI surfaces those
-    /// where they happen, so counting them here would make a healthy session
-    /// read as a broken one.
+    /// Requests canceled before response headers, transport failures, and 5xx
+    /// responses. A 4xx is the API server answering correctly — a missing CRD,
+    /// an RBAC denial — and the UI surfaces those where they happen, so counting
+    /// them here would make a healthy session read as a broken one.
     pub errors: u64,
     pub avg_ms: f64,
     /// Bucket upper bounds, so these read as "at most": exact percentiles
@@ -606,6 +609,7 @@ mod tests {
     // both reset it would race under the default parallel runner.
     #[test]
     fn summarises_recorded_latency() {
+        let _guard = LATENCY_TEST_LOCK.lock().unwrap();
         reset_latency();
         assert!(latency_lines().is_empty(), "no requests, no table");
         for _ in 0..8 {
