@@ -7881,6 +7881,100 @@ async fn debug_is_blocked_in_readonly_and_by_guardrail() {
 }
 
 #[tokio::test]
+async fn sanitize_ships_with_sofka_and_confirms_before_deleting() {
+    let (mut app, _rx) = app_with_pod();
+    // The package is registered from the binary, with no user configuration and
+    // nothing copied into the config directory.
+    app.plugins = crate::plugins::bundled()
+        .into_iter()
+        .map(|p| p.expect("bundled package parses"))
+        .collect();
+    let sanitize = app
+        .plugins
+        .iter()
+        .find(|p| p.palette.as_deref() == Some("sanitize"))
+        .expect(":sanitize is available out of the box");
+    assert!(sanitize.bundled);
+    assert!(sanitize.dangerous, "a bulk delete must confirm");
+    assert_eq!(sanitize.scopes, ["pods"]);
+    assert_eq!(sanitize.target.as_deref(), Some("context"));
+    // The adapter is this binary, so nothing extra has to be on PATH.
+    assert!(crate::plugins::available(sanitize).is_ok());
+
+    // Running it opens the confirmation instead of deleting anything.
+    plugin_command(&mut app, "sanitize");
+    assert_eq!(app.mode, Mode::Confirm);
+    assert!(app.pending.is_none(), "must not run before confirmation");
+    assert!(app.confirm_label.contains('⚠'), "{}", app.confirm_label);
+
+    // Declining leaves the cluster alone.
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.pending.is_none());
+}
+
+#[tokio::test]
+async fn a_guardrail_can_deny_sanitize() {
+    let (mut app, _rx) = app_with_pod();
+    app.plugins = crate::plugins::bundled()
+        .into_iter()
+        .map(|p| p.expect("bundled package parses"))
+        .collect();
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["plugin:sanitize".into()],
+        deny: true,
+        reason: Some("cleanup goes through the owning controller".into()),
+        ..Default::default()
+    }];
+
+    plugin_command(&mut app, "sanitize");
+    assert_ne!(
+        app.mode,
+        Mode::Confirm,
+        "a denied action must not even confirm"
+    );
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("blocked by guardrail"), "{}", app.flash);
+    assert!(app.flash.contains("owning controller"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn sanitize_checks_the_default_context_bulk_limit_before_confirmation() {
+    let (mut app, _rx) = app_with_pod();
+    app.cluster.context = "default".into();
+    app.plugins = crate::plugins::bundled()
+        .into_iter()
+        .map(|p| p.expect("bundled package parses"))
+        .collect();
+    app.guardrails = vec![crate::config::Guardrail {
+        contexts: vec!["default".into()],
+        actions: vec!["plugin:sanitize".into()],
+        max_bulk: Some(0),
+        ..Default::default()
+    }];
+
+    plugin_command(&mut app, "sanitize");
+    assert_ne!(app.mode, Mode::Confirm);
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("exceeds the max of 0"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn sanitize_is_blocked_in_readonly_mode() {
+    let (mut app, _rx) = app_with_pod();
+    app.readonly = true;
+    app.plugins = crate::plugins::bundled()
+        .into_iter()
+        .map(|p| p.expect("bundled package parses"))
+        .collect();
+
+    plugin_command(&mut app, "sanitize");
+    assert_ne!(app.mode, Mode::Confirm, "read-only must not even confirm");
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("read-only"), "{}", app.flash);
+}
+
+#[tokio::test]
 async fn readonly_gates_mutating_plugins_only() {
     let (mut app, _rx) = app_with_pod();
     app.readonly = true;
@@ -11226,7 +11320,8 @@ async fn plugin_package_reload_loads_valid_packages_and_isolates_invalid_ones() 
     let (mut app, mut rx) = test_app();
     app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
     plugin_command(&mut app, "reload");
-    assert_eq!(app.plugins.len(), 1);
+    // Bundled packages are always present; this counts the configured ones.
+    assert_eq!(app.plugins.iter().filter(|p| !p.bundled).count(), 1);
     assert!(app.config_warnings.iter().any(|w| w.contains("broken")));
     plugin_command(&mut app, "example-plugin");
     app.handle_msg(plugin_result(&mut rx).await);
@@ -11238,7 +11333,7 @@ async fn plugin_package_reload_loads_valid_packages_and_isolates_invalid_ones() 
     );
     std::fs::remove_file(package.join("plugin.toml")).unwrap();
     plugin_command(&mut app, "reload");
-    assert!(app.plugins.is_empty());
+    assert!(!app.plugins.iter().any(|p| !p.bundled));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -11429,7 +11524,11 @@ async fn check_unknown_inline_fields(location: &str) {
             app.user_aliases.get("pluginpods").map(String::as_str),
             Some("pods")
         );
-        assert_eq!(app.plugins.len(), 2, "{layer}: plugins were lost");
+        assert_eq!(
+            app.plugins.iter().filter(|p| !p.bundled).count(),
+            2,
+            "{layer}: plugins were lost"
+        );
         assert!(
             app.config_warnings.is_empty(),
             "{layer}: {:?}",

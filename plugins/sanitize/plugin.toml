@@ -1,0 +1,24 @@
+schema_version = 1
+
+[plugin]
+name = "Sanitize pods"
+palette = "sanitize"
+# Rewritten to the running executable when sofka registers this package, so a
+# normal install needs no adapter file and no extra language runtime.
+command = "sofka"
+args = ["--plugin-adapter", "sanitize"]
+scopes = ["pods"]
+target = "context"
+output = "report"
+mutating = true
+dangerous = true
+timeout = "2m"
+
+[plugin.inputs.states]
+type = "string"
+default = "terminal"
+choices = ["terminal", "stuck", "all"]
+
+[plugin.inputs.dry_run]
+type = "boolean"
+default = "false"

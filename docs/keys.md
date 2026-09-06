@@ -117,11 +117,13 @@ port-forward go through the kube API (or a backgrounded process) directly.
 
 ## Plugin commands
 
-| Command                      | Action                                                |
-| ---------------------------- | ----------------------------------------------------- |
-| `:<plugin> [name=value ...]` | Run a plugin with validated inputs.                   |
-| `:plugin-cancel`             | Stop the active plugin run and its temporary forward. |
+| Command                            | Action                                                       |
+| ---------------------------------- | ------------------------------------------------------------ |
+| `:<plugin> [name=value ...]`       | Run a plugin with validated inputs.                          |
+| `:plugin-cancel`                   | Stop the active plugin run and its temporary forward.        |
+| `:sanitize [states=…] [dry_run=…]` | Delete the pods the namespace has finished with (pods view). |
 
+`:sanitize` ships with sofka; see [Sanitize pods](../plugins/sanitize/README.md).
 Installed packages add their commands and key chords to `?` help.
 Use `:reload` after a package change.
 See [Create a plugin package](plugin-authoring.md).
