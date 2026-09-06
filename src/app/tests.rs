@@ -6139,6 +6139,121 @@ async fn narrow_window_keeps_full_external_ip_visible() {
 }
 
 #[tokio::test]
+async fn logs_wait_for_container_start() {
+    for reason in ["ContainerCreating", "PodInitializing", "ImagePullBackOff"] {
+        let (mut app, mut rx, requests) = waiting_logs_app(400, reason);
+        app.handle_key(press(KeyCode::Char('l'))).unwrap();
+        assert_eq!(app.mode, Mode::Logs);
+        let msg = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let msg = rx.recv().await.unwrap();
+                if matches!(msg, Msg::LogLines { .. }) {
+                    break msg;
+                }
+            }
+        })
+        .await
+        .expect("logs should start after the container starts");
+        app.handle_msg(msg);
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(app.logs.view.lines.iter().collect::<Vec<_>>(), ["started"]);
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn leaving_logs_stops_container_start_retries() {
+    let (mut app, _rx, requests) = waiting_logs_app(400, "ContainerCreating");
+    app.handle_key(press(KeyCode::Char('l'))).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while requests.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn logs_report_errors_other_than_container_waiting() {
+    for (code, message, key) in [
+        (403, "is waiting to start", 'l'),
+        (400, "invalid container", 'l'),
+        (400, "ContainerCreating", 'p'),
+    ] {
+        let (mut app, mut rx, requests) = waiting_logs_app(code, message);
+        app.handle_key(press(KeyCode::Char(key))).unwrap();
+        let msg = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let msg = rx.recv().await.unwrap();
+                if matches!(msg, Msg::LogLines { .. }) {
+                    break msg;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        app.handle_msg(msg);
+        assert!(app.logs.view.lines[0].starts_with("[error]"));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+    }
+}
+
+fn waiting_logs_app(code: u16, reason: &str) -> (App, Receiver<Msg>, Arc<AtomicU64>) {
+    let (mut app, rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "pending", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "test"}]},
+            "status": {"phase": "Pending"}}),
+    );
+    app.table_state.select(Some(0));
+    let requests = Arc::new(AtomicU64::new(0));
+    let seen = requests.clone();
+    let message = if code == 400 && reason != "invalid container" {
+        format!("container \"app\" in pod \"pending\" is waiting to start: {reason}")
+    } else {
+        reason.to_owned()
+    };
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            assert_eq!(
+                request.uri().path(),
+                "/api/v1/namespaces/default/pods/pending/log"
+            );
+            let attempt = seen.fetch_add(1, Ordering::SeqCst);
+            let (status, body) = if attempt < 2 {
+                (
+                    code,
+                    json!({"kind": "Status", "apiVersion": "v1",
+                    "status": "Failure", "message": message,
+                    "reason": "BadRequest", "code": code})
+                    .to_string(),
+                )
+            } else {
+                (200, "started\n".to_owned())
+            };
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .body(http_body_util::Full::new(hyper::body::Bytes::from(body)))
+                        .unwrap(),
+                )
+            }
+        }),
+        "default",
+    );
+    (app, rx, requests)
+}
+
+#[tokio::test]
 async fn logs_keep_view_and_restore_selection() {
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
