@@ -2002,49 +2002,190 @@ async fn mouse_click_selects_row_header_click_sorts_wheel_moves() {
 }
 
 #[tokio::test]
-async fn horizontal_column_scroll_anchors_name_and_clamps() {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
+async fn horizontal_scroll_keeps_names_and_moves_content_without_resizing() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for all_namespaces in [false, true] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("pods");
+        if all_namespaces {
+            app.namespace.clear();
+        }
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": "web", "namespace": "default"},
+                "spec": {"nodeName": "node-abcdefghijklmnopqrstuvwxyz-0123456789-long-value"},
+                "status": {"phase": "Running"}
+            }),
+        );
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        app.handle_key(press(KeyCode::Home)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(app.col_scroll_max > 5);
+        let initial = term.backend().buffer().clone();
+        let hit = app.table_hit.borrow().clone().unwrap();
+        let title = |term: &Terminal<TestBackend>| -> String {
+            (hit.x_min..hit.x_max)
+                .map(|x| term.backend().buffer()[(x, hit.header_y - 1)].symbol())
+                .collect()
+        };
+        assert!(title(&term).contains('→'));
+        assert!(!title(&term).contains('←'));
+        let anchored = usize::from(all_namespaces) + 1;
+        let frozen_end = hit.cols[anchored].0;
+        app.handle_key(press(KeyCode::Left)).unwrap();
+        assert_eq!(app.col_offset, 0);
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.col_offset, 5);
+        assert!(title(&term).contains('←'));
+        assert!(title(&term).contains('→'));
+        let moved = app.table_hit.borrow().clone().unwrap();
+        assert_eq!(&hit.cols[..anchored], &moved.cols[..anchored]);
+        for y in [hit.header_y, hit.rows_y] {
+            for x in hit.x_min..frozen_end {
+                assert_eq!(
+                    initial[(x, y)].symbol(),
+                    term.backend().buffer()[(x, y)].symbol()
+                );
+            }
+            for x in frozen_end..hit.x_max.saturating_sub(5) {
+                assert_eq!(
+                    initial[(x + 5, y)].symbol(),
+                    term.backend().buffer()[(x, y)].symbol()
+                );
+            }
+        }
+        app.handle_key(press(KeyCode::Left)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(term.backend().buffer(), &initial);
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let &(start, _, index) = moved.cols.last().unwrap();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: start,
+            row: moved.header_y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+        assert_eq!(app.sort_column, Some(index));
+        app.handle_key(press(KeyCode::Left)).unwrap();
+        assert_eq!(app.col_offset, 0);
+        for _ in 0..100 {
+            app.handle_key(press(KeyCode::Right)).unwrap();
+        }
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.col_offset, app.col_scroll_max);
+        assert_eq!(
+            app.table_hit
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .cols
+                .last()
+                .unwrap()
+                .2,
+            app.display_headers().len() - 1
+        );
+        assert!(title(&term).contains('←'));
+        assert!(!title(&term).contains('→'));
+        let at_end = app.col_offset;
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        assert_eq!(app.col_offset, at_end);
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        assert_eq!(app.col_offset, 0);
+    }
+}
+
+#[tokio::test]
+async fn horizontal_scroll_stops_when_columns_fit_and_resets_after_resize() {
+    use ratatui::{Terminal, backend::TestBackend};
 
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
+    let mut term = Terminal::new(TestBackend::new(180, 24)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.col_scroll_max, 0);
+    let before = term.backend().buffer().clone();
+    app.handle_key(press(KeyCode::Right)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.col_offset, 0);
+    assert_eq!(term.backend().buffer(), &before);
+
+    term.backend_mut().resize(45, 24);
+    term.autoresize().unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    app.handle_key(press(KeyCode::Right)).unwrap();
+    assert!(app.col_offset > 0);
+    term.backend_mut().resize(180, 24);
+    term.autoresize().unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.col_offset, 0);
+    assert_eq!(app.col_scroll_max, 0);
+}
+
+#[tokio::test]
+async fn horizontal_scroll_clips_wide_characters_at_both_edges() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [[views."cert-manager.io/v1/certificates".columns]]
+        name = "VALUE"
+        path = "/spec/value"
+        width = 40
+        align = "right"
+    "#,
+    );
+    app.switch_kind("certificates");
     apply(
         &mut app,
         json!({
-            "apiVersion": "v1", "kind": "Pod",
-            "metadata": {"name": "a", "namespace": "default"},
-            "status": {"phase": "Running"}
+            "apiVersion": "cert-manager.io/v1", "kind": "Certificate",
+            "metadata": {"name": "web", "namespace": "default"},
+            "spec": {"value": "界".repeat(20)}
         }),
     );
-    app.table_state.select(Some(0));
-
-    let headers = app.display_headers().to_vec();
-    assert_eq!(headers[0], "NAME");
-    let scrollable = headers.len() - 1;
-
-    // ← at the left edge is a no-op; → hides the column after NAME.
-    app.handle_key(press(KeyCode::Left)).unwrap();
-    assert_eq!(app.col_offset, 0);
-    app.handle_key(press(KeyCode::Right)).unwrap();
-    assert_eq!(app.col_offset, 1);
-
-    // → clamps so the last scrollable column stays visible.
-    for _ in 0..headers.len() {
-        app.handle_key(press(KeyCode::Right)).unwrap();
-    }
-    assert_eq!(app.col_offset, scrollable - 1);
-
-    // The rendered geometry skips the hidden columns: NAME (0) stays
-    // anchored, then only the last scrollable column follows.
-    let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(30, 24)).unwrap();
     term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
-    let hit = app.table_hit.borrow().clone().expect("geometry recorded");
-    let cols: Vec<usize> = hit.cols.iter().map(|&(_, _, i)| i).collect();
-    assert_eq!(cols, vec![0, headers.len() - 1]);
-
-    // Rebuilding the view spec (view switch, wide toggle) resets the scroll.
-    app.refresh_view_spec();
-    assert_eq!(app.col_offset, 0);
+    for _ in 0..4 {
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        let rendered = term
+            .draw(|f| crate::ui::draw(f, &mut app))
+            .unwrap()
+            .buffer
+            .clone();
+        let hit = app.table_hit.borrow().clone().unwrap();
+        let &(start, end, _) = hit.cols.iter().find(|c| c.2 == 1).unwrap();
+        for x in start..end {
+            let source = app.col_offset + usize::from(x - start);
+            let expected = if source.is_multiple_of(2) && x + 1 < end {
+                "界"
+            } else {
+                " "
+            };
+            assert_eq!(rendered[(x, hit.rows_y)].symbol(), expected);
+            // A terminal does not write the second half of a wide character.
+            if source.is_multiple_of(2) || x == start {
+                assert_eq!(term.backend().buffer()[(x, hit.rows_y)].symbol(), expected);
+            }
+        }
+    }
+    for width in [1, 2, 3, 4, 8] {
+        term.backend_mut().resize(width, 24);
+        term.autoresize().unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    }
 }
 
 #[tokio::test]

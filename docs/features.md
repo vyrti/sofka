@@ -18,7 +18,11 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   a NAME/AGE fallback for everything else. STATUS columns use a fixed width of
   26 characters so status changes do not move adjacent columns. A configured
   column width takes priority. Column widths use the full filtered list so
-  scrolling does not move the columns.
+  vertical scrolling does not move the columns.
+- **Horizontal scrolling** - Left and Right move the table by five text positions.
+  NAME and NAMESPACE stay fixed. Other columns keep their widths while you
+  scroll. Arrows in the title show where more content is available. When all
+  columns fit, Left and Right do nothing.
 - **Custom views** - define columns for any resource in the config file. An
   unknown custom resource picks up its CRD `additionalPrinterColumns`
   automatically. `w` toggles wide-only columns (kubectl `-o wide`), including
