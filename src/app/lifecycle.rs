@@ -266,6 +266,7 @@ impl App {
         };
         self.applied_filter_labels = filter_labels;
         self.applied_filter_fields = filter_fields;
+        self.stop_oha();
         self.clear_progress_flash();
         self.generation += 1;
         self.gen_flag.store(self.generation, Ordering::SeqCst);
@@ -782,6 +783,7 @@ impl App {
 
     pub(super) fn bump_generation(&mut self) {
         self.stop_event_stream();
+        self.stop_oha();
         self.clear_progress_flash();
         self.generation += 1;
         self.gen_flag.store(self.generation, Ordering::SeqCst);
@@ -1065,6 +1067,32 @@ impl App {
                         ),
                         true,
                     );
+                }
+            }
+            Msg::Oha {
+                generation,
+                run,
+                claim,
+                result,
+            } if generation == self.generation && run == self.oha_run => {
+                self.oha_task = None;
+                match result {
+                    Ok(report) => {
+                        let summary = format!(
+                            "oha: {} requests, {:.0} rps, {:.2}% ok",
+                            report.requests, report.requests_per_sec, report.success_rate
+                        );
+                        self.detail = Scrollable {
+                            title: report.title,
+                            lines: report.lines.into(),
+                            ..Default::default()
+                        };
+                        self.mode = Mode::Detail;
+                        self.set_claimed_status(claim, summary, false);
+                    }
+                    Err(error) => {
+                        self.set_claimed_status(claim, format!("oha failed: {error}"), true);
+                    }
                 }
             }
             Msg::DebuggersCleaned {

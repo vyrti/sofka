@@ -2135,6 +2135,15 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         bind(":q / ctrl-c", "quit"),
         bind("?", "global help — close to return to the previous screen"),
     ];
+    if app.oha_path.is_some() {
+        lines.insert(
+            10,
+            bind(
+                ":oha [dur] [conns]",
+                "benchmark the selected ingress/service/pod (optional oha CLI)",
+            ),
+        );
+    }
     // Config-defined plugins, with their (possibly modified) key chords.
     if !app.plugins.is_empty() {
         lines.push(Line::from(""));

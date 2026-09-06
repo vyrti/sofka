@@ -1408,6 +1408,10 @@ impl App {
     /// view. A reload that fails validation keeps the last known-good config
     /// active and reports the precise error (file, key, what's wrong) instead.
     pub(super) fn reload_config(&mut self) {
+        // Tool availability is independent of config validity. Always rescan
+        // first so a newly installed oha appears even if this config edit
+        // happens to be invalid.
+        self.rescan_oha();
         let loader = match self.config.reload() {
             Ok(l) => l,
             Err(e) => {

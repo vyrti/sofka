@@ -1473,6 +1473,308 @@ async fn saved_forwards_show_as_stopped_until_running() {
     assert_eq!(app.pf_state.selected(), Some(0), "clamped to combined list");
 }
 
+/// A fake oha that answers only for the exact argv the test expects, so a
+/// wrong URL, duration or connection count fails the run instead of passing.
+#[cfg(unix)]
+fn write_fake_oha(path: &std::path::Path, expected_args: &str, report: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = format!(
+        "#!/bin/sh\ncase \" $* \" in\n  \" {expected_args} \") printf '%s\\n' '{report}' ;;\n  *) echo \"wrong benchmark arguments: $*\" >&2; exit 9 ;;\nesac\n"
+    );
+    std::fs::write(path, script).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+const OHA_REPORT: &str = r#"{"summary":{"successRate":1.0,"total":10.0,"slowest":0.05,"fastest":0.001,"average":0.0087,"requestsPerSec":1149.2,"totalData":1024,"sizePerRequest":1024},"latencyPercentiles":{"p50":0.0087,"p90":0.018,"p95":0.0214,"p99":0.0481,"p99.9":0.05},"statusCodeDistribution":{"200":11492},"errorDistribution":{}}"#;
+
+#[cfg(unix)]
+fn oha_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "sofka-app-oha-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Select a service whose cluster IP is a live local listener, so the direct
+/// probe succeeds and no port-forward is needed.
+#[cfg(unix)]
+fn select_reachable_service(app: &mut App, port: u16) {
+    app.switch_kind("services");
+    apply(
+        app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"clusterIP": "127.0.0.1", "ports": [{"port": port}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+}
+
+#[cfg(unix)]
+async fn drain_to_oha_result(app: &mut App, rx: &mut Receiver<Msg>) {
+    loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("oha result timed out")
+            .expect("message channel closed");
+        let finished = matches!(&msg, Msg::Oha { .. });
+        app.handle_msg(msg);
+        if finished {
+            return;
+        }
+    }
+}
+
+#[tokio::test]
+async fn oha_command_is_visible_only_when_detected() {
+    let (mut app, _rx) = test_app();
+    app.oha_path = None;
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "oha".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    assert!(
+        app.cmd_suggestions
+            .iter()
+            .all(|suggestion| suggestion.label != "oha")
+    );
+    assert!(app.oha_task.is_none());
+
+    app.oha_path = Some("/test/bin/oha".into());
+    app.update_suggestions();
+    assert!(
+        app.cmd_suggestions
+            .iter()
+            .any(|s| s.kind == SuggestKind::Command && s.label == "oha")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn oha_benchmarks_a_reachable_address_without_forwarding() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let dir = oha_dir("direct");
+    let executable = dir.join("oha");
+    write_fake_oha(
+        &executable,
+        &format!("--no-tui --output-format json -z 10s -c 20 http://127.0.0.1:{port}/"),
+        OHA_REPORT,
+    );
+    let (mut app, mut rx) = test_app();
+    app.oha_path = Some(executable);
+    select_reachable_service(&mut app, port);
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "oha".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(app.flash.contains("oha: benchmarking web"), "{}", app.flash);
+
+    drain_to_oha_result(&mut app, &mut rx).await;
+    assert_eq!(app.mode, Mode::Detail);
+    assert_eq!(app.detail.title, "oha — 11,492 requests, 1149 rps");
+    assert!(
+        app.detail
+            .lines
+            .iter()
+            .any(|line| line.contains("route:       direct")),
+        "{:?}",
+        app.detail.lines
+    );
+    assert_eq!(app.flash, "oha: 11492 requests, 1149 rps, 100.00% ok");
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn oha_arguments_override_duration_and_connections() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let dir = oha_dir("args");
+    let executable = dir.join("oha");
+    // Only this argv answers, so the override must reach the process.
+    write_fake_oha(
+        &executable,
+        &format!("--no-tui --output-format json -z 30s -c 100 http://127.0.0.1:{port}/"),
+        OHA_REPORT,
+    );
+    let (mut app, mut rx) = test_app();
+    app.oha_path = Some(executable);
+    select_reachable_service(&mut app, port);
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "oha 30s 100".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+
+    drain_to_oha_result(&mut app, &mut rx).await;
+    assert_eq!(app.mode, Mode::Detail);
+    assert!(
+        app.detail
+            .lines
+            .iter()
+            .any(|line| line.contains("requested:   30s, 100 connections")),
+        "{:?}",
+        app.detail.lines
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn oha_rejects_an_unsafe_run_before_starting_a_process() {
+    let (mut app, _rx) = test_app();
+    app.oha_path = Some("/test/bin/oha".into());
+    app.switch_kind("services");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"clusterIP": "10.96.0.12", "ports": [{"port": 80}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "oha 6m".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(app.flash.contains("cap"), "{}", app.flash);
+    assert!(app.oha_task.is_none(), "no process for a rejected run");
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "oha 99h".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(app.flash.contains("invalid duration"), "{}", app.flash);
+    assert!(app.oha_task.is_none(), "no process for a malformed run");
+}
+
+#[tokio::test]
+async fn oha_refuses_a_selection_it_cannot_benchmark() {
+    let (mut app, _rx) = test_app();
+    app.oha_path = Some("/test/bin/oha".into());
+    app.switch_kind("deployments");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "apps/v1", "kind": "Deployment",
+            "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"}
+        }),
+    );
+    app.table_state.select(Some(0));
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "oha".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert!(
+        app.flash.contains("ingresses/services/pods"),
+        "{}",
+        app.flash
+    );
+    assert!(app.oha_task.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn oha_reports_an_unreachable_ingress_rather_than_forwarding() {
+    let dir = oha_dir("unreachable");
+    let executable = dir.join("oha");
+    write_fake_oha(&executable, "never matched", OHA_REPORT);
+    let (mut app, mut rx) = test_app();
+    app.oha_path = Some(executable);
+    app.cluster
+        .register_kind("networking.k8s.io", "Ingress", "ingresses", true);
+    app.switch_kind("ingresses");
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "networking.k8s.io/v1", "kind": "Ingress",
+            "metadata": {"name": "web", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"rules": [{"host": "no-such-host.invalid"}]}
+        }),
+    );
+    app.table_state.select(Some(0));
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "oha".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+
+    drain_to_oha_result(&mut app, &mut rx).await;
+    // An ingress has no forwardable pod, so the failure is reported as-is.
+    assert!(app.flash.contains("not reachable"), "{}", app.flash);
+    assert!(app.flash_err);
+    assert_ne!(app.mode, Mode::Detail);
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn oha_times_out_a_hung_benchmark() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let dir = oha_dir("hung");
+    let executable = dir.join("oha");
+    std::fs::write(&executable, "#!/bin/sh\nsleep 30\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (mut app, mut rx) = test_app();
+    app.oha_path = Some(executable);
+    app.oha_test_timeout = Some(std::time::Duration::from_millis(50));
+    select_reachable_service(&mut app, port);
+
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "oha".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+
+    drain_to_oha_result(&mut app, &mut rx).await;
+    assert!(app.flash.contains("timed out"), "{}", app.flash);
+    assert!(app.flash_err);
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reload_redetects_a_new_oha_install_through_key_handling() {
+    let dir = oha_dir("reload");
+    let executable = dir.join("oha");
+    let (mut app, _rx) = test_app();
+    app.oha_test_path = Some(dir.as_os_str().to_owned());
+    assert!(app.oha_path.is_none());
+
+    write_fake_oha(&executable, "--version", OHA_REPORT);
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "reload".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.oha_path.as_deref(), Some(executable.as_path()));
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test]
 async fn port_forward_prompt_prefills_first_exposed_port() {
     let (mut app, _rx) = test_app();

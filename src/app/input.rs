@@ -667,6 +667,7 @@ impl App {
             PaletteAction::Skin => self.open_skins(),
             PaletteAction::Helm => self.open_helm_releases(),
             PaletteAction::Notify => self.toggle_notify(),
+            PaletteAction::Oha => self.open_oha(""),
             PaletteAction::Reload => self.reload_config(),
             PaletteAction::ConfigInfo => self.open_config_info(),
         }
@@ -734,9 +735,22 @@ impl App {
             }
             return true;
         }
+        // `:oha [duration] [connections]` benchmarks the selected object;
+        // bare `:oha` uses the conservative defaults.
+        let mut parts = cmd.split_whitespace();
+        if let Some(first) = parts.next()
+            && matches!(first.to_ascii_lowercase().as_str(), "oha" | "bench")
+        {
+            if self.oha_path.is_none() {
+                return false;
+            }
+            let rest = parts.collect::<Vec<_>>().join(" ");
+            self.open_oha(&rest);
+            return true;
+        }
         let action = PALETTE_COMMANDS
             .iter()
-            .find(|c| c.names.contains(&cmd))
+            .find(|c| c.names.contains(&cmd) && self.palette_action_available(c.action))
             .map(|c| c.action);
         match action {
             Some(a) => {
@@ -780,6 +794,9 @@ impl App {
         // Skipped for an empty query so they don't pre-empt the resource list.
         if !q.is_empty() {
             for c in PALETTE_COMMANDS {
+                if !self.palette_action_available(c.action) {
+                    continue;
+                }
                 let best = c
                     .names
                     .iter()
@@ -891,6 +908,15 @@ impl App {
         rank_completions(&mut scored, |s| s.label.as_str(), !q.is_empty());
         self.cmd_suggestions = scored.into_iter().take(100).map(|(_, s)| s).collect();
         self.cmd_sel = 0;
+    }
+
+    /// Commands backed by an optional external CLI are hidden, and refused on
+    /// exact input, until that CLI is detected on `PATH`.
+    fn palette_action_available(&self, action: PaletteAction) -> bool {
+        match action {
+            PaletteAction::Oha => self.oha_path.is_some(),
+            _ => true,
+        }
     }
 
     /// Palette completions for `:<kind> <ns>`: cached namespaces fuzzy-matched

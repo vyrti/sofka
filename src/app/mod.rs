@@ -542,6 +542,7 @@ enum PaletteAction {
     Skin,
     Helm,
     Notify,
+    Oha,
     Reload,
     ConfigInfo,
 }
@@ -610,6 +611,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         action: PaletteAction::Notify,
         names: &["notify", "bell"],
+    },
+    PaletteCommand {
+        action: PaletteAction::Oha,
+        names: &["oha", "bench"],
     },
     PaletteCommand {
         action: PaletteAction::Find,
@@ -1585,6 +1590,18 @@ pub struct App {
     pub forwards_cfg: Vec<crate::config::Forward>,
     /// `[notify]` delivery options (bell, desktop-notification protocol).
     pub notify_cfg: crate::config::NotifyConfig,
+    /// Resolved once at startup and on `:reload`. `None` keeps the optional
+    /// command out of both palette completion and dispatch.
+    pub oha_path: Option<std::path::PathBuf>,
+    /// At most one benchmark is live. Aborting this handle drops and kills the
+    /// subprocess — and any temporary port-forward it opened — because both
+    /// commands are configured with `kill_on_drop`.
+    oha_task: Option<JoinHandle<()>>,
+    oha_run: u64,
+    #[cfg(test)]
+    oha_test_path: Option<std::ffi::OsString>,
+    #[cfg(test)]
+    oha_test_timeout: Option<Duration>,
     /// Compiled `[keys]` palette-completion bindings.
     pub palette_keys: crate::config::PaletteKeys,
 
@@ -1724,6 +1741,10 @@ pub struct App {
 impl App {
     pub fn new(cluster: Cluster, tx: Sender<Msg>) -> Self {
         let namespace = cluster.default_namespace.clone();
+        #[cfg(not(test))]
+        let oha_path = crate::oha::detect();
+        #[cfg(test)]
+        let oha_path = None;
         Self {
             cluster,
             store: Store::default(),
@@ -1835,6 +1856,13 @@ impl App {
             port_forwards: Vec::new(),
             forwards_cfg: Vec::new(),
             notify_cfg: crate::config::NotifyConfig::default(),
+            oha_path,
+            oha_task: None,
+            oha_run: 0,
+            #[cfg(test)]
+            oha_test_path: None,
+            #[cfg(test)]
+            oha_test_timeout: None,
             palette_keys: crate::config::PaletteKeys::default(),
             pf_state: ListState::default(),
             skin_list: crate::theme::BUILTIN_NAMES
@@ -1952,6 +1980,7 @@ mod logs;
 mod mouse;
 mod navigation;
 mod notify;
+mod oha;
 mod overlays;
 mod pickers;
 mod rightsize;

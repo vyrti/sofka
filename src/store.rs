@@ -104,6 +104,13 @@ pub enum Msg {
         ok: usize,
         failed: Vec<String>,
     },
+    /// Parsed output of an optional oha HTTP benchmark.
+    Oha {
+        generation: u64,
+        run: u64,
+        claim: StatusClaim,
+        result: Result<crate::oha::ReportView, String>,
+    },
     /// Result of an off-thread `kubectl describe` (or its YAML fallback).
     Detail {
         generation: u64,

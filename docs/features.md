@@ -27,8 +27,9 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   `pulse`, `xray`, `explain`, `timeline`, `gitops`, `can-i`, `journal`, `debug`,
   `debug-clean`, `bundle`, `bundle-save`, `snapshot`, `snapshots`, `diff`,
   `events`, `pf`, `notify`, `find`, `vlogs`, `rightsize`, `fleet`, `skin`,
-  `reload`, `config`, `info`). `:` and `?` open the palette and help from every
-  navigation screen, then close back to the screen where they were opened.
+  `reload`, `config`, `info`, plus `oha` when the oha CLI is installed). `:`
+  and `?` open the palette and help from every navigation screen, then close
+  back to the screen where they were opened.
 - **Filtering** (`/`) with matched-character highlighting: fuzzy text, `!text`
   inverse match, `-l`/`-f` label and field selectors (evaluated server-side on
   ⏎), and typed column comparisons (`status=CrashLoopBackOff`, `cpu>500m`,
@@ -66,6 +67,16 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
 
 ## Metrics and health
 
+- **HTTP benchmarking** (`:oha [duration] [connections]`) - when `oha` is
+  executable on `PATH`, load-test the selected ingress, service or pod and show
+  the parsed JSON report in a searchable document view. The address the object
+  advertises (ingress host, load-balancer address, cluster IP, pod IP) is probed
+  first, so an in-cluster or VPN session benchmarks it directly; only when
+  nothing answers does sofka reuse a running `f` port-forward, or open a
+  temporary one that is torn down with the run. Defaults to a deliberately gentle
+  10s / 20 connections, capped at 5m and 500 connections, and validated before
+  any process starts. Availability is checked at startup and rescanned by
+  `:reload`.
 - **Live CPU and MEM columns** for pods and nodes from the metrics API, colored
   on unusual values. Nodes also get **%CPU and %MEM of allocatable**
   (`status.allocatable` - the pool the scheduler hands out), colored by the
