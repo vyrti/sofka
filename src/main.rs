@@ -79,6 +79,12 @@ struct Args {
     /// discovery/metrics/watch status, use `:info` inside the TUI.
     #[arg(long)]
     info: bool,
+
+    /// Run a core plugin's adapter: read a plugin request on stdin, write its
+    /// report on stdout. sofka spawns itself with this; it is not a user-facing
+    /// entry point, which is why it is hidden from `--help`.
+    #[arg(long, value_name = "NAME", hide = true)]
+    plugin_adapter: Option<String>,
 }
 
 /// Heap profiling build (`--features dhat-heap`). dhat replaces the global
@@ -110,6 +116,14 @@ fn main() -> Result<()> {
 }
 
 async fn run_main(args: Args) -> Result<()> {
+    // Before anything else: an adapter run owns stdout for its report and must
+    // never load config, connect, or touch the terminal.
+    if let Some(name) = &args.plugin_adapter {
+        return match name.as_str() {
+            "sanitize" => sofka::sanitize::run().await,
+            other => Err(anyhow::anyhow!("unknown core plugin adapter '{other}'")),
+        };
+    }
     if let Some(dir) = &args.validate_plugin {
         let plugin = sofka::plugins::read_package(dir).map_err(anyhow::Error::msg)?;
         sofka::plugins::available(&plugin).map_err(anyhow::Error::msg)?;

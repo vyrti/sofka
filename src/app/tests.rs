@@ -2002,49 +2002,190 @@ async fn mouse_click_selects_row_header_click_sorts_wheel_moves() {
 }
 
 #[tokio::test]
-async fn horizontal_column_scroll_anchors_name_and_clamps() {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
+async fn horizontal_scroll_keeps_names_and_moves_content_without_resizing() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for all_namespaces in [false, true] {
+        let (mut app, _rx) = test_app();
+        app.switch_kind("pods");
+        if all_namespaces {
+            app.namespace.clear();
+        }
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": "web", "namespace": "default"},
+                "spec": {"nodeName": "node-abcdefghijklmnopqrstuvwxyz-0123456789-long-value"},
+                "status": {"phase": "Running"}
+            }),
+        );
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        app.handle_key(press(KeyCode::Home)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(app.col_scroll_max > 5);
+        let initial = term.backend().buffer().clone();
+        let hit = app.table_hit.borrow().clone().unwrap();
+        let title = |term: &Terminal<TestBackend>| -> String {
+            (hit.x_min..hit.x_max)
+                .map(|x| term.backend().buffer()[(x, hit.header_y - 1)].symbol())
+                .collect()
+        };
+        assert!(title(&term).contains('→'));
+        assert!(!title(&term).contains('←'));
+        let anchored = usize::from(all_namespaces) + 1;
+        let frozen_end = hit.cols[anchored].0;
+        app.handle_key(press(KeyCode::Left)).unwrap();
+        assert_eq!(app.col_offset, 0);
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.col_offset, 5);
+        assert!(title(&term).contains('←'));
+        assert!(title(&term).contains('→'));
+        let moved = app.table_hit.borrow().clone().unwrap();
+        assert_eq!(&hit.cols[..anchored], &moved.cols[..anchored]);
+        for y in [hit.header_y, hit.rows_y] {
+            for x in hit.x_min..frozen_end {
+                assert_eq!(
+                    initial[(x, y)].symbol(),
+                    term.backend().buffer()[(x, y)].symbol()
+                );
+            }
+            for x in frozen_end..hit.x_max.saturating_sub(5) {
+                assert_eq!(
+                    initial[(x + 5, y)].symbol(),
+                    term.backend().buffer()[(x, y)].symbol()
+                );
+            }
+        }
+        app.handle_key(press(KeyCode::Left)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(term.backend().buffer(), &initial);
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let &(start, _, index) = moved.cols.last().unwrap();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: start,
+            row: moved.header_y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+        assert_eq!(app.sort_column, Some(index));
+        app.handle_key(press(KeyCode::Left)).unwrap();
+        assert_eq!(app.col_offset, 0);
+        for _ in 0..100 {
+            app.handle_key(press(KeyCode::Right)).unwrap();
+        }
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.col_offset, app.col_scroll_max);
+        assert_eq!(
+            app.table_hit
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .cols
+                .last()
+                .unwrap()
+                .2,
+            app.display_headers().len() - 1
+        );
+        assert!(title(&term).contains('←'));
+        assert!(!title(&term).contains('→'));
+        let at_end = app.col_offset;
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        assert_eq!(app.col_offset, at_end);
+        app.handle_key(press(KeyCode::Char('w'))).unwrap();
+        assert_eq!(app.col_offset, 0);
+    }
+}
+
+#[tokio::test]
+async fn horizontal_scroll_stops_when_columns_fit_and_resets_after_resize() {
+    use ratatui::{Terminal, backend::TestBackend};
 
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
+    let mut term = Terminal::new(TestBackend::new(180, 24)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.col_scroll_max, 0);
+    let before = term.backend().buffer().clone();
+    app.handle_key(press(KeyCode::Right)).unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.col_offset, 0);
+    assert_eq!(term.backend().buffer(), &before);
+
+    term.backend_mut().resize(45, 24);
+    term.autoresize().unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    app.handle_key(press(KeyCode::Right)).unwrap();
+    assert!(app.col_offset > 0);
+    term.backend_mut().resize(180, 24);
+    term.autoresize().unwrap();
+    term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.col_offset, 0);
+    assert_eq!(app.col_scroll_max, 0);
+}
+
+#[tokio::test]
+async fn horizontal_scroll_clips_wide_characters_at_both_edges() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, _rx) = test_app();
+    install_views(
+        &mut app,
+        r#"
+        [[views."cert-manager.io/v1/certificates".columns]]
+        name = "VALUE"
+        path = "/spec/value"
+        width = 40
+        align = "right"
+    "#,
+    );
+    app.switch_kind("certificates");
     apply(
         &mut app,
         json!({
-            "apiVersion": "v1", "kind": "Pod",
-            "metadata": {"name": "a", "namespace": "default"},
-            "status": {"phase": "Running"}
+            "apiVersion": "cert-manager.io/v1", "kind": "Certificate",
+            "metadata": {"name": "web", "namespace": "default"},
+            "spec": {"value": "界".repeat(20)}
         }),
     );
-    app.table_state.select(Some(0));
-
-    let headers = app.display_headers().to_vec();
-    assert_eq!(headers[0], "NAME");
-    let scrollable = headers.len() - 1;
-
-    // ← at the left edge is a no-op; → hides the column after NAME.
-    app.handle_key(press(KeyCode::Left)).unwrap();
-    assert_eq!(app.col_offset, 0);
-    app.handle_key(press(KeyCode::Right)).unwrap();
-    assert_eq!(app.col_offset, 1);
-
-    // → clamps so the last scrollable column stays visible.
-    for _ in 0..headers.len() {
-        app.handle_key(press(KeyCode::Right)).unwrap();
-    }
-    assert_eq!(app.col_offset, scrollable - 1);
-
-    // The rendered geometry skips the hidden columns: NAME (0) stays
-    // anchored, then only the last scrollable column follows.
-    let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(30, 24)).unwrap();
     term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
-    let hit = app.table_hit.borrow().clone().expect("geometry recorded");
-    let cols: Vec<usize> = hit.cols.iter().map(|&(_, _, i)| i).collect();
-    assert_eq!(cols, vec![0, headers.len() - 1]);
-
-    // Rebuilding the view spec (view switch, wide toggle) resets the scroll.
-    app.refresh_view_spec();
-    assert_eq!(app.col_offset, 0);
+    for _ in 0..4 {
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        let rendered = term
+            .draw(|f| crate::ui::draw(f, &mut app))
+            .unwrap()
+            .buffer
+            .clone();
+        let hit = app.table_hit.borrow().clone().unwrap();
+        let &(start, end, _) = hit.cols.iter().find(|c| c.2 == 1).unwrap();
+        for x in start..end {
+            let source = app.col_offset + usize::from(x - start);
+            let expected = if source.is_multiple_of(2) && x + 1 < end {
+                "界"
+            } else {
+                " "
+            };
+            assert_eq!(rendered[(x, hit.rows_y)].symbol(), expected);
+            // A terminal does not write the second half of a wide character.
+            if source.is_multiple_of(2) || x == start {
+                assert_eq!(term.backend().buffer()[(x, hit.rows_y)].symbol(), expected);
+            }
+        }
+    }
+    for width in [1, 2, 3, 4, 8] {
+        term.backend_mut().resize(width, 24);
+        term.autoresize().unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    }
 }
 
 #[tokio::test]
@@ -5998,6 +6139,121 @@ async fn narrow_window_keeps_full_external_ip_visible() {
 }
 
 #[tokio::test]
+async fn logs_wait_for_container_start() {
+    for reason in ["ContainerCreating", "PodInitializing", "ImagePullBackOff"] {
+        let (mut app, mut rx, requests) = waiting_logs_app(400, reason);
+        app.handle_key(press(KeyCode::Char('l'))).unwrap();
+        assert_eq!(app.mode, Mode::Logs);
+        let msg = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let msg = rx.recv().await.unwrap();
+                if matches!(msg, Msg::LogLines { .. }) {
+                    break msg;
+                }
+            }
+        })
+        .await
+        .expect("logs should start after the container starts");
+        app.handle_msg(msg);
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(app.logs.view.lines.iter().collect::<Vec<_>>(), ["started"]);
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn leaving_logs_stops_container_start_retries() {
+    let (mut app, _rx, requests) = waiting_logs_app(400, "ContainerCreating");
+    app.handle_key(press(KeyCode::Char('l'))).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while requests.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn logs_report_errors_other_than_container_waiting() {
+    for (code, message, key) in [
+        (403, "is waiting to start", 'l'),
+        (400, "invalid container", 'l'),
+        (400, "ContainerCreating", 'p'),
+    ] {
+        let (mut app, mut rx, requests) = waiting_logs_app(code, message);
+        app.handle_key(press(KeyCode::Char(key))).unwrap();
+        let msg = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let msg = rx.recv().await.unwrap();
+                if matches!(msg, Msg::LogLines { .. }) {
+                    break msg;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        app.handle_msg(msg);
+        assert!(app.logs.view.lines[0].starts_with("[error]"));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+    }
+}
+
+fn waiting_logs_app(code: u16, reason: &str) -> (App, Receiver<Msg>, Arc<AtomicU64>) {
+    let (mut app, rx) = test_app();
+    app.switch_kind("pods");
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "pending", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "test"}]},
+            "status": {"phase": "Pending"}}),
+    );
+    app.table_state.select(Some(0));
+    let requests = Arc::new(AtomicU64::new(0));
+    let seen = requests.clone();
+    let message = if code == 400 && reason != "invalid container" {
+        format!("container \"app\" in pod \"pending\" is waiting to start: {reason}")
+    } else {
+        reason.to_owned()
+    };
+    app.cluster.client = kube::Client::new(
+        tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            assert_eq!(
+                request.uri().path(),
+                "/api/v1/namespaces/default/pods/pending/log"
+            );
+            let attempt = seen.fetch_add(1, Ordering::SeqCst);
+            let (status, body) = if attempt < 2 {
+                (
+                    code,
+                    json!({"kind": "Status", "apiVersion": "v1",
+                    "status": "Failure", "message": message,
+                    "reason": "BadRequest", "code": code})
+                    .to_string(),
+                )
+            } else {
+                (200, "started\n".to_owned())
+            };
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .body(http_body_util::Full::new(hyper::body::Bytes::from(body)))
+                        .unwrap(),
+                )
+            }
+        }),
+        "default",
+    );
+    (app, rx, requests)
+}
+
+#[tokio::test]
 async fn logs_keep_view_and_restore_selection() {
     let (mut app, _rx) = test_app();
     app.switch_kind("pods");
@@ -7740,6 +7996,100 @@ async fn debug_is_blocked_in_readonly_and_by_guardrail() {
 }
 
 #[tokio::test]
+async fn sanitize_ships_with_sofka_and_confirms_before_deleting() {
+    let (mut app, _rx) = app_with_pod();
+    // The package is registered from the binary, with no user configuration and
+    // nothing copied into the config directory.
+    app.plugins = crate::plugins::bundled()
+        .into_iter()
+        .map(|p| p.expect("bundled package parses"))
+        .collect();
+    let sanitize = app
+        .plugins
+        .iter()
+        .find(|p| p.palette.as_deref() == Some("sanitize"))
+        .expect(":sanitize is available out of the box");
+    assert!(sanitize.bundled);
+    assert!(sanitize.dangerous, "a bulk delete must confirm");
+    assert_eq!(sanitize.scopes, ["pods"]);
+    assert_eq!(sanitize.target.as_deref(), Some("context"));
+    // The adapter is this binary, so nothing extra has to be on PATH.
+    assert!(crate::plugins::available(sanitize).is_ok());
+
+    // Running it opens the confirmation instead of deleting anything.
+    plugin_command(&mut app, "sanitize");
+    assert_eq!(app.mode, Mode::Confirm);
+    assert!(app.pending.is_none(), "must not run before confirmation");
+    assert!(app.confirm_label.contains('⚠'), "{}", app.confirm_label);
+
+    // Declining leaves the cluster alone.
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    assert_eq!(app.mode, Mode::Table);
+    assert!(app.pending.is_none());
+}
+
+#[tokio::test]
+async fn a_guardrail_can_deny_sanitize() {
+    let (mut app, _rx) = app_with_pod();
+    app.plugins = crate::plugins::bundled()
+        .into_iter()
+        .map(|p| p.expect("bundled package parses"))
+        .collect();
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["plugin:sanitize".into()],
+        deny: true,
+        reason: Some("cleanup goes through the owning controller".into()),
+        ..Default::default()
+    }];
+
+    plugin_command(&mut app, "sanitize");
+    assert_ne!(
+        app.mode,
+        Mode::Confirm,
+        "a denied action must not even confirm"
+    );
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("blocked by guardrail"), "{}", app.flash);
+    assert!(app.flash.contains("owning controller"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn sanitize_checks_the_default_context_bulk_limit_before_confirmation() {
+    let (mut app, _rx) = app_with_pod();
+    app.cluster.context = "default".into();
+    app.plugins = crate::plugins::bundled()
+        .into_iter()
+        .map(|p| p.expect("bundled package parses"))
+        .collect();
+    app.guardrails = vec![crate::config::Guardrail {
+        contexts: vec!["default".into()],
+        actions: vec!["plugin:sanitize".into()],
+        max_bulk: Some(0),
+        ..Default::default()
+    }];
+
+    plugin_command(&mut app, "sanitize");
+    assert_ne!(app.mode, Mode::Confirm);
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("exceeds the max of 0"), "{}", app.flash);
+}
+
+#[tokio::test]
+async fn sanitize_is_blocked_in_readonly_mode() {
+    let (mut app, _rx) = app_with_pod();
+    app.readonly = true;
+    app.plugins = crate::plugins::bundled()
+        .into_iter()
+        .map(|p| p.expect("bundled package parses"))
+        .collect();
+
+    plugin_command(&mut app, "sanitize");
+    assert_ne!(app.mode, Mode::Confirm, "read-only must not even confirm");
+    assert!(app.pending.is_none());
+    assert!(app.flash.contains("read-only"), "{}", app.flash);
+}
+
+#[tokio::test]
 async fn readonly_gates_mutating_plugins_only() {
     let (mut app, _rx) = app_with_pod();
     app.readonly = true;
@@ -8738,6 +9088,73 @@ async fn user_view_adds_provider_label_columns_to_curated_nodes() {
     let (cells, _) = cache.get(&key).unwrap();
     assert_eq!(cells[4], "v1.33.4");
     assert_eq!(&cells[5..9], ["general", "eu-west-1a", "m7i.large", "spot"]);
+}
+
+#[tokio::test]
+async fn node_wide_labels_render_filter_and_refresh() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("nodes");
+    let narrow_headers = app.display_headers().to_vec();
+    assert!(!narrow_headers.iter().any(|header| header == "LABELS"));
+    for (name, labels) in [
+        (
+            "worker-1",
+            json!({"zone": "west", "karpenter.sh/nodepool": "general", "empty": ""}),
+        ),
+        ("worker-2", json!({})),
+        ("worker-3", Value::Null),
+    ] {
+        apply(
+            &mut app,
+            json!({
+                "apiVersion": "v1", "kind": "Node",
+                "metadata": {"name": name, "resourceVersion": "1", "labels": labels}
+            }),
+        );
+    }
+
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    let labels_index = app
+        .display_headers()
+        .iter()
+        .position(|h| *h == "LABELS")
+        .unwrap();
+    {
+        let rows = app.rows();
+        app.ensure_table_cell_cache(&rows);
+        let cache = app.table_cell_cache();
+        for row in rows {
+            let (cells, _) = cache.get(&row_key(row)).unwrap();
+            let expected = if row.metadata.name.as_deref() == Some("worker-1") {
+                "empty=,karpenter.sh/nodepool=general,zone=west"
+            } else {
+                "<none>"
+            };
+            assert_eq!(cells[labels_index], expected);
+        }
+    }
+
+    app.handle_key(press(KeyCode::Char('/'))).unwrap();
+    for c in "general".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.rows().len(), 1);
+    assert_eq!(app.rows()[0].metadata.name.as_deref(), Some("worker-1"));
+
+    apply(
+        &mut app,
+        json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "worker-1", "resourceVersion": "2",
+                         "labels": {"karpenter.sh/nodepool": "batch"}}
+        }),
+    );
+    assert!(app.rows().is_empty());
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.rows().len(), 3);
+    app.handle_key(press(KeyCode::Char('w'))).unwrap();
+    assert_eq!(app.display_headers().to_vec(), narrow_headers);
 }
 
 #[tokio::test]
@@ -11648,7 +12065,8 @@ async fn plugin_package_reload_loads_valid_packages_and_isolates_invalid_ones() 
     let (mut app, mut rx) = test_app();
     app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
     plugin_command(&mut app, "reload");
-    assert_eq!(app.plugins.len(), 1);
+    // Bundled packages are always present; this counts the configured ones.
+    assert_eq!(app.plugins.iter().filter(|p| !p.bundled).count(), 1);
     assert!(app.config_warnings.iter().any(|w| w.contains("broken")));
     plugin_command(&mut app, "example-plugin");
     app.handle_msg(plugin_result(&mut rx).await);
@@ -11660,7 +12078,7 @@ async fn plugin_package_reload_loads_valid_packages_and_isolates_invalid_ones() 
     );
     std::fs::remove_file(package.join("plugin.toml")).unwrap();
     plugin_command(&mut app, "reload");
-    assert!(app.plugins.is_empty());
+    assert!(!app.plugins.iter().any(|p| !p.bundled));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -11851,7 +12269,11 @@ async fn check_unknown_inline_fields(location: &str) {
             app.user_aliases.get("pluginpods").map(String::as_str),
             Some("pods")
         );
-        assert_eq!(app.plugins.len(), 2, "{layer}: plugins were lost");
+        assert_eq!(
+            app.plugins.iter().filter(|p| !p.bundled).count(),
+            2,
+            "{layer}: plugins were lost"
+        );
         assert!(
             app.config_warnings.is_empty(),
             "{layer}: {:?}",
@@ -11870,4 +12292,256 @@ async fn check_unknown_inline_fields(location: &str) {
         assert!(app.flash.contains("outside range"));
         std::fs::remove_dir_all(dir).unwrap();
     }
+}
+
+fn faults_test_pod(name: &str) -> Value {
+    json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": name, "namespace": "default", "resourceVersion": "1"},
+        "spec": {"containers": [{"name": "app"}]},
+        "status": {
+            "phase": "Running",
+            "conditions": [{"type": "Ready", "status": "True"}],
+            "containerStatuses": [{"name": "app", "ready": true, "restartCount": 0,
+                                   "state": {"running": {}}}]
+        }
+    })
+}
+
+#[tokio::test]
+async fn ctrl_z_filters_pod_faults() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let healthy = faults_test_pod("healthy");
+    let mut cases = vec![(healthy.clone(), false)];
+    for phase in ["Pending", "Failed", "Unknown", "Succeeded"] {
+        let mut pod = faults_test_pod(phase);
+        pod["status"] = json!({"phase": phase});
+        cases.push((pod, phase != "Succeeded"));
+    }
+    for reason in [
+        "CrashLoopBackOff",
+        "ImagePullBackOff",
+        "ErrImagePull",
+        "ContainerCreating",
+    ] {
+        let mut pod = faults_test_pod(reason);
+        pod["status"]["containerStatuses"][0]["state"] = json!({"waiting": {"reason": reason}});
+        cases.push((pod, true));
+    }
+    let mut unready = faults_test_pod("unready");
+    unready["status"]["conditions"][0]["status"] = json!("False");
+    cases.push((unready, true));
+    let mut container_unready = faults_test_pod("container-unready");
+    container_unready["status"]["containerStatuses"][0]["ready"] = json!(false);
+    cases.push((container_unready, true));
+    let mut missing = faults_test_pod("missing-status");
+    missing["status"]["containerStatuses"] = json!([]);
+    cases.push((missing, true));
+    let mut terminating = faults_test_pod("terminating");
+    terminating["metadata"]["deletionTimestamp"] = json!("2026-09-06T00:00:00Z");
+    cases.push((terminating, true));
+    let mut gate = faults_test_pod("gate");
+    gate["spec"]["readinessGates"] = json!([{"conditionType": "example.com/ready"}]);
+    cases.push((gate, true));
+    for (name, sidecar, ready, faulty) in [
+        ("init-complete", false, true, false),
+        ("init-failed", false, false, true),
+        ("sidecar-ready", true, true, false),
+        ("sidecar-unready", true, false, true),
+    ] {
+        let mut pod = faults_test_pod(name);
+        pod["spec"]["initContainers"] = json!([{"name": "init"}]);
+        let state = if sidecar {
+            pod["spec"]["initContainers"][0]["restartPolicy"] = json!("Always");
+            json!({"running": {}})
+        } else {
+            json!({"terminated": {"exitCode": if ready { 0 } else { 1 }}})
+        };
+        pod["status"]["initContainerStatuses"] =
+            json!([{"name": "init", "ready": ready, "state": state}]);
+        cases.push((pod, faulty));
+    }
+    for (pod, _) in &cases {
+        apply(&mut app, pod.clone());
+    }
+    assert_eq!(app.row_count(), cases.len());
+    app.handle_key(press(KeyCode::End)).unwrap();
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    let names = row_names(&app);
+    for (pod, faulty) in &cases {
+        let name = pod["metadata"]["name"].as_str().unwrap();
+        assert_eq!(names.iter().any(|n| n == name), *faulty, "{name}");
+    }
+    assert_eq!(app.table_state.selected(), Some(0));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(screen.contains("[faults]"));
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.row_count(), cases.len());
+}
+
+#[tokio::test]
+async fn faults_filter_combines_with_text_and_tracks_watch_updates() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    let mut pod = faults_test_pod("api");
+    apply(&mut app, pod.clone());
+    let mut other = faults_test_pod("other");
+    other["status"]["phase"] = json!("Pending");
+    apply(&mut app, other);
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(row_names(&app), ["other"]);
+    pod["metadata"]["resourceVersion"] = json!("2");
+    pod["status"]["conditions"][0]["status"] = json!("False");
+    apply(&mut app, pod.clone());
+    assert_eq!(row_names(&app), ["api", "other"]);
+    type_filter(&mut app, "api");
+    assert_eq!(row_names(&app), ["api"]);
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.filter, "api");
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    pod["metadata"]["resourceVersion"] = json!("3");
+    pod["status"]["conditions"][0]["status"] = json!("True");
+    apply(&mut app, pod);
+    assert!(row_names(&app).is_empty());
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+    assert_eq!(row_names(&app), ["other"]);
+    app.handle_key(press(KeyCode::Char(':'))).unwrap();
+    for c in "services".chars() {
+        app.handle_key(press(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.kind_plural, "services");
+    assert!(!app.faults_filter_active());
+    apply(
+        &mut app,
+        json!({"apiVersion": "v1", "kind": "Service",
+        "metadata": {"name": "service", "namespace": "default"}}),
+    );
+    assert_eq!(row_names(&app), ["service"]);
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert!(app.faults_only);
+}
+
+#[tokio::test]
+async fn configured_ctrl_z_actions_take_precedence_over_faults() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    app.bookmarks = vec![crate::config::Bookmark {
+        key: Some("ctrl-z".into()),
+        name: "services".into(),
+        resource: "services".into(),
+        ..Default::default()
+    }];
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.kind_plural, "services");
+    assert!(!app.faults_only);
+
+    app.bookmarks.clear();
+    app.switch_kind("pods");
+    app.workspaces = vec![crate::config::Workspace {
+        key: Some("ctrl-z".into()),
+        name: "ops".into(),
+        context: None,
+        views: vec![crate::config::WorkspaceView {
+            name: "services".into(),
+            resource: "services".into(),
+            ..Default::default()
+        }],
+    }];
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert_eq!(app.kind_plural, "services");
+    assert!(!app.faults_only);
+
+    app.workspaces.clear();
+    app.switch_kind("pods");
+    app.readonly = true;
+    app.plugins = vec![crate::config::Plugin {
+        key: "ctrl-z".into(),
+        name: "custom".into(),
+        command: "true".into(),
+        scopes: vec!["pods".into()],
+        ..Default::default()
+    }];
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert!(app.flash.contains("read-only"));
+    assert!(!app.faults_only);
+    app.plugins[0].scopes = vec!["services".into()];
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    assert!(app.faults_only);
+}
+
+#[tokio::test]
+async fn faults_watch_changes_preserve_pod_identity_or_clear_selection() {
+    let (mut app, _rx) = test_app();
+    app.switch_kind("pods");
+    for name in ["b", "c", "d"] {
+        let mut pod = faults_test_pod(name);
+        pod["metadata"]["uid"] = json!(name);
+        pod["status"]["phase"] = json!("Pending");
+        apply(&mut app, pod);
+    }
+    app.handle_key(ctrl(KeyCode::Char('z'))).unwrap();
+    app.handle_key(press(KeyCode::Down)).unwrap();
+    assert_eq!(
+        app.selected_ref().unwrap().metadata.name.as_deref(),
+        Some("c")
+    );
+
+    let mut earlier = faults_test_pod("a");
+    earlier["status"]["phase"] = json!("Pending");
+    apply(&mut app, earlier);
+    assert_eq!(app.table_state.selected(), Some(2));
+    assert_eq!(
+        app.selected_ref().unwrap().metadata.name.as_deref(),
+        Some("c")
+    );
+
+    let mut recovered = faults_test_pod("b");
+    recovered["metadata"]["uid"] = json!("b");
+    recovered["metadata"]["resourceVersion"] = json!("2");
+    apply(&mut app, recovered);
+    assert_eq!(app.table_state.selected(), Some(1));
+    assert_eq!(
+        app.selected_ref().unwrap().metadata.name.as_deref(),
+        Some("c")
+    );
+
+    let mut recovered = faults_test_pod("c");
+    recovered["metadata"]["uid"] = json!("c");
+    recovered["metadata"]["resourceVersion"] = json!("2");
+    apply(&mut app, recovered);
+    assert!(app.selected_ref().is_none());
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+    terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+    assert_eq!(app.table_state.selected(), None);
+    app.handle_key(ctrl(KeyCode::Char('d'))).unwrap();
+    assert_ne!(app.mode, Mode::Confirm);
+
+    app.handle_key(press(KeyCode::End)).unwrap();
+    assert_eq!(
+        app.selected_ref().unwrap().metadata.name.as_deref(),
+        Some("d")
+    );
+    let mut replacement = faults_test_pod("d");
+    replacement["metadata"]["uid"] = json!("replacement");
+    replacement["metadata"]["resourceVersion"] = json!("2");
+    replacement["status"]["phase"] = json!("Pending");
+    apply(&mut app, replacement);
+    assert_eq!(app.table_state.selected(), None);
+    app.handle_key(press(KeyCode::Home)).unwrap();
+    let key = row_key(app.selected_ref().unwrap());
+    app.handle_msg(Msg::Deleted {
+        generation: app.generation,
+        key,
+    });
+    assert_eq!(app.table_state.selected(), None);
 }

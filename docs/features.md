@@ -18,10 +18,15 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   a NAME/AGE fallback for everything else. STATUS columns use a fixed width of
   26 characters so status changes do not move adjacent columns. A configured
   column width takes priority. Column widths use the full filtered list so
-  scrolling does not move the columns.
+  vertical scrolling does not move the columns.
+- **Horizontal scrolling** - Left and Right move the table by five text positions.
+  NAME and NAMESPACE stay fixed. Other columns keep their widths while you
+  scroll. Arrows in the title show where more content is available. When all
+  columns fit, Left and Right do nothing.
 - **Custom views** - define columns for any resource in the config file. An
   unknown custom resource picks up its CRD `additionalPrinterColumns`
-  automatically. `w` toggles wide-only columns (kubectl `-o wide`). See
+  automatically. `w` toggles wide-only columns (kubectl `-o wide`), including
+  node labels. See
   [Views and thresholds](views.md).
 - **Drill-down navigation** with a breadcrumb stack: workload/service → pods,
   cronjob → its jobs, node → its pods, pod → containers, namespace → re-scope,
@@ -44,12 +49,20 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   ⏎), and typed column comparisons (`status=CrashLoopBackOff`, `cpu>500m`,
   `memory>1Gi`, `restarts>=5`, `age<2h`). Structured terms AND together with
   spaces or `&&`; `||` combines alternatives, parentheses group expressions,
-  and `!(...)` negates a group. Quote values containing spaces. Selectors survive refresh,
-  namespace changes, drill-down, and view history. The title shows local,
-  server-side, mixed, or pending evaluation; `/` edits and Esc clears.
-  Palette queries combine scope and filtering:
+  and `!(...)` negates a group. Quote values containing spaces. Selectors
+  survive refresh, namespace changes, drill-down, and view history. The title
+  shows local, server-side, mixed, or pending evaluation; `/` edits and Esc
+  clears. Palette queries combine scope and filtering:
   `:pods -n prod --context west /-l app=api status=Running`.
   See [filter grammar and selectors](filtering.md).
+- **Toggle faults** (`Ctrl+Z`, pods only) shows pending, failed, unknown,
+  terminating, and running pods that are not ready. Completed pods are hidden.
+  The table title shows `[faults]` while the filter is on. It works with the
+  text filter and current namespace or drill scope. Press `Ctrl+Z` again to
+  turn it off. The setting stays on for pod views during the session and does
+  not filter other resource types. Configured `Ctrl+Z` bookmark, workspace,
+  and matching plugin actions take precedence. Live updates keep the selected
+  pod selected. If it leaves the list or its UID changes, selection is cleared.
 - **Global fuzzy find** (`:find <text>`) - search object names across the common
   kinds (workloads, pods, services, config, ingresses, jobs, storage, nodes,
   namespaces, Flux objects) in every namespace at once, concurrently. Results
@@ -166,7 +179,8 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   [Debug containers and pods](debugging.md#debug-containers-and-pods).
 - **Logs** (`l`) - per-container on a pod, or aggregated across all matching
   pods on a workload/service, with filtering, previous-container logs, and
-  configurable tail/buffer/lookback. sofka parses ANSI color from the source app
+  configurable tail/buffer/lookback. If a container is waiting to start, sofka
+  retries until its logs are available. sofka parses ANSI color from the source app
   and maps it onto the active skin instead of printing literal escapes. See
   [Log controls](debugging.md#log-controls).
 - **VictoriaLogs integration** (`L` / `:vlogs`) - log history from a
@@ -227,6 +241,22 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   state/snapshot/bundle directories. The connected Kubernetes revision also
   stays visible in the main header.
   Identifiers and counts only, never credentials, tokens, or Secret values.
+
+## Bundled plugins
+
+- **`:sanitize`** deletes the pods a namespace has finished with - completed
+  jobs, failed and evicted pods, and optionally the wedged ones. It ships with
+  sofka and needs no runtime on `PATH`; the adapter is the sofka binary.
+  `states` selects `terminal` (the default), `stuck`, or `all`, named after the
+  STATUS values the pods view shows. `dry_run=true` reports without deleting.
+  It confirms before running, is blocked in read-only mode, and matches
+  guardrails as `plugin:sanitize`. It never deletes a pod that is terminating,
+  still has a running container, or was replaced since the scan.
+  The scope is the current namespace - **all namespaces when the view is**.
+  `-l`/`-f` filter terms narrow the scan server-side; a filter it cannot
+  reproduce exactly makes it refuse rather than delete more than the table
+  shows.
+  See [Sanitize pods](../plugins/sanitize/README.md).
 
 ## External plugin packages
 

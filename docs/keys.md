@@ -28,6 +28,7 @@ for the grammar and selector persistence rules.
 | `ctrl-e`                                      | compact mode: collapse the header + footer (for tiled/multiplexed panes)                                                                                      |
 | `space`                                       | mark/unmark row for bulk actions                                                                                                                              |
 | `/`                                           | filter: fuzzy text · `!inverse` · `-l`/`-f` selectors (server-side on ⏎) · `status=X` `cpu>500m` `age<2h`                                                     |
+| `Ctrl+Z`                                      | toggle faults filter in pod views; configured actions take precedence; combine with `/`; press again to turn off                                              |
 | `n` / `0`                                     | namespace switcher / all namespaces                                                                                                                           |
 | `shift-j`                                     | jump to owner/controller                                                                                                                                      |
 | `o`                                           | show the node the selected row names (pods built in; other kinds via `[views."…"].node`)                                                                      |
@@ -63,8 +64,8 @@ for the grammar and selector persistence rules.
 | `t`                                           | Flux: suspend/resume/reconcile menu · ArgoCD App/AppSet: suspend/resume (App: + sync) · CronJobs: trigger/suspend/resume · pods: file transfer (`kubectl cp`) |
 | `C` / `U` / `D`                               | nodes: cordon / uncordon / drain                                                                                                                              |
 | `ctrl-d` / `ctrl-k`                           | delete / force-delete (marked rows, or current); in confirm: `f` toggles force, `c` cycles cascade (background → foreground → orphan)                         |
-| `w`                                           | toggle wide-only columns (kubectl `-o wide`)                                                                                                                  |
-| `←` / `→`                                     | scroll columns horizontally (NAMESPACE/NAME stay anchored) — for narrow panes                                                                                 |
+| `w`                                           | toggle wide-only columns (kubectl `-o wide`), including node labels                                                                                           |
+| `←` / `→`                                     | scroll sideways by 5 text positions; NAMESPACE/NAME stay fixed; arrows show more content                                                                      |
 | `:q`, `ctrl-c`                                | quit                                                                                                                                                          |
 | `?`                                           | help                                                                                                                                                          |
 | _(config)_                                    | plugin / bookmark / workspace key chords — `ctrl-`/`alt-`/`shift-`/`fN`; listed in `?` help                                                                   |
@@ -123,11 +124,13 @@ port-forward go through the kube API (or a backgrounded process) directly.
 
 ## Plugin commands
 
-| Command                      | Action                                                |
-| ---------------------------- | ----------------------------------------------------- |
-| `:<plugin> [name=value ...]` | Run a plugin with validated inputs.                   |
-| `:plugin-cancel`             | Stop the active plugin run and its temporary forward. |
+| Command                            | Action                                                       |
+| ---------------------------------- | ------------------------------------------------------------ |
+| `:<plugin> [name=value ...]`       | Run a plugin with validated inputs.                          |
+| `:plugin-cancel`                   | Stop the active plugin run and its temporary forward.        |
+| `:sanitize [states=…] [dry_run=…]` | Delete the pods the namespace has finished with (pods view). |
 
+`:sanitize` ships with sofka; see [Sanitize pods](../plugins/sanitize/README.md).
 Installed packages add their commands and key chords to `?` help.
 Use `:reload` after a package change.
 See [Create a plugin package](plugin-authoring.md).

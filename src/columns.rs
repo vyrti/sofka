@@ -167,6 +167,7 @@ const NODE_COLUMNS: &[Column] = &[
     column("ROLES", col_node_roles),
     column("TAINTS", col_node_taints),
     column("VERSION", col_node_version),
+    wide_column("LABELS", col_node_labels),
     column("AGE", col_age),
 ];
 
@@ -900,6 +901,25 @@ fn col_node_version<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     Cow::Borrowed(sget(ctx.data, &["status", "nodeInfo", "kubeletVersion"]).unwrap_or_default())
 }
 
+fn col_node_labels<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
+    let Some(labels) = ctx
+        .obj
+        .metadata
+        .labels
+        .as_ref()
+        .filter(|labels| !labels.is_empty())
+    else {
+        return Cow::Borrowed("<none>");
+    };
+    Cow::Owned(
+        labels
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
 fn col_namespace_status<'a>(ctx: &CellContext<'a>) -> Cow<'a, str> {
     Cow::Borrowed(sget(ctx.data, &["status", "phase"]).unwrap_or("Active"))
 }
@@ -1374,14 +1394,34 @@ fn pod_summary(obj: &DynamicObject) -> (String, String, String) {
     let total = statuses.len();
     let mut ready = 0usize;
     let mut restarts = 0i64;
-    let mut waiting_reason: Option<String> = None;
-    let mut terminated_reason: Option<String> = None;
-
     for c in statuses {
         if c.get("ready").and_then(Value::as_bool).unwrap_or(false) {
             ready += 1;
         }
         restarts += c.get("restartCount").and_then(Value::as_i64).unwrap_or(0);
+    }
+
+    (
+        format!("{ready}/{total}"),
+        pod_status(obj),
+        restarts.to_string(),
+    )
+}
+
+/// A pod's STATUS cell. Exposed so the `:sanitize` plugin selects pods by the
+/// status the pods view shows, rather than a second, drifting derivation.
+pub fn pod_status(obj: &DynamicObject) -> String {
+    let d = &obj.data;
+    let empty = vec![];
+    let statuses = d
+        .get("status")
+        .and_then(|s| s.get("containerStatuses"))
+        .and_then(|c| c.as_array())
+        .unwrap_or(&empty);
+
+    let mut waiting_reason: Option<String> = None;
+    let mut terminated_reason: Option<String> = None;
+    for c in statuses {
         if let Some(r) = c.pointer("/state/waiting/reason").and_then(Value::as_str)
             && (r != "ContainerCreating" || waiting_reason.is_none())
         {
@@ -1396,18 +1436,17 @@ fn pod_summary(obj: &DynamicObject) -> (String, String, String) {
         }
     }
 
-    let phase = sget(d, &["status", "phase"]).unwrap_or("Unknown");
-    let status = if obj.metadata.deletion_timestamp.is_some() {
+    if obj.metadata.deletion_timestamp.is_some() {
         "Terminating".to_string()
     } else if let Some(r) = waiting_reason {
         r
     } else if let Some(r) = terminated_reason {
         r
     } else {
-        phase.to_string()
-    };
-
-    (format!("{ready}/{total}"), status, restarts.to_string())
+        sget(d, &["status", "phase"])
+            .unwrap_or("Unknown")
+            .to_string()
+    }
 }
 
 fn external_ip(d: &Value, typ: &str) -> String {
