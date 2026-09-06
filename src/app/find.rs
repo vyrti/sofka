@@ -68,7 +68,7 @@ impl App {
 
             // Score after gathering: the matcher isn't Send, so it must not
             // live across the await above.
-            let matcher = SkimMatcherV2::default();
+            let matcher = crate::fuzzy::Fuzzy::new();
             let mut failed = 0usize;
             let mut scored: Vec<(i64, crate::store::FindItem)> = Vec::new();
             for (plural, res) in lists {
@@ -76,7 +76,7 @@ impl App {
                     Ok(list) => {
                         for o in list.items {
                             let name = o.metadata.name.unwrap_or_default();
-                            if let Some(score) = matcher.fuzzy_match(&name, &query) {
+                            if let Some(score) = matcher.score(&name, &query) {
                                 scored.push((
                                     score,
                                     crate::store::FindItem {

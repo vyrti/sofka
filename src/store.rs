@@ -322,7 +322,25 @@ pub fn row_key(obj: &DynamicObject) -> String {
 /// contributor to RSS and to per-event cost. Nothing mutates an object once
 /// stored (`apply` replaces wholesale), so sharing is safe.
 pub type RowKey = Rc<str>;
-pub type Items = HashMap<RowKey, Arc<DynamicObject>>;
+pub type Items = FastMap<RowKey, Arc<DynamicObject>>;
+
+/// The hasher for maps keyed by cluster data — row keys, cell caches, sort
+/// keys. The default `SipHash` is chosen to make hash flooding infeasible for
+/// keys an attacker supplies; a filter keystroke rehashes every row key in the
+/// store, so that costs real frame time here.
+///
+/// `foldhash`'s randomized state keeps a per-process seed, so a collision set
+/// cannot be precomputed against the binary. What it drops is the guarantee
+/// against an adversary who can both observe timing and choose keys — and here
+/// the keys are `namespace/name` of objects the API server already accepted,
+/// read by a user who is authenticated to that cluster and is watching those
+/// objects deliberately. Anything that could flood these maps could already
+/// exhaust them by simply creating objects.
+///
+/// Config, theme and registry maps keep the standard hasher: they are built
+/// once from local files and never sit in a hot path.
+pub type FastMap<K, V> = HashMap<K, V, foldhash::fast::RandomState>;
+pub type FastSet<T> = std::collections::HashSet<T, foldhash::fast::RandomState>;
 
 /// How a store operation affected the rows currently visible to the UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -387,7 +405,7 @@ impl Store {
             self.pending = None;
             true
         } else {
-            self.pending = Some(HashMap::new());
+            self.pending = Some(Items::default());
             false
         }
     }
@@ -521,7 +539,7 @@ mod tests {
         store.remove("default/gone");
         advanced(&store, &mut last, "remove (no such key)");
 
-        let mut seeded = Items::new();
+        let mut seeded = Items::default();
         seeded.insert(Rc::from("default/b"), Arc::new(pod("b")));
         store.seed(seeded);
         advanced(&store, &mut last, "seed");

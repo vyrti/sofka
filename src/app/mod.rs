@@ -15,8 +15,6 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures_util::StreamExt;
-use fuzzy_matcher::FuzzyMatcher;
-use fuzzy_matcher::skim::SkimMatcherV2;
 use k8s_openapi::api::core::v1::Pod;
 use kube::Client;
 use kube::api::{
@@ -1229,7 +1227,7 @@ const PREV_REVISIONS_MAX: usize = 256;
 /// drilling away and back keeps the baseline.
 #[derive(Default)]
 pub(super) struct PrevRevisions {
-    map: HashMap<(String, String), Arc<DynamicObject>>,
+    map: crate::store::FastMap<(String, String), Arc<DynamicObject>>,
     order: VecDeque<(String, String)>,
 }
 
@@ -1260,6 +1258,93 @@ struct FilterCache {
     parsed: crate::filter::ParsedFilter,
 }
 
+/// Highlight positions per row name for the active fuzzy needle.
+///
+/// The filter pass already ran the matcher over every row; without this the
+/// renderer ran it again for every *visible* row on every redraw, which is
+/// the same fuzzy scoring work repeated at frame rate for a result that only
+/// changes when the needle or the name does.
+#[derive(Default)]
+struct HighlightCache {
+    /// The needle these entries were matched against. Anything else empties
+    /// the map — a new needle invalidates every entry at once.
+    needle: String,
+    /// Match positions per name. `None` — the name did not match — is a real
+    /// answer and is cached too, so a filter that excludes most rows does not
+    /// re-run the matcher over them every frame.
+    rows: crate::store::FastMap<Box<str>, Option<Rc<[usize]>>>,
+}
+
+/// The display header list, valid for the view spec and column toggles it was
+/// built from.
+///
+/// `display_headers` is asked for the header list from a dozen places — the
+/// renderer, sorting, mouse hit-testing, the copy picker, bookmarks — several
+/// times per frame, and each call used to build a fresh `Vec<String>` of owned
+/// headers only to read one entry out of it.
+struct HeaderCache {
+    /// `(namespace column, node capacity columns, metrics columns)` — the
+    /// toggles that add columns around the spec's own.
+    shape: (bool, bool, bool),
+    /// Bumped whenever the view spec is rebuilt.
+    spec_rev: u64,
+    headers: Rc<[String]>,
+}
+
+/// Memoized picker lists.
+///
+/// Every one of these is fuzzy-scored and sorted from scratch on each draw,
+/// and again on each keystroke by the input handlers that ask it for a length,
+/// a selection or a lookup — several full rebuilds per frame while a picker is
+/// open.
+///
+/// Each memo is keyed on the inputs themselves rather than on a revision
+/// counter someone has to remember to bump: comparing them is a handful of
+/// string compares against no allocation, and a new writer to `ns_list` or the
+/// favourites cannot leave a stale list on screen.
+#[derive(Default)]
+struct PickerMemos {
+    namespaces: Option<NamespaceMemo>,
+    contexts: Option<ContextMemo>,
+    sort_entries: Option<SortEntryMemo>,
+    copy_entries: Option<CopyEntryMemo>,
+}
+
+struct NamespaceMemo {
+    filter: String,
+    context: String,
+    ns_list: Vec<String>,
+    favorites: Vec<String>,
+    recents: Vec<String>,
+    value: Rc<Vec<String>>,
+}
+
+struct ContextMemo {
+    filter: String,
+    ctx_list: Vec<String>,
+    value: Rc<Vec<String>>,
+}
+
+struct SortEntryMemo {
+    filter: String,
+    /// The header list this was built from. Held as the same handle
+    /// `display_headers` returns, so a hit is a pointer comparison.
+    headers: Rc<[String]>,
+    value: Rc<Vec<String>>,
+}
+
+struct CopyEntryMemo {
+    filter: String,
+    fields: Vec<(String, String)>,
+    value: Rc<Vec<(String, String)>>,
+}
+
+/// Names are only inserted when they are drawn, so this holds a screenful in
+/// practice. The bound is here for the pathological case — a session left on
+/// one filter while rows churn through it — and clearing costs one redraw's
+/// worth of rematching.
+const HIGHLIGHT_CACHE_LIMIT: usize = 4096;
+
 /// Lazily-rebuilt cache of the display-ordered, filtered row keys. Recomputing
 /// the sort + fuzzy filter on every `rows()` call (per frame, per keystroke) is
 /// wasteful on large clusters; we rebuild only when the store or filter changes.
@@ -1267,14 +1352,14 @@ struct FilterCache {
 struct RowsCache {
     dirty: bool,
     keys: Vec<RowKey>,
-    cells: HashMap<RowKey, CellCacheEntry>,
+    cells: crate::store::FastMap<RowKey, CellCacheEntry>,
     /// Computed primary sort keys, valid per (sort header, resourceVersion) —
     /// a rebuild touches every object, but only changed rows re-extract.
-    sort_keys: HashMap<RowKey, SortKeyEntry>,
+    sort_keys: crate::store::FastMap<RowKey, SortKeyEntry>,
     /// Helm view only: the latest-revision dedup, paired with the store
     /// version it was computed from. A rebuild staled by a filter keystroke or
     /// a sort toggle leaves the store untouched, so the dedup still holds.
-    helm_latest: Option<(u64, HashSet<RowKey>)>,
+    helm_latest: Option<(u64, crate::store::FastSet<RowKey>)>,
 }
 
 struct CellCacheEntry {
@@ -1461,6 +1546,17 @@ pub struct App {
     /// Parsed form of `filter`, refreshed lazily when the string changes so
     /// neither row matching nor rendering reparses it per frame.
     filter_cache: RefCell<FilterCache>,
+    /// Fuzzy highlight positions per visible row name, valid for the needle
+    /// they were matched against.
+    highlight_cache: RefCell<HighlightCache>,
+    /// Memoized `display_headers()`, rebuilt when the spec or the column
+    /// toggles change.
+    header_cache: RefCell<Option<HeaderCache>>,
+    /// Memoized picker lists, each valid for the inputs it was built from.
+    picker_memos: RefCell<PickerMemos>,
+    /// Bumped on every view-spec rebuild, so caches derived from the spec can
+    /// tell that it moved.
+    spec_rev: u64,
     /// Server-side selectors (`-l`/`-f` filter terms) the running watch was
     /// started with. Compared against the parsed filter to know when a
     /// restart is needed and to mark the filter as server-side in the UI.
@@ -1756,7 +1852,7 @@ pub struct App {
     /// return so the cursor lands back on the same object.
     return_selection: Option<String>,
     pub should_quit: bool,
-    matcher: SkimMatcherV2,
+    matcher: crate::fuzzy::Fuzzy,
     rows_cache: RefCell<RowsCache>,
     /// Scratch buffer for the fuzzy filter's "namespace name" haystack, reused
     /// across rows so the filter pass doesn't allocate a `String` per object.
@@ -1822,6 +1918,10 @@ impl App {
                 raw: String::new(),
                 parsed: crate::filter::parse(""),
             }),
+            highlight_cache: RefCell::new(HighlightCache::default()),
+            header_cache: RefCell::new(None),
+            picker_memos: RefCell::new(PickerMemos::default()),
+            spec_rev: 0,
             applied_filter_labels: None,
             applied_filter_fields: None,
             command: String::new(),
@@ -1959,13 +2059,13 @@ impl App {
             return_mode: Mode::Table,
             return_selection: None,
             should_quit: false,
-            matcher: SkimMatcherV2::default(),
+            matcher: crate::fuzzy::Fuzzy::new(),
             hay_buf: RefCell::new(String::new()),
             rows_cache: RefCell::new(RowsCache {
                 dirty: true,
                 keys: Vec::new(),
-                cells: HashMap::new(),
-                sort_keys: HashMap::new(),
+                cells: crate::store::FastMap::default(),
+                sort_keys: crate::store::FastMap::default(),
                 helm_latest: None,
             }),
             log_provider: None,
