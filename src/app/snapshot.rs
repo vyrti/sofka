@@ -47,7 +47,7 @@ impl App {
     /// the table renders (NAMESPACE prepended across namespaces, CPU/MEM
     /// appended for pods/nodes, volatile cells resolved), minus the coloring.
     pub(super) fn snapshot_table(&self) -> (Vec<String>, Vec<Vec<String>>) {
-        let headers = self.display_headers();
+        let headers: Vec<String> = self.display_headers().to_vec();
         let show_ns = self.show_namespace_column();
         let metrics_cols = self.metrics_columns();
         let pods_view = self.kind_plural == "pods";
@@ -56,6 +56,9 @@ impl App {
         self.ensure_table_cell_cache(&objs);
         let cache = self.table_cell_cache();
         let spec = self.view_spec();
+        // One clock reading for the whole snapshot, so every row's elapsed
+        // cell is measured against the same instant.
+        let now = crate::columns::now_secs();
 
         let rows = objs
             .iter()
@@ -67,9 +70,9 @@ impl App {
                 }
                 if let Some((base_cells, _)) = cache.get(&rk) {
                     for (i, cell) in base_cells.iter().enumerate() {
-                        match spec.volatile(obj, &self.kind_plural, i) {
+                        match spec.volatile(obj, &self.kind_plural, i, now) {
                             Some(v) => cells.push(v),
-                            None => cells.push(cell.clone()),
+                            None => cells.push(cell.to_string()),
                         }
                     }
                 }

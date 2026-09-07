@@ -11,6 +11,7 @@
 //! - `metadata`    -> 3.3 (typed field lookup vs whole-meta serialization)
 //! - `log_filter`  -> 4.1 (O(n*m) substring scan)
 //! - `log_wrap`    -> 2.3 / 4.2 (full-buffer re-measure per frame)
+//! - `cell_extract` / `provider_selection` -> Tier 2/3 follow-up baselines
 
 use std::hint::black_box;
 
@@ -74,10 +75,11 @@ fn cells(c: &mut Criterion) {
 
     let pods: Vec<_> = (0..256).map(bs::pod).collect();
     let pod_spec = columns::build_spec("pods", None, None, false);
+    let now = columns::now_secs();
     g.bench_function("pods_256", |b| {
         b.iter(|| {
             for o in &pods {
-                black_box(pod_spec.cells(o));
+                black_box(pod_spec.cells(o, now));
             }
         });
     });
@@ -88,7 +90,7 @@ fn cells(c: &mut Criterion) {
     g.bench_function("helm_16", |b| {
         b.iter(|| {
             for o in &helm {
-                black_box(helm_spec.cells(o));
+                black_box(helm_spec.cells(o, now));
             }
         });
     });
@@ -285,14 +287,434 @@ fn helm_decode(c: &mut Criterion) {
             black_box(v)
         });
     });
+    // The double base64 decode Helm's payload needs, SIMD against scalar.
+    {
+        let wire = secret
+            .data
+            .pointer("/data/release")
+            .and_then(serde_json::Value::as_str)
+            .expect("fixture payload")
+            .to_string();
+        let scalar = base64::engine::general_purpose::STANDARD;
+        let simd = base64::engine::Simd::standard(Default::default());
+        fn twice<E: base64::Engine>(e: &E, wire: &str) -> Vec<u8> {
+            let inner = e.decode(wire).expect("outer base64");
+            e.decode(inner).expect("inner base64")
+        }
+        g.bench_function("base64_scalar", |b| {
+            b.iter(|| black_box(twice(&scalar, black_box(&wire))));
+        });
+        g.bench_function("base64_simd", |b| {
+            b.iter(|| black_box(twice(&simd, black_box(&wire))));
+        });
+    }
     g.bench_function("parse_typed", |b| {
         b.iter(|| black_box(sofka::helm::parse_release_json(black_box(&json))));
     });
     g.finish();
 }
 
+/// Tier 3 — targeted structured-filter extraction. The baseline forces the
+/// borrowed JSON string into an owned `String`, matching the old `sget ->
+/// String` contract; production consumes the `Cow::Borrowed` directly.
+fn cell_extract(c: &mut Criterion) {
+    let mut g = c.benchmark_group("cell_extract");
+    let pods: Vec<_> = (0..2_000).map(bs::pod).collect();
+    let spec = columns::build_spec("pods", None, None, true);
+
+    g.bench_function("borrowed_ip_2000", |b| {
+        b.iter(|| {
+            for pod in &pods {
+                black_box(
+                    spec.cell_at(black_box(pod), 4, columns::now_secs())
+                        .unwrap(),
+                );
+            }
+        });
+    });
+    g.bench_function("owned_ip_baseline_2000", |b| {
+        b.iter(|| {
+            for pod in &pods {
+                black_box(
+                    spec.cell_at(black_box(pod), 4, columns::now_secs())
+                        .unwrap()
+                        .into_owned(),
+                );
+            }
+        });
+    });
+    g.finish();
+}
+
+/// The per-frame clock. `now` measures the shipped path — one reading threaded
+/// through the row — against the previous one, where each elapsed cell read the
+/// clock for itself.
+fn frame_clock(c: &mut Criterion) {
+    let mut g = c.benchmark_group("frame_clock");
+    let pods: Vec<_> = (0..2_000).map(bs::pod).collect();
+    let spec = columns::build_spec("pods", None, None, false);
+    // AGE is the elapsed cell this measures, and it is not column 0 — that is
+    // NAME, which is not volatile, so both sides would have returned `None`
+    // and timed the clock call against an empty result.
+    let age = spec
+        .header_index("AGE")
+        .expect("pods view must have an AGE column");
+    assert!(
+        spec.volatile(&pods[0], "pods", age, columns::now_secs())
+            .is_some(),
+        "AGE must render an elapsed value, or this measures nothing"
+    );
+
+    g.bench_function("one_reading_per_frame_2000", |b| {
+        b.iter(|| {
+            let now = columns::now_secs();
+            for pod in &pods {
+                black_box(spec.volatile(pod, "pods", age, now));
+            }
+        });
+    });
+    g.bench_function("one_reading_per_cell_2000", |b| {
+        b.iter(|| {
+            for pod in &pods {
+                black_box(spec.volatile(pod, "pods", age, columns::now_secs()));
+            }
+        });
+    });
+    g.finish();
+}
+
+/// Tier 2 — provider autodiscovery. Both implementations use `min_by_key`;
+/// the baseline first collects every candidate into a `Vec`, while production
+/// feeds the filtered iterator directly into the minimum selection.
+fn provider_selection(c: &mut Criterion) {
+    let mut g = c.benchmark_group("provider_selection");
+    let services = bs::services(256);
+
+    g.bench_function("logs_streaming_256", |b| {
+        b.iter(|| black_box(bs::pick_log_service(black_box(&services))));
+    });
+    g.bench_function("logs_collected_baseline_256", |b| {
+        b.iter(|| black_box(bs::pick_log_service_collected(black_box(&services))));
+    });
+    g.bench_function("metrics_streaming_256", |b| {
+        b.iter(|| black_box(bs::pick_metrics_service(black_box(&services))));
+    });
+    g.bench_function("metrics_collected_baseline_256", |b| {
+        b.iter(|| black_box(bs::pick_metrics_service_collected(black_box(&services))));
+    });
+    g.finish();
+}
+
+/// The extract-then-render path the borrowed one replaced: an owned `Value`
+/// for the whole subtree, then the same formatting. The shipped `render_cell`
+/// produces exactly this text without the clone.
+fn render_owned(obj: &kube::core::DynamicObject, pointer: &str) -> String {
+    use serde_json::Value;
+    let Some(v) = sofka::views::extract(obj, pointer) else {
+        return "<none>".into();
+    };
+    match v {
+        Value::Null => "<none>".into(),
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        ref other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// Custom-column extraction: the shipped borrowed result against the owned
+/// `Value` it replaced, over the shapes a printer column actually points at.
+fn custom_columns(c: &mut Criterion) {
+    let mut g = c.benchmark_group("custom_columns");
+    let pods: Vec<_> = (0..2_000).map(bs::pod).collect();
+    let col = |pointer: &str| sofka::views::UserColumn {
+        header: "COL".into(),
+        pointer: pointer.into(),
+        kind: sofka::views::ColumnKind::Text,
+        wide: false,
+        width: None,
+        align: None,
+        condition_field: None,
+    };
+    let now = columns::now_secs();
+
+    for (name, pointer) in [
+        ("scalar", "/status/phase"),
+        ("label", "/metadata/labels/app.kubernetes.io~1name"),
+        ("array", "/spec/containers"),
+        ("nested", "/spec/containers/0/resources"),
+    ] {
+        let column = col(pointer);
+        g.bench_with_input(BenchmarkId::new("render_2000", name), &column, |b, col| {
+            b.iter(|| {
+                for pod in &pods {
+                    black_box(sofka::views::render_cell(pod, col, now));
+                }
+            });
+        });
+        g.bench_with_input(
+            BenchmarkId::new("owned_baseline_2000", name),
+            &column,
+            |b, col| {
+                b.iter(|| {
+                    for pod in &pods {
+                        black_box(render_owned(pod, &col.pointer));
+                    }
+                });
+            },
+        );
+    }
+    g.finish();
+}
+
+/// Provider log records: the shipped selective visitor against the
+/// `serde_json::Value` DOM it replaced, over records carrying the extra fields
+/// an ingestion pipeline attaches.
+fn provider_records(c: &mut Criterion) {
+    let mut g = c.benchmark_group("provider_records");
+
+    for extra in [0usize, 12] {
+        let fields: String = (0..extra)
+            .map(|i| format!(r#","field_{i}":"value {i}""#))
+            .collect();
+        let lines: Vec<String> = (0..10_000)
+            .map(|i| {
+                format!(
+                    r#"{{"_time":"2026-09-05T12:00:00Z","_msg":"request {i} served","kubernetes.pod_name":"api-{i}","kubernetes.container_name":"app"{fields}}}"#
+                )
+            })
+            .collect();
+
+        g.bench_with_input(
+            BenchmarkId::new("visitor_10000", extra),
+            &lines,
+            |b, lines| {
+                b.iter(|| {
+                    for l in lines {
+                        black_box(sofka::providers::bench_parse_entry(l));
+                    }
+                });
+            },
+        );
+        g.bench_with_input(
+            BenchmarkId::new("dom_baseline_10000", extra),
+            &lines,
+            |b, lines| {
+                b.iter(|| {
+                    for l in lines {
+                        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                        black_box((
+                            v.get("_msg").and_then(|v| v.as_str()).map(str::to_string),
+                            v.get("_time").and_then(|v| v.as_str()).map(str::to_string),
+                            v.get("kubernetes.pod_name")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
+                            v.get("kubernetes.container_name")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
+                        ));
+                    }
+                });
+            },
+        );
+    }
+    g.finish();
+}
+
+/// The fuzzy matcher, over the two shapes it runs in: one needle against every
+/// row of a store, and the highlight positions the renderer asks for.
+fn fuzzy(c: &mut Criterion) {
+    let mut g = c.benchmark_group("fuzzy");
+    let names: Vec<String> = (0..20_000)
+        .map(|i| format!("kube-httpcache-{i:05}"))
+        .collect();
+    let f = sofka::fuzzy::Fuzzy::new();
+
+    g.bench_function("score_20000", |b| {
+        b.iter(|| {
+            for n in &names {
+                black_box(f.score(n, "khc"));
+            }
+        });
+    });
+    g.bench_function("indices_visible_50", |b| {
+        b.iter(|| {
+            for n in names.iter().take(50) {
+                black_box(f.indices(n, "khc"));
+            }
+        });
+    });
+    g.finish();
+}
+
+/// The memoized per-frame models: headers and the picker lists. Each pair is
+/// the memo against the rebuild it replaced.
+fn frame_models(c: &mut Criterion) {
+    let mut g = c.benchmark_group("frame_models");
+    let (app, _rx) = bs::pods_app(2_000);
+
+    g.bench_function("display_headers", |b| {
+        b.iter(|| black_box(app.display_headers()));
+    });
+
+    let (ctx_app, _ctx_rx) = bs::contexts_app(2_000);
+    g.bench_function("filtered_contexts_2000", |b| {
+        b.iter(|| black_box(ctx_app.filtered_contexts()));
+    });
+    g.bench_function("filtered_sort_entries", |b| {
+        b.iter(|| black_box(app.filtered_sort_entries()));
+    });
+    g.finish();
+}
+
+/// The dependency swaps whose baseline is in `std`, each against the
+/// implementation it replaced. The fuzzy matcher is measured in `fuzzy` above;
+/// its predecessor is not carried as a dependency just to benchmark it.
+fn dependencies(c: &mut Criterion) {
+    let mut g = c.benchmark_group("dependencies");
+
+    // --- hasher: foldhash against SipHash, over real row keys ---------------
+    // The shape that matters is a filter keystroke, which looks up every key
+    // in the store once. Keys are `namespace/name`, as the store holds them.
+    for n in [2_000usize, 20_000] {
+        let keys: Vec<std::rc::Rc<str>> = (0..n)
+            .map(|i| std::rc::Rc::from(format!("namespace-{}/pod-{i:05}", i % 40).as_str()))
+            .collect();
+
+        let mut fold: sofka::store::FastMap<std::rc::Rc<str>, u32> = Default::default();
+        let mut sip: std::collections::HashMap<std::rc::Rc<str>, u32> = Default::default();
+        for (i, k) in keys.iter().enumerate() {
+            fold.insert(k.clone(), i as u32);
+            sip.insert(k.clone(), i as u32);
+        }
+
+        g.bench_with_input(BenchmarkId::new("lookup_foldhash", n), &n, |b, _| {
+            b.iter(|| {
+                for k in &keys {
+                    black_box(fold.get(k.as_ref()));
+                }
+            });
+        });
+        g.bench_with_input(BenchmarkId::new("lookup_siphash", n), &n, |b, _| {
+            b.iter(|| {
+                for k in &keys {
+                    black_box(sip.get(k.as_ref()));
+                }
+            });
+        });
+    }
+
+    g.finish();
+}
+
+/// 3-4/039 — one xray refresh's CPU half: index every child by owner uid, then
+/// walk the roots into the flat row list. The pool is dominated by pods, and
+/// the old index cloned each one once per owner reference.
+fn xray_index(c: &mut Criterion) {
+    let mut g = c.benchmark_group("xray_index");
+    for (roots, per) in [(20usize, 10usize), (100, 20)] {
+        let (deployments, pool) = bs::xray_tree(roots, per);
+        let n = roots * per;
+        g.bench_with_input(BenchmarkId::new("flatten", n), &n, |b, _| {
+            b.iter(|| black_box(bs::xray_flatten("deployment", &deployments, &pool).len()));
+        });
+    }
+    g.finish();
+}
+
+/// 3-4/036 — the events document. `render` is one full format+sort of the
+/// accumulated map; `initial_burst` is what an N-event initial list costs when
+/// every arriving event republishes the whole document, which is the shape the
+/// watcher had: a sequence of growing full rebuilds.
+fn events_doc(c: &mut Criterion) {
+    let mut g = c.benchmark_group("events_doc");
+    for n in [200usize, 1_000] {
+        let doc = bs::event_doc(&bs::events(n));
+        g.bench_with_input(BenchmarkId::new("render", n), &n, |b, _| {
+            b.iter(|| black_box(bs::event_doc_render(&doc)));
+        });
+    }
+    let n = 200usize;
+    let events = bs::events(n);
+    g.bench_with_input(BenchmarkId::new("initial_burst", n), &n, |b, _| {
+        b.iter(|| black_box(bs::event_doc_initial(&events)));
+    });
+    g.finish();
+}
+
+/// 3-4/037 — the YAML document a keypress builds on the UI thread. The object
+/// is cloned before serializing so `TypeMeta` can be stamped in.
+fn object_yaml(c: &mut Criterion) {
+    let mut g = c.benchmark_group("object_yaml");
+    let (app, _rx) = bs::pods_app(1);
+    for (label, obj) in [("pod", bs::pod(1)), ("fat", bs::fat_object(120))] {
+        g.bench_function(label, |b| {
+            b.iter(|| black_box(app.object_yaml(black_box(&obj)).len()));
+        });
+    }
+    g.finish();
+}
+
+/// 3-4/037 — the `d` keypress: two cleaned YAML renders and a unified diff of
+/// the whole document, all on the UI thread.
+fn object_diff(c: &mut Criterion) {
+    let mut g = c.benchmark_group("object_diff");
+    for entries in [40usize, 240] {
+        let prev = bs::fat_object(entries);
+        let live = bs::fat_object_changed(entries);
+        g.bench_with_input(BenchmarkId::new("fat", entries), &entries, |b, _| {
+            b.iter(|| black_box(bs::diff_document(&prev, &live)));
+        });
+    }
+    g.finish();
+}
+
+/// 3-4/033 — per-line cost of the kubelet log ingest loop: build the batch
+/// entry, then hand a full batch to the channel. `plain` is the unprefixed
+/// single-pod stream; `prefixed` is the aggregate view's `[pod] ` tag.
+fn log_ingest(c: &mut Criterion) {
+    let mut g = c.benchmark_group("log_ingest");
+    let lines = bs::log_lines(4_096);
+    for (label, prefix) in [("plain", ""), ("prefixed", "[workload-00042:app] ")] {
+        g.bench_function(label, |b| {
+            b.iter(|| black_box(bs::ingest_lines(black_box(prefix), lines.iter().cloned())));
+        });
+    }
+    g.finish();
+}
+
+/// 3-4/031 — appending a batch to the follow buffer, which is already at its
+/// retention limit, so every push also trims. `long` feeds pathological
+/// single-line payloads (a structured log record dumped whole).
+fn log_retain(c: &mut Criterion) {
+    let mut g = c.benchmark_group("log_retain");
+    for (label, batch) in [
+        ("normal", bs::log_lines(64)),
+        ("long", bs::log_lines_long(64, 64 * 1024)),
+    ] {
+        // A buffer already at its limit trims exactly what each push appends,
+        // so this is a genuine steady state: no per-iteration setup to drown
+        // out the microseconds being measured.
+        let mut app = bs::logs_app_at_capacity(2_000);
+        app.push_log_lines(batch.iter().cloned());
+        g.bench_function(label, |b| {
+            b.iter(|| {
+                app.push_log_lines(batch.iter().cloned());
+                black_box(bs::log_line_count(&app))
+            });
+        });
+    }
+    g.finish();
+}
+
 criterion_group!(
     benches,
+    xray_index,
+    events_doc,
+    object_yaml,
+    object_diff,
+    log_ingest,
+    log_retain,
     rows_cache,
     filter,
     filter_cmp,
@@ -303,6 +725,14 @@ criterion_group!(
     metadata,
     log_filter,
     log_wrap,
-    log_viewport
+    log_viewport,
+    cell_extract,
+    provider_selection,
+    frame_clock,
+    custom_columns,
+    provider_records,
+    fuzzy,
+    frame_models,
+    dependencies
 );
 criterion_main!(benches);

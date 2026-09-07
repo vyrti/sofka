@@ -1,9 +1,5 @@
 use super::*;
 
-/// Fallback delay if the watcher backoff ever runs out of steps. `DefaultBackoff`
-/// is unbounded in attempts, so this is belt and braces rather than a real path.
-const NODE_PODS_BACKOFF_CEILING: Duration = Duration::from_secs(30);
-
 fn node_pods_watch_forbidden(error: &watcher::Error) -> bool {
     match error {
         watcher::Error::InitialListFailed(kube::Error::Api(status))
@@ -267,6 +263,7 @@ impl App {
         self.applied_filter_labels = filter_labels;
         self.applied_filter_fields = filter_fields;
         self.clear_progress_flash();
+        self.stop_plugins();
         self.generation += 1;
         self.gen_flag.store(self.generation, Ordering::SeqCst);
         for t in self.tasks.drain(..) {
@@ -715,8 +712,7 @@ impl App {
                             // the counts are going nowhere; `dirty` survives, so
                             // the next tick after recovery still emits.
                             Err(_) => {
-                                let delay =
-                                    backoff.next().unwrap_or(NODE_PODS_BACKOFF_CEILING);
+                                let delay = backoff.next().unwrap_or(crate::k8s::WATCH_BACKOFF_CEILING);
                                 tokio::time::sleep(delay).await;
                             }
                         }
@@ -783,6 +779,7 @@ impl App {
     pub(super) fn bump_generation(&mut self) {
         self.stop_event_stream();
         self.clear_progress_flash();
+        self.stop_plugins();
         self.generation += 1;
         self.gen_flag.store(self.generation, Ordering::SeqCst);
         for t in self.tasks.drain(..) {
@@ -791,6 +788,21 @@ impl App {
     }
 
     pub fn handle_msg(&mut self, msg: Msg) {
+        let preserve_selection = self.faults_filter_active()
+            && matches!(
+                &msg,
+                Msg::Applied { generation, .. }
+                    | Msg::Deleted { generation, .. }
+                    | Msg::Reset { generation }
+                    | Msg::Synced { generation }
+                    if *generation == self.generation
+            );
+        let selected_pod = if preserve_selection {
+            self.selected_ref()
+                .map(|o| (crate::store::row_key(o), o.metadata.uid.clone()))
+        } else {
+            None
+        };
         match msg {
             Msg::Reset { generation } if generation == self.generation => {
                 // With rows on screen (cached snapshot or established watch)
@@ -843,6 +855,13 @@ impl App {
                 self.last_error = Some(error.clone());
                 self.borrow_status(format!("error: {error}"), true);
             }
+            Msg::StateWriteFailed { id, error } => {
+                self.last_state_write_error = Some(error.clone());
+                self.borrow_status(format!("state not saved: {error}"), true);
+                if let Some(writer) = &self.state_writer {
+                    writer.acknowledge_failure(id);
+                }
+            }
             Msg::Flash {
                 generation,
                 claim,
@@ -855,14 +874,21 @@ impl App {
                 self.last_error = Some(error.clone());
                 self.borrow_status(format!("internal error: {error}"), true);
             }
-            Msg::Notify(text) => {
+            Msg::Notify { epoch, text } if epoch == self.notify_epoch => {
                 self.borrow_status(format!("🔔 {text}"), false);
                 // Delivery happens once per frame in the run loop (see
-                // `take_notification`), so a batch of these coalesces.
-                self.pending_notify.push(text);
+                // `take_notification`), so a batch of these coalesces. The
+                // queue is bounded here rather than at delivery: a rollout
+                // across many notified objects would otherwise build a large
+                // string only for `take_notification` to ellipsize it away.
+                if self.pending_notify.len() < MAX_PENDING_NOTIFY {
+                    self.pending_notify.push(text);
+                } else {
+                    self.dropped_notify += 1;
+                }
             }
             Msg::LogLines { generation, lines } if generation == self.log_gen => {
-                self.push_log_lines(lines);
+                self.push_log_lines(lines.into_lines());
             }
             Msg::LogProviderDiscovered {
                 generation,
@@ -1022,12 +1048,15 @@ impl App {
                 self.clear_claimed_status(claim);
             }
             Msg::PluginOutput {
+                run,
                 generation,
                 claim,
                 title,
                 lines,
                 warn,
-            } if generation == self.generation => {
+            } if generation == self.generation && run == self.plugin_run => {
+                self.plugin_task = None;
+                self.plugin_claim = None;
                 self.detail = Scrollable {
                     title,
                     lines: lines.into(),
@@ -1040,12 +1069,15 @@ impl App {
                 }
             }
             Msg::PluginBulkDone {
+                run,
                 generation,
                 claim,
                 name,
                 ok,
                 failed,
-            } if generation == self.generation => {
+            } if generation == self.generation && run == self.plugin_run => {
+                self.plugin_task = None;
+                self.plugin_claim = None;
                 if failed.is_empty() {
                     self.set_claimed_status(claim, format!("plugin {name}: {ok} ok"), false);
                 } else {
@@ -1141,10 +1173,18 @@ impl App {
             Msg::Detail {
                 generation,
                 claim,
+                target,
                 title,
                 lines,
                 warn,
             } if generation == self.generation => {
+                if target
+                    .as_deref()
+                    .is_some_and(|target| !self.document_result_is_current(claim, target))
+                {
+                    self.clear_claimed_status(claim);
+                    return;
+                }
                 self.detail = Scrollable {
                     title,
                     lines: lines.into(),
@@ -1158,6 +1198,34 @@ impl App {
                     None => self.clear_claimed_status(claim),
                 }
             }
+            Msg::Diff {
+                generation,
+                claim,
+                target,
+                title,
+                result,
+            } if generation == self.generation => {
+                if !self.document_result_is_current(claim, &target) {
+                    self.clear_claimed_status(claim);
+                    return;
+                }
+                match result {
+                    Ok(lines) => {
+                        self.detail = Scrollable {
+                            title,
+                            lines: lines.into(),
+                            ..Default::default()
+                        };
+                        self.mode = Mode::Diff;
+                        self.clear_claimed_status(claim);
+                    }
+                    Err(label) => self.set_claimed_status(
+                        claim,
+                        format!("no diff: live matches {label}"),
+                        false,
+                    ),
+                }
+            }
             Msg::Events {
                 generation,
                 title,
@@ -1169,10 +1237,6 @@ impl App {
                 // one it replaces, which would otherwise leave a stale
                 // search-match cache behind.
                 self.detail.replace_lines(lines.into());
-                self.detail.scroll = self
-                    .detail
-                    .scroll
-                    .min(self.detail.lines.len().saturating_sub(1));
             }
             Msg::TransferDone {
                 generation,
@@ -1272,6 +1336,20 @@ impl App {
                 }
             },
             _ => {} // stale generation, drop
+        }
+        if preserve_selection {
+            let index = selected_pod.and_then(|(key, uid)| {
+                self.ensure_rows_cache();
+                if self.store.get(&key)?.metadata.uid != uid {
+                    return None;
+                }
+                self.rows_cache
+                    .borrow()
+                    .keys
+                    .iter()
+                    .position(|k| k.as_ref() == key)
+            });
+            self.table_state.select(index);
         }
     }
 }

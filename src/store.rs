@@ -6,6 +6,36 @@ use std::sync::Arc;
 
 use kube::core::DynamicObject;
 
+/// A log payload plus the byte reservation that keeps queued log memory
+/// bounded. The reservation is released when the UI consumes or discards the
+/// message.
+pub struct QueuedLogLines {
+    lines: Vec<String>,
+    _queue_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl QueuedLogLines {
+    pub(crate) fn new(
+        lines: Vec<String>,
+        queue_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Self {
+        Self {
+            lines,
+            _queue_permit: queue_permit,
+        }
+    }
+
+    pub(crate) fn into_lines(self) -> Vec<String> {
+        self.lines
+    }
+}
+
+impl From<Vec<String>> for QueuedLogLines {
+    fn from(lines: Vec<String>) -> Self {
+        Self::new(lines, None)
+    }
+}
+
 /// Identity of an asynchronous operation's claim on the shared status bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StatusClaim(pub(crate) u64);
@@ -30,7 +60,7 @@ pub enum Msg {
     },
     LogLines {
         generation: u64,
-        lines: Vec<String>,
+        lines: QueuedLogLines,
     },
     /// Point-in-time usage snapshot from the metrics API, keyed by "ns/name"
     /// (pods) or "name" (nodes) -> (cpu millicores, memory bytes).
@@ -88,6 +118,7 @@ pub enum Msg {
     },
     /// Captured output of an `output = "popup"` plugin run.
     PluginOutput {
+        run: u64,
         generation: u64,
         claim: StatusClaim,
         title: String,
@@ -98,6 +129,7 @@ pub enum Msg {
     /// Completion notice for an `output = "background"` plugin run (single or
     /// bulk): how many jobs succeeded and the failures (label + reason).
     PluginBulkDone {
+        run: u64,
         generation: u64,
         claim: StatusClaim,
         name: String,
@@ -108,10 +140,24 @@ pub enum Msg {
     Detail {
         generation: u64,
         claim: StatusClaim,
+        /// Selection identity for key-triggered document work. `None` for
+        /// reports whose result is independent of the table cursor.
+        target: Option<String>,
         title: String,
         lines: Vec<String>,
         /// Set when describe failed and we fell back to YAML.
         warn: Option<String>,
+    },
+    /// Result of an off-thread `d` diff. Large documents are serialized and
+    /// diffed on a blocking worker so the keypress does not stall the frame.
+    Diff {
+        generation: u64,
+        claim: StatusClaim,
+        target: String,
+        title: String,
+        /// The diff rows, or the baseline label when live matched it (which
+        /// stays on the current view rather than opening an empty document).
+        result: Result<Vec<String>, String>,
     },
     /// Live Event rows for the selected object.
     Events {
@@ -228,6 +274,13 @@ pub enum Msg {
         generation: u64,
         error: String,
     },
+    /// A generation-independent persistent UI-state write failed. The id lets
+    /// the UI acknowledge that it actually handled the notice; merely putting
+    /// it in the event channel is not delivery during shutdown.
+    StateWriteFailed {
+        id: u64,
+        error: String,
+    },
     /// A background action (delete, restart, scale, drain, helm op, …)
     /// finished; replaces its "…ing" progress flash with a result. Also
     /// carries `:can-i` verdicts, which are the same thing: a one-line answer
@@ -245,9 +298,12 @@ pub enum Msg {
     /// Deliberately generation-free: it must surface no matter which view is
     /// current.
     Panic(String),
-    /// A state change on a `:notify`-watched object. Generation-free like
-    /// [`Msg::Panic`]: the whole point is firing from any view.
-    Notify(String),
+    /// A state change on a `:notify`-watched object. The epoch changes only
+    /// across cluster contexts, unlike the ordinary view generation.
+    Notify {
+        epoch: u64,
+        text: String,
+    },
 }
 
 /// One hit from the global fuzzy find (`:find <text>`).
@@ -313,7 +369,25 @@ pub fn row_key(obj: &DynamicObject) -> String {
 /// contributor to RSS and to per-event cost. Nothing mutates an object once
 /// stored (`apply` replaces wholesale), so sharing is safe.
 pub type RowKey = Rc<str>;
-pub type Items = HashMap<RowKey, Arc<DynamicObject>>;
+pub type Items = FastMap<RowKey, Arc<DynamicObject>>;
+
+/// The hasher for maps keyed by cluster data — row keys, cell caches, sort
+/// keys. The default `SipHash` is chosen to make hash flooding infeasible for
+/// keys an attacker supplies; a filter keystroke rehashes every row key in the
+/// store, so that costs real frame time here.
+///
+/// `foldhash`'s randomized state keeps a per-process seed, so a collision set
+/// cannot be precomputed against the binary. What it drops is the guarantee
+/// against an adversary who can both observe timing and choose keys — and here
+/// the keys are `namespace/name` of objects the API server already accepted,
+/// read by a user who is authenticated to that cluster and is watching those
+/// objects deliberately. Anything that could flood these maps could already
+/// exhaust them by simply creating objects.
+///
+/// Config, theme and registry maps keep the standard hasher: they are built
+/// once from local files and never sit in a hot path.
+pub type FastMap<K, V> = HashMap<K, V, foldhash::fast::RandomState>;
+pub type FastSet<T> = std::collections::HashSet<T, foldhash::fast::RandomState>;
 
 /// How a store operation affected the rows currently visible to the UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -378,7 +452,7 @@ impl Store {
             self.pending = None;
             true
         } else {
-            self.pending = Some(HashMap::new());
+            self.pending = Some(Items::default());
             false
         }
     }
@@ -455,6 +529,10 @@ impl Store {
         self.items.get(key).map(AsRef::as_ref)
     }
 
+    pub(crate) fn shared(&self, key: &str) -> Option<Arc<DynamicObject>> {
+        self.items.get(key).cloned()
+    }
+
     pub fn key(&self, key: &str) -> Option<&RowKey> {
         self.items.get_key_value(key).map(|(key, _)| key)
     }
@@ -508,7 +586,7 @@ mod tests {
         store.remove("default/gone");
         advanced(&store, &mut last, "remove (no such key)");
 
-        let mut seeded = Items::new();
+        let mut seeded = Items::default();
         seeded.insert(Rc::from("default/b"), Arc::new(pod("b")));
         store.seed(seeded);
         advanced(&store, &mut last, "seed");

@@ -7,7 +7,8 @@ impl App {
     /// waiting reasons, conditions) flashes, rings the terminal bell, and
     /// emits a desktop notification (`[notify]`). Each notify is its own bounded
     /// single-object watch, so it keeps firing no matter which view is open,
-    /// until toggled off or the session ends. Nothing touches disk.
+    /// until toggled off, the cluster context changes, or the session ends.
+    /// Nothing touches disk.
     pub(super) fn toggle_notify(&mut self) {
         if matches!(self.kind_plural.as_str(), "helm" | "helmhistory") {
             self.flash_warn("notify is not available for Helm views");
@@ -41,12 +42,24 @@ impl App {
             self.flash_warn("object has no name to watch");
             return;
         }
+        // Each notify is its own watch, held for the session; without a budget
+        // a long session can accumulate an unbounded number of them. Toggling
+        // one off is always allowed — the check is below that branch.
+        let budget = self.notify_cfg.max_watches;
+        if budget > 0 && self.notify_tasks.len() >= budget {
+            self.flash_warn(&format!(
+                "notify budget reached ({budget} watches) — toggle one off, \
+                 or raise [notify] max_watches"
+            ));
+            return;
+        }
         let label = format!("{}/{name}", trim_s(&self.kind_plural));
         let plural = self.kind_plural.clone();
         let client = self.cluster.client.clone();
         let ar = kind.ar.clone();
         let namespaced = kind.namespaced;
         let tx = self.tx.clone();
+        let epoch = self.notify_epoch;
 
         let handle = tokio::spawn(async move {
             let api: Api<DynamicObject> = if namespaced && !ns.is_empty() {
@@ -62,7 +75,19 @@ impl App {
             // The initial list describes the state the user just looked at —
             // only changes after that are news.
             let mut synced = false;
+            let mut backoff = watcher::DefaultBackoff::default();
             while let Some(event) = stream.next().await {
+                // Progress, as opposed to another doomed list attempt: `Init`
+                // and its `InitApply`s replay on every attempt, so resetting on
+                // those would never let the delay escalate.
+                if matches!(
+                    event,
+                    Ok(watcher::Event::Apply(_)
+                        | watcher::Event::Delete(_)
+                        | watcher::Event::InitDone)
+                ) {
+                    backoff.reset();
+                }
                 match event {
                     Ok(watcher::Event::Apply(o)) | Ok(watcher::Event::InitApply(o)) => {
                         // One watch event → ONE notification. A single change
@@ -81,7 +106,7 @@ impl App {
                         };
                         if !items.is_empty() {
                             let text = format!("{label}: {}", items.join(" · "));
-                            if tx.send(Msg::Notify(text)).await.is_err() {
+                            if tx.send(Msg::Notify { epoch, text }).await.is_err() {
                                 return;
                             }
                         }
@@ -90,7 +115,10 @@ impl App {
                     Ok(watcher::Event::Delete(_)) => {
                         prev = None;
                         if tx
-                            .send(Msg::Notify(format!("{label}: deleted")))
+                            .send(Msg::Notify {
+                                epoch,
+                                text: format!("{label}: deleted"),
+                            })
                             .await
                             .is_err()
                         {
@@ -100,8 +128,16 @@ impl App {
                     Ok(watcher::Event::Init) => {}
                     Ok(watcher::Event::InitDone) => synced = true,
                     // The watcher self-heals; a transient error is not a
-                    // state change worth ringing a bell for.
-                    Err(_) => {}
+                    // state change worth ringing a bell for. It does need
+                    // pacing though: `watcher` re-lists as fast as the stream
+                    // is polled, so an error that never clears would hammer
+                    // the API server for the rest of the session.
+                    Err(_) => {
+                        tokio::time::sleep(
+                            backoff.next().unwrap_or(crate::k8s::WATCH_BACKOFF_CEILING),
+                        )
+                        .await;
+                    }
                 }
             }
         });
@@ -113,17 +149,36 @@ impl App {
         self.flash_err = false;
     }
 
+    /// Stop watches bound to the previous cluster and invalidate any of their
+    /// events already waiting in the shared message channel. A failed context
+    /// switch never calls this, so notifications keep working on the context
+    /// the user remains connected to.
+    pub(super) fn stop_context_notifications(&mut self) {
+        self.notify_epoch = self.notify_epoch.wrapping_add(1);
+        for (_, task) in self.notify_tasks.drain() {
+            task.abort();
+        }
+        self.pending_notify.clear();
+        self.dropped_notify = 0;
+        self.pending_notifier = None;
+        self.merged_notifier = 0;
+    }
+
     /// The message the main loop should deliver (bell, escape sequence,
     /// notifier subprocess), if any arrived since the last frame. Multiple
     /// pending notifications join into one message — one delivery per frame,
     /// bounded, so bursts survive sink rate limiting.
+    ///
+    /// Anything the queue had to drop is reported as a count rather than
+    /// silently lost.
     pub fn take_notification(&mut self) -> Option<String> {
         if self.pending_notify.is_empty() {
             return None;
         }
         let text = self.pending_notify.join(" · ");
         self.pending_notify.clear();
-        Some(crate::text::ellipsize(&text, 300))
+        let dropped = std::mem::take(&mut self.dropped_notify);
+        Some(notification_summary(&text, dropped))
     }
 
     /// Deliver one `:notify` event through the notifier subprocess, when one
@@ -132,7 +187,33 @@ impl App {
     /// sequences. Fire-and-forget with nulled stdio; a notifier that can't
     /// even start is worth one warning, not a broken TUI.
     pub fn run_notify_command(&mut self, text: &str) {
-        let Some(argv) = notification_command(&self.notify_cfg, in_herdr_pane(), text) else {
+        if notification_command(&self.notify_cfg, in_herdr_pane(), text).is_none() {
+            return;
+        }
+        if self.pending_notifier.is_some() {
+            self.merged_notifier = self.merged_notifier.saturating_add(1);
+        } else {
+            self.pending_notifier = Some(text.to_string());
+        }
+        self.retry_notify_command();
+    }
+
+    /// Reap notifier subprocesses and deliver the retained summary as soon as
+    /// one slot is free. Called on quiet frames too, so a saturated burst does
+    /// not need another state change to make progress.
+    pub fn retry_notify_command(&mut self) {
+        self.notifier_procs
+            .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_)) | Err(_)));
+        if self.notifier_procs.len() >= MAX_NOTIFIER_PROCS {
+            return;
+        }
+        let Some(pending) = self.pending_notifier.as_deref() else {
+            return;
+        };
+        let text = notification_summary(pending, self.merged_notifier);
+        let Some(argv) = notification_command(&self.notify_cfg, in_herdr_pane(), &text) else {
+            self.pending_notifier = None;
+            self.merged_notifier = 0;
             return;
         };
         let mut cmd = tokio::process::Command::new(&argv[0]);
@@ -140,10 +221,32 @@ impl App {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        if let Err(e) = cmd.spawn() {
-            self.flash_warn(&format!("notify command '{}' failed: {e}", argv[0]));
+        match cmd.spawn() {
+            Ok(child) => {
+                self.notifier_procs.push(child);
+                self.pending_notifier = None;
+                self.merged_notifier = 0;
+            }
+            Err(e) => {
+                self.pending_notifier = None;
+                self.merged_notifier = 0;
+                self.flash_warn(&format!("notify command '{}' failed: {e}", argv[0]));
+            }
         }
     }
+}
+
+/// Ellipsize the detail while reserving room for the overflow count. Appending
+/// the suffix after a full 300-character message made the count itself the
+/// first thing truncation removed.
+pub(super) fn notification_summary(text: &str, merged: usize) -> String {
+    const LIMIT: usize = 300;
+    if merged == 0 {
+        return crate::text::ellipsize(text, LIMIT);
+    }
+    let suffix = format!(" · (+{merged} more)");
+    let detail_limit = LIMIT.saturating_sub(suffix.chars().count());
+    format!("{}{}", crate::text::ellipsize(text, detail_limit), suffix)
 }
 
 /// Whether this process runs inside a herdr pane (herdr exports its socket

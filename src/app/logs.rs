@@ -3,26 +3,17 @@ use super::*;
 impl App {
     // ----- selection -----------------------------------------------------
 
-    pub(super) fn push_log_lines<I>(&mut self, lines: I)
+    pub fn push_log_lines<I>(&mut self, lines: I)
     where
         I: IntoIterator<Item = String>,
     {
-        // Strip carriage returns so progress output doesn't overwrite a row,
-        // and expand tabs to spaces — many loggers separate timestamp/level/body
-        // with tabs, which some terminals render awkwardly in a TUI cell.
-        // Clean lines (the vast majority) pass through without reallocating.
+        let mut added = 0usize;
         self.logs.view.lines.extend(lines.into_iter().map(|line| {
-            if !line.contains('\r') && !line.contains('\t') {
-                return line;
-            }
-            line.chars()
-                .filter_map(|c| match c {
-                    '\r' => None,
-                    '\t' => Some(' '),
-                    c => Some(c),
-                })
-                .collect()
+            let line = bound_log_line(line, self.logs_cfg.line_bytes);
+            added += line.len();
+            line
         }));
+        self.logs.retained_bytes += added;
 
         // While following, keep a tight tail buffer. While paused, avoid
         // trimming so indices don't shift under the frozen view (only a huge
@@ -32,7 +23,23 @@ impl App {
         } else {
             MAX_LOG_LINES_PAUSED
         };
-        let overflow = self.logs.view.lines.len().saturating_sub(cap);
+        let mut overflow = self.logs.view.lines.len().saturating_sub(cap);
+        // The byte ceiling applies whether following or paused: it is what
+        // actually bounds memory, and a paused firehose is exactly the case
+        // a line count fails to catch.
+        let byte_cap = self.logs_cfg.buffer_bytes;
+        if byte_cap > 0 && self.logs.retained_bytes > byte_cap {
+            let mut excess = self.logs.retained_bytes - byte_cap;
+            let mut dropped = 0usize;
+            for line in &self.logs.view.lines {
+                if excess == 0 {
+                    break;
+                }
+                excess = excess.saturating_sub(line.len());
+                dropped += 1;
+            }
+            overflow = overflow.max(dropped);
+        }
         if overflow == 0 {
             return;
         }
@@ -55,7 +62,8 @@ impl App {
                 .sum();
             self.logs.view.scroll = self.logs.view.scroll.saturating_sub(rows);
         }
-        self.logs.view.drain_front(overflow);
+        let dropped = self.logs.view.drain_front(overflow);
+        self.logs.retained_bytes = self.logs.retained_bytes.saturating_sub(dropped);
     }
 
     // ----- containers / logs --------------------------------------------
@@ -263,6 +271,7 @@ impl App {
             lines: VecDeque::new(),
             ..Default::default()
         };
+        self.logs.retained_bytes = 0;
         // A new Scrollable starts at revision 0, which can match the previous
         // buffer's revision. Do not let refresh_index mistake the replacement
         // for an append and retain stale line positions or wrapped heights.
@@ -280,7 +289,7 @@ impl App {
         if self.logs.source.is_none() {
             return;
         }
-        self.logs.view.clear_lines();
+        self.logs.clear_buffer();
         self.logs.view.scroll = 0;
         self.restart_log_stream();
     }
@@ -305,6 +314,16 @@ impl App {
     /// Spawn the streaming task(s) for the current `log_source`.
     pub(super) fn start_logs(&mut self) {
         let ts = self.logs.timestamps;
+        let queue = LogQueue::new(
+            self.tx.clone(),
+            self.log_gen,
+            self.logs_cfg.line_bytes,
+            self.logs_cfg.buffer_bytes,
+        );
+        let run = LogRun {
+            queue,
+            timestamps: ts,
+        };
         match self.logs.source.clone() {
             Some(LogSource::Pod {
                 ns,
@@ -313,7 +332,7 @@ impl App {
             }) => {
                 if containers.is_empty() {
                     // Unknown container set (e.g. from xray) — stream the default.
-                    self.spawn_one_log(ns, name, None, String::new(), false, ts);
+                    self.spawn_one_log(ns, name, None, String::new(), false, run);
                 } else {
                     let multi = containers.len() > 1;
                     for c in containers {
@@ -322,18 +341,25 @@ impl App {
                         } else {
                             String::new()
                         };
-                        self.spawn_one_log(ns.clone(), name.clone(), Some(c), prefix, false, ts);
+                        self.spawn_one_log(
+                            ns.clone(),
+                            name.clone(),
+                            Some(c),
+                            prefix,
+                            false,
+                            run.clone(),
+                        );
                     }
                 }
             }
-            Some(LogSource::Selector { ns, labels }) => self.spawn_selector_logs(ns, labels, ts),
+            Some(LogSource::Selector { ns, labels }) => self.spawn_selector_logs(ns, labels, run),
             Some(LogSource::Single {
                 ns,
                 pod,
                 container,
                 previous,
-            }) => self.spawn_one_log(ns, pod, container, String::new(), previous, ts),
-            Some(LogSource::Provider { request }) => self.spawn_provider_logs(request, ts),
+            }) => self.spawn_one_log(ns, pod, container, String::new(), previous, run),
+            Some(LogSource::Provider { request }) => self.spawn_provider_logs(request, run),
             None => {}
         }
     }
@@ -346,8 +372,9 @@ impl App {
     pub(super) fn spawn_provider_logs(
         &mut self,
         request: crate::providers::LogRequest,
-        timestamps: bool,
+        run: LogRun,
     ) {
+        let LogRun { queue, timestamps } = run;
         let provider = self.log_provider.clone().unwrap_or_default();
         let client = self.cluster.client.clone();
         let tx = self.tx.clone();
@@ -368,7 +395,7 @@ impl App {
                     }
                     Err(e) => {
                         let mut lines = vec![format!("[error] {e}")];
-                        let _ = send_log_batch(&tx, genr, &mut lines).await;
+                        let _ = send_log_batch(&queue, &mut lines).await;
                         return;
                     }
                 }
@@ -409,10 +436,10 @@ impl App {
                     })
                     .await;
             }
-            if !info.is_empty() && !send_log_batch(&tx, genr, &mut info).await {
+            if !info.is_empty() && !send_log_batch(&queue, &mut info).await {
                 return;
             }
-            provider_log_task(provider, request, client, tx, genr, flag, timestamps).await;
+            provider_log_task(provider, request, client, queue, genr, flag, timestamps).await;
         });
         self.log_tasks.push(handle);
     }
@@ -424,10 +451,10 @@ impl App {
         container: Option<String>,
         prefix: String,
         previous: bool,
-        timestamps: bool,
+        run: LogRun,
     ) {
+        let LogRun { queue, timestamps } = run;
         let client = self.cluster.client.clone();
-        let tx = self.tx.clone();
         let genr = self.log_gen;
         let flag = self.log_flag.clone();
         let (tail, since) = self.log_tail_and_since();
@@ -451,7 +478,12 @@ impl App {
                 since_seconds,
                 ..Default::default()
             };
-            forward_log_stream(api, pod, lp, prefix, tx, genr, flag).await;
+            let ctx = LogStreamCtx {
+                generation: genr,
+                flag,
+                setup: None,
+            };
+            forward_log_stream(api, pod, lp, prefix, queue, ctx).await;
         });
         self.log_tasks.push(handle);
     }
@@ -507,15 +539,16 @@ impl App {
         }
     }
 
-    pub(super) fn spawn_selector_logs(&mut self, ns: String, labels: String, timestamps: bool) {
+    pub(super) fn spawn_selector_logs(&mut self, ns: String, labels: String, run: LogRun) {
+        let LogRun { queue, timestamps } = run;
         let client = self.cluster.client.clone();
-        let tx = self.tx.clone();
         let genr = self.log_gen;
         let flag = self.log_flag.clone();
         let (tail, since) = self.log_tail_and_since();
         // Bound the per-pod tail so an aggregate over many pods stays sane; the
         // follow buffer trims the total anyway.
         let per_pod_tail = tail.min(100);
+        let max_streams = self.logs_cfg.max_streams;
         let handle = tokio::spawn(async move {
             let list_api: Api<Pod> = if ns.is_empty() {
                 Api::all(client.clone())
@@ -525,58 +558,57 @@ impl App {
             let pods = match list_api.list(&ListParams::default().labels(&labels)).await {
                 Ok(p) => p,
                 Err(e) => {
-                    let _ = tx
-                        .send(Msg::LogLines {
-                            generation: genr,
-                            lines: vec![format!("[error] {e}")],
-                        })
-                        .await;
+                    let _ = queue.send(vec![format!("[error] {e}")]).await;
                     return;
                 }
             };
             if pods.items.is_empty() {
-                let _ = tx
-                    .send(Msg::LogLines {
-                        generation: genr,
-                        lines: vec!["(no matching pods)".into()],
-                    })
-                    .await;
+                let _ = queue.send(vec!["(no matching pods)".into()]).await;
             }
+            let (targets, total) = log_stream_targets(pods.items, max_streams);
+            if let Some(notice) = partial_coverage_notice(&targets, total, max_streams) {
+                let _ = queue.send(vec![notice]).await;
+            }
+
+            // Opening every connection at once is its own burst of API load,
+            // separate from how many stay open.
+            let setup = Arc::new(tokio::sync::Semaphore::new(LOG_STREAM_SETUP_CONCURRENCY));
             let mut streams = tokio::task::JoinSet::new();
-            for p in pods {
-                let pod_ns = p.metadata.namespace.clone().unwrap_or_default();
-                let pod_name = p.metadata.name.clone().unwrap_or_default();
-                let containers: Vec<String> = p
-                    .spec
-                    .as_ref()
-                    .map(|s| s.containers.iter().map(|c| c.name.clone()).collect())
-                    .unwrap_or_default();
-                let multi = containers.len() > 1;
-                for c in containers {
-                    let prefix = if multi {
-                        format!("[{pod_name}:{c}] ")
-                    } else {
-                        format!("[{pod_name}] ")
+            for LogTarget {
+                ns: pod_ns,
+                pod: pod_name,
+                container: c,
+                multi,
+            } in targets
+            {
+                let prefix = if multi {
+                    format!("[{pod_name}:{c}] ")
+                } else {
+                    format!("[{pod_name}] ")
+                };
+                let (client, queue, flag) = (client.clone(), queue.clone(), flag.clone());
+                let setup = Arc::clone(&setup);
+                streams.spawn(async move {
+                    let api: Api<Pod> = Api::namespaced(client, &pod_ns);
+                    let (tail_lines, since_seconds) = match since {
+                        Some(s) => (None, Some(s)),
+                        None => (Some(per_pod_tail), None),
                     };
-                    let (client, tx, flag) = (client.clone(), tx.clone(), flag.clone());
-                    let (pn, pns) = (pod_name.clone(), pod_ns.clone());
-                    streams.spawn(async move {
-                        let api: Api<Pod> = Api::namespaced(client, &pns);
-                        let (tail_lines, since_seconds) = match since {
-                            Some(s) => (None, Some(s)),
-                            None => (Some(per_pod_tail), None),
-                        };
-                        let lp = LogParams {
-                            follow: true,
-                            container: Some(c),
-                            timestamps,
-                            tail_lines,
-                            since_seconds,
-                            ..Default::default()
-                        };
-                        forward_log_stream(api, pn, lp, prefix, tx, genr, flag).await;
-                    });
-                }
+                    let lp = LogParams {
+                        follow: true,
+                        container: Some(c),
+                        timestamps,
+                        tail_lines,
+                        since_seconds,
+                        ..Default::default()
+                    };
+                    let ctx = LogStreamCtx {
+                        generation: genr,
+                        flag,
+                        setup: Some(setup),
+                    };
+                    forward_log_stream(api, pod_name, lp, prefix, queue, ctx).await;
+                });
             }
             while streams.join_next().await.is_some() {
                 if flag.load(Ordering::SeqCst) != genr {
@@ -596,7 +628,7 @@ async fn provider_log_task(
     provider: crate::providers::LogProvider,
     request: crate::providers::LogRequest,
     client: Client,
-    tx: Sender<Msg>,
+    queue: LogQueue,
     generation: u64,
     flag: Arc<AtomicU64>,
     timestamps: bool,
@@ -628,7 +660,7 @@ async fn provider_log_task(
                 Ok(list) => list,
                 Err(e) => {
                     let mut lines = vec![format!("[error] listing pods: {e}")];
-                    let _ = send_log_batch(&tx, generation, &mut lines).await;
+                    let _ = send_log_batch(&queue, &mut lines).await;
                     return;
                 }
             };
@@ -639,7 +671,7 @@ async fn provider_log_task(
                 .collect();
             if names.is_empty() {
                 let mut lines = vec!["(no matching pods)".to_string()];
-                let _ = send_log_batch(&tx, generation, &mut lines).await;
+                let _ = send_log_batch(&queue, &mut lines).await;
                 return;
             }
             (LogScope::Pods { ns, pods: names }, Prefix::PodContainer)
@@ -655,23 +687,28 @@ async fn provider_log_task(
     let mut backfill_max: i128 = i128::MIN;
     match provider.query(&scope).await {
         Ok(entries) => {
-            let mut lines: Vec<String> = Vec::new();
+            let Some(mut batch) = queue.batch().await else {
+                return;
+            };
             for e in &entries {
                 if let Some(n) = e.nanos {
                     backfill_max = backfill_max.max(n);
                 }
-                lines.extend(e.lines(prefix, timestamps));
+                batch.render_entry(e, prefix, timestamps);
+                if batch.is_full() && !batch.flush_and_renew(&queue).await {
+                    return;
+                }
             }
-            if lines.is_empty() {
-                lines.push(format!("(no logs in the last {})", provider.lookback_label));
+            if batch.is_empty() {
+                batch.push_raw(format!("(no logs in the last {})", provider.lookback_label));
             }
-            if !send_log_batch(&tx, generation, &mut lines).await {
+            if !batch.flush(&queue).await {
                 return;
             }
         }
         Err(e) => {
             let mut lines = vec![format!("[error] {e}")];
-            let _ = send_log_batch(&tx, generation, &mut lines).await;
+            let _ = send_log_batch(&queue, &mut lines).await;
             return;
         }
     }
@@ -684,7 +721,7 @@ async fn provider_log_task(
         Ok(t) => t,
         Err(e) => {
             let mut lines = vec![format!("[error] live tail unavailable: {e}")];
-            let _ = send_log_batch(&tx, generation, &mut lines).await;
+            let _ = send_log_batch(&queue, &mut lines).await;
             return;
         }
     };
@@ -692,7 +729,9 @@ async fn provider_log_task(
     // Same batching cadence as the kubelet streams: coalesce bursts, flush
     // quickly when quiet.
     use tokio::time::MissedTickBehavior;
-    let mut batch: Vec<String> = Vec::with_capacity(LOG_BATCH_LINES);
+    let Some(mut batch) = queue.batch().await else {
+        return;
+    };
     let mut flush = tokio::time::interval(Duration::from_millis(LOG_BATCH_MS));
     flush.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
@@ -705,30 +744,98 @@ async fn provider_log_task(
                     // Skip anything the backfill already showed (the tail may
                     // replay a little history at the seam).
                     if e.nanos.is_none_or(|n| n > backfill_max) {
-                        batch.extend(e.lines(prefix, timestamps));
+                        batch.render_entry(&e, prefix, timestamps);
                     }
-                    if batch.len() >= LOG_BATCH_LINES
-                        && !send_log_batch(&tx, generation, &mut batch).await
-                    {
+                    if batch.is_full() && !batch.flush_and_renew(&queue).await {
                         return;
                     }
                 }
                 Ok(None) => {
-                    batch.push("[provider] log stream ended".to_string());
-                    let _ = send_log_batch(&tx, generation, &mut batch).await;
+                    batch.push_raw("[provider] log stream ended".to_string());
+                    let _ = batch.flush(&queue).await;
                     return;
                 }
                 Err(e) => {
-                    batch.push(format!("[error] {e}"));
-                    let _ = send_log_batch(&tx, generation, &mut batch).await;
+                    batch.push_raw(format!("[error] {e}"));
+                    let _ = batch.flush(&queue).await;
                     return;
                 }
             },
             _ = flush.tick(), if !batch.is_empty() => {
-                if !send_log_batch(&tx, generation, &mut batch).await {
+                if !batch.flush_and_renew(&queue).await {
                     return;
                 }
             }
         }
     }
+}
+
+/// One container an aggregate log view would stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LogTarget {
+    pub(super) ns: String,
+    pub(super) pod: String,
+    pub(super) container: String,
+    /// Whether its pod has more than one container, which decides the prefix.
+    pub(super) multi: bool,
+}
+
+/// Every container the match would stream, capped to `max_streams` (`0` = no
+/// cap), with the total the match actually had.
+///
+/// The whole match is enumerated before the cap is applied: the fan-out has to
+/// be measured against a known total, and the order has to be stable so that
+/// "the first N containers" means the same set on every restart rather than
+/// whatever the API server happened to return first.
+pub(super) fn log_stream_targets(pods: Vec<Pod>, max_streams: usize) -> (Vec<LogTarget>, usize) {
+    let mut targets: Vec<LogTarget> = Vec::new();
+    for p in pods {
+        let ns = p.metadata.namespace.clone().unwrap_or_default();
+        let pod = p.metadata.name.clone().unwrap_or_default();
+        let containers: Vec<String> = p
+            .spec
+            .as_ref()
+            .map(|s| s.containers.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default();
+        let multi = containers.len() > 1;
+        for container in containers {
+            targets.push(LogTarget {
+                ns: ns.clone(),
+                pod: pod.clone(),
+                container,
+                multi,
+            });
+        }
+    }
+    // Unstable: namespace/pod/container is unique, so a tie means the two
+    // entries are indistinguishable.
+    targets
+        .sort_unstable_by(|a, b| (&a.ns, &a.pod, &a.container).cmp(&(&b.ns, &b.pod, &b.container)));
+
+    let total = targets.len();
+    if max_streams > 0 && total > max_streams {
+        targets.truncate(max_streams);
+    }
+    (targets, total)
+}
+
+/// What the view says when it is streaming less than the whole match. Showing
+/// part of a match silently would be worse than showing less on purpose.
+pub(super) fn partial_coverage_notice(
+    targets: &[LogTarget],
+    total: usize,
+    max_streams: usize,
+) -> Option<String> {
+    if targets.len() >= total {
+        return None;
+    }
+    let pods_covered = targets
+        .iter()
+        .map(|t| (&t.ns, &t.pod))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    Some(format!(
+        "[partial] streaming {max_streams} of {total} containers \
+         ({pods_covered} pods) — raise [logs] max_streams to widen"
+    ))
 }

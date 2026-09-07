@@ -50,23 +50,23 @@ switches live, `:skin gruvbox-dark` applies directly.
 
 Each of these is documented where the feature itself is:
 
-| Section               | What it does                                | Docs                                                       |
-| --------------------- | ------------------------------------------- | ---------------------------------------------------------- |
-| `[views]`             | custom table columns per resource           | [Views and thresholds](views.md)                           |
-| `[thresholds]`        | RESTARTS/CPU/MEM/utilization coloring bands | [Views and thresholds](views.md#thresholds)                |
-| `[[plugins]]`         | shell-out commands bound to key chords      | [Plugins](plugins.md)                                      |
-| `[[bookmarks]]`       | saved navigation commands                   | [Plugins](plugins.md#bookmarks)                            |
-| `[[workspaces]]`      | named sets of views for one task            | [Plugins](plugins.md#workspaces)                           |
-| `[[forwards]]`        | saved port-forwards, optionally autostarted | [Plugins](plugins.md#saved-forwards)                       |
-| `[[guardrails]]`      | enforced rules on destructive actions       | [Safety](safety.md#guardrails)                             |
-| `[logs]`              | log tail, follow buffer, `since` lookback   | [Log controls](debugging.md#log-controls)                  |
-| `[notify]`            | bell and desktop notification delivery      | [Notifications](debugging.md#notifications)                |
-| `[keys]`              | palette completion key rebinds              | [Key reference](keys.md#palette-completion-keys)           |
-| `[debug]`             | ephemeral and node debug images             | [Debug containers](debugging.md#debug-containers-and-pods) |
-| `[bundle]`            | redaction and size caps for `:bundle`       | [Diagnostic bundles](debugging.md#diagnostic-bundles)      |
-| `[providers.metrics]` | Prometheus/VictoriaMetrics for `:rightsize` | [Providers](providers.md#right-sizing-metrics-provider)    |
-| `[providers.logs]`    | VictoriaLogs backend for `L`                | [Providers](providers.md#log-provider-victorialogs)        |
-| `[fleet]`             | contexts in the cross-cluster dashboard     | [Providers](providers.md#fleet-dashboard)                  |
+| Section               | What it does                                 | Docs                                                       |
+| --------------------- | -------------------------------------------- | ---------------------------------------------------------- |
+| `[views]`             | custom table columns per resource            | [Views and thresholds](views.md)                           |
+| `[thresholds]`        | RESTARTS/CPU/MEM/utilization coloring bands  | [Views and thresholds](views.md#thresholds)                |
+| `[[plugins]]`         | shell-out commands bound to key chords       | [Plugins](plugins.md)                                      |
+| `[[bookmarks]]`       | saved navigation commands                    | [Plugins](plugins.md#bookmarks)                            |
+| `[[workspaces]]`      | named sets of views for one task             | [Plugins](plugins.md#workspaces)                           |
+| `[[forwards]]`        | saved port-forwards, optionally autostarted  | [Plugins](plugins.md#saved-forwards)                       |
+| `[[guardrails]]`      | enforced rules on destructive actions        | [Safety](safety.md#guardrails)                             |
+| `[logs]`              | byte, line, stream caps and `since` lookback | [Log controls](debugging.md#log-controls)                  |
+| `[notify]`            | bell, command, desktop, and watch cap        | [Notifications](debugging.md#notifications)                |
+| `[keys]`              | palette completion key rebinds               | [Key reference](keys.md#palette-completion-keys)           |
+| `[debug]`             | ephemeral and node debug images              | [Debug containers](debugging.md#debug-containers-and-pods) |
+| `[bundle]`            | redaction and size caps for `:bundle`        | [Diagnostic bundles](debugging.md#diagnostic-bundles)      |
+| `[providers.metrics]` | Prometheus/VictoriaMetrics for `:rightsize`  | [Providers](providers.md#right-sizing-metrics-provider)    |
+| `[providers.logs]`    | VictoriaLogs backend for `L`                 | [Providers](providers.md#log-provider-victorialogs)        |
+| `[fleet]`             | contexts in the cross-cluster dashboard      | [Providers](providers.md#fleet-dashboard)                  |
 
 ## Per-cluster and per-context overrides
 
@@ -105,3 +105,17 @@ A skin in an override sets the colors for that context. A context with no skin
 keeps the session skin (config `skin.name`, the auto-detected default, or your
 last `:skin` choice). Overrides are re-read on every `:ctx` switch, so edits
 apply without a restart.
+
+## Plugin packages
+
+sofka reads packages from the `plugins/` directory next to `config.toml`.
+Each package directory contains a `plugin.toml` manifest.
+Enter `:reload` to read package changes.
+The `:config` view shows invalid packages and absent executables.
+
+Inline `[[plugins]]` entries take priority over packages with the same name or palette command.
+Packages load after cluster and context overrides.
+An empty inline plugin list does not disable installed packages.
+
+The [manifest reference](plugin-authoring.md#manifest) describes the package fields.
+The [authoring guide](plugin-authoring.md) includes an adapter and tests without a cluster.

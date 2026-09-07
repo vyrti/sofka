@@ -15,8 +15,6 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures_util::StreamExt;
-use fuzzy_matcher::FuzzyMatcher;
-use fuzzy_matcher::skim::SkimMatcherV2;
 use k8s_openapi::api::core::v1::Pod;
 use kube::Client;
 use kube::api::{
@@ -58,6 +56,38 @@ const MAX_LOG_LINES_PAUSED: usize = 100_000;
 /// flushing quickly for low-volume logs.
 const LOG_BATCH_LINES: usize = 64;
 const LOG_BATCH_MS: u64 = 50;
+
+/// Companion byte ceiling for a batch. 64 lines is a small message for
+/// ordinary logs and a large one for structured records, so a batch flushes on
+/// whichever limit it reaches first — which is what bounds how much log data
+/// can be sitting in the channel at once.
+const LOG_BATCH_BYTES: usize = 256 * 1024;
+
+/// Document rendering can expand compressed Helm releases and Secrets by a
+/// large factor. Keep that CPU/memory work off the input thread without
+/// letting repeated keypresses grow the blocking pool without bound.
+const DOCUMENT_WORKER_CONCURRENCY: usize = 4;
+
+/// How many of an aggregate view's streams may be dialling at once. The cap on
+/// how many stay open is `[logs] max_streams`; this bounds the thundering herd
+/// of opening them.
+const LOG_STREAM_SETUP_CONCURRENCY: usize = 8;
+
+/// Notifications held for the next delivery. They are joined into one message
+/// and ellipsized to 300 characters, so past this the extra text would be
+/// built only to be thrown away; the overflow is reported as a count instead.
+const MAX_PENDING_NOTIFY: usize = 32;
+
+/// Notifier subprocesses allowed to be running at once. A rollout across many
+/// notified objects must not be able to fork a process per frame faster than
+/// the notifier can exit.
+const MAX_NOTIFIER_PROCS: usize = 4;
+
+/// The events document coalesces the same way: a rollout can produce dozens of
+/// events in a few milliseconds, and republishing the whole document for each
+/// one only makes the view re-layout. Short enough that a single live event
+/// still lands within one frame of arriving.
+const EVENTS_PUBLISH_MS: u64 = 100;
 
 /// Initial status-bar hint. Unlike transient action results, this stays visible
 /// until another interaction replaces it.
@@ -310,7 +340,7 @@ enum ConfirmAction {
     /// Run a confirmed plugin (`confirm`/`dangerous`) once accepted — one job
     /// (label, argv) per target, so a bulk run confirms once.
     Plugin {
-        jobs: Vec<(String, Vec<String>)>,
+        jobs: Vec<crate::plugins::Job>,
         name: String,
         mode: PluginMode,
         timeout: u64,
@@ -331,6 +361,8 @@ pub enum PluginMode {
     Terminal,
     /// Captured off-thread into a scrollable document view.
     Popup,
+    /// Versioned JSON report rendered as a searchable document.
+    Report,
     /// Detached; a notification flashes on completion.
     Background,
 }
@@ -415,14 +447,16 @@ enum PromptKind {
 pub struct Scrollable {
     pub title: String,
     pub lines: VecDeque<String>,
-    /// Scroll offset in display rows. `usize` on purpose: a paused log buffer
-    /// (100k lines, wrapped) far exceeds `u16`; views that hand this to a
-    /// ratatui `Paragraph` clamp at the edge instead.
+    /// Vertical scroll offset in rendered display rows. `usize` on purpose: a
+    /// paused wrapped log buffer can far exceed `u16`.
     pub scroll: usize,
+    /// Cached document layout from the last draw. Logs keep their equivalent
+    /// viewport and wrapping index in [`LogsView`] instead.
+    viewport: Option<DocumentViewport>,
     /// Horizontal scroll offset in columns, for views (`describe`, events) whose
     /// lines run past the right edge. Ignored while `wrap` is on.
     pub hscroll: usize,
-    /// Word-wrap toggle. When on, long lines fold instead of being clipped, and
+    /// Line-wrap toggle. When on, long lines fold instead of being clipped, and
     /// horizontal scrolling is disabled.
     pub wrap: bool,
     /// Case-insensitive substring search (`/`), vim-style: the full document
@@ -452,6 +486,32 @@ struct MatchCache {
     revision: u64,
     line_count: usize,
     matches: Vec<usize>,
+}
+
+struct DocumentViewport {
+    width: usize,
+    height: usize,
+    wrap: bool,
+    revision: u64,
+    line_count: usize,
+    /// Cumulative display-row end for every source line.
+    ends: Vec<usize>,
+}
+
+impl DocumentViewport {
+    fn total_rows(&self) -> usize {
+        self.ends.last().copied().unwrap_or(0)
+    }
+
+    fn line_at_row(&self, row: usize) -> usize {
+        self.ends.partition_point(|&end| end <= row)
+    }
+
+    fn line_start(&self, line: usize) -> usize {
+        line.checked_sub(1)
+            .and_then(|i| self.ends.get(i).copied())
+            .unwrap_or(0)
+    }
 }
 
 /// One command-palette suggestion — a built-in command (`:ctx`, `:pulse`), a
@@ -638,9 +698,92 @@ impl Scrollable {
         Self::default()
     }
     pub fn scroll_by(&mut self, delta: i32) {
-        let max = self.lines.len().saturating_sub(1) as i64;
+        let max = self.max_scroll() as i64;
         self.scroll = (self.scroll as i64 + delta as i64).clamp(0, max) as usize;
     }
+
+    pub(crate) fn scroll_to_bottom(&mut self) {
+        self.scroll = self.max_scroll();
+    }
+
+    pub(crate) fn set_viewport(&mut self, width: usize, height: usize) {
+        let width = width.max(1);
+        let stale = self.viewport.as_ref().is_none_or(|viewport| {
+            viewport.width != width
+                || viewport.wrap != self.wrap
+                || viewport.revision != self.revision
+                || viewport.line_count != self.lines.len()
+        });
+        if stale {
+            let mut rows = 0usize;
+            let ends = self
+                .lines
+                .iter()
+                .map(|line| {
+                    let line_rows = if self.wrap {
+                        crate::ui::wrapped_height(line, width)
+                    } else {
+                        1
+                    };
+                    rows = rows.saturating_add(line_rows);
+                    rows
+                })
+                .collect();
+            self.viewport = Some(DocumentViewport {
+                width,
+                height,
+                wrap: self.wrap,
+                revision: self.revision,
+                line_count: self.lines.len(),
+                ends,
+            });
+        } else if let Some(viewport) = self.viewport.as_mut() {
+            viewport.height = height;
+        }
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    pub(crate) fn visible_source_window(&self) -> (usize, usize, usize) {
+        let Some(viewport) = self.viewport.as_ref() else {
+            let start = self.scroll.min(self.lines.len());
+            return (start, self.lines.len(), 0);
+        };
+        if viewport.height == 0 {
+            return (0, 0, 0);
+        }
+
+        let start = viewport.line_at_row(self.scroll).min(self.lines.len());
+        let row_offset = self.scroll.saturating_sub(viewport.line_start(start));
+        let visible_end = self.scroll.saturating_add(viewport.height);
+        let end = viewport
+            .ends
+            .partition_point(|&line_end| line_end < visible_end)
+            .saturating_add(1)
+            .min(self.lines.len());
+        (start, end, row_offset)
+    }
+
+    fn max_scroll(&self) -> usize {
+        self.viewport.as_ref().map_or_else(
+            || self.lines.len().saturating_sub(1),
+            |viewport| viewport.total_rows().saturating_sub(viewport.height),
+        )
+    }
+
+    fn scroll_to_line(&mut self, line: usize) {
+        let row = self
+            .viewport
+            .as_ref()
+            .map_or(line, |viewport| viewport.line_start(line));
+        self.scroll = row.min(self.max_scroll());
+    }
+
+    fn source_line_at_scroll(&self) -> usize {
+        self.viewport
+            .as_ref()
+            .map_or(self.scroll, |viewport| viewport.line_at_row(self.scroll))
+    }
+
     /// Scroll horizontally by `delta` columns, clamped to the widest line. A
     /// no-op while wrapping, since wrapped lines have no off-screen right edge.
     pub fn scroll_h(&mut self, delta: i32) {
@@ -656,12 +799,22 @@ impl Scrollable {
         let max = widest.saturating_sub(1) as i64;
         self.hscroll = (self.hscroll as i64 + delta as i64).clamp(0, max) as usize;
     }
-    /// Toggle word wrap. Turning it on resets the horizontal offset so the view
+    /// Toggle line wrap. Turning it on resets the horizontal offset so the view
     /// snaps back to the left margin. Returns the new state.
     pub fn toggle_wrap(&mut self) -> bool {
+        let current_line = self.source_line_at_scroll();
+        let dimensions = self
+            .viewport
+            .as_ref()
+            .map(|viewport| (viewport.width, viewport.height));
         self.wrap = !self.wrap;
         if self.wrap {
             self.hscroll = 0;
+        }
+        self.viewport = None;
+        if let Some((width, height)) = dimensions {
+            self.set_viewport(width, height);
+            self.scroll_to_line(current_line);
         }
         self.wrap
     }
@@ -684,17 +837,24 @@ impl Scrollable {
         self.revision
     }
 
-    /// Drop `n` lines from the front (log-buffer trimming). Shifts every
-    /// index, so it bumps the revision.
-    pub fn drain_front(&mut self, n: usize) {
-        self.lines.drain(0..n);
+    /// Drop `n` lines from the front (log-buffer trimming), returning the
+    /// bytes they held. Shifts every index, so it bumps the revision.
+    ///
+    /// The byte total comes from the same pass that drops the lines — the
+    /// caller keeping a running total would otherwise have to walk them a
+    /// second time just to measure what it is about to discard.
+    pub fn drain_front(&mut self, n: usize) -> usize {
+        let dropped = self.lines.drain(0..n).map(|line| line.len()).sum();
         self.revision = self.revision.wrapping_add(1);
+        self.viewport = None;
+        dropped
     }
 
     /// Drop every line.
     pub fn clear_lines(&mut self) {
         self.lines.clear();
         self.revision = self.revision.wrapping_add(1);
+        self.viewport = None;
     }
 
     /// Replace the document, invalidating the search-match cache.
@@ -704,8 +864,18 @@ impl Scrollable {
     /// live view — a refreshed events list — where the new document can have
     /// the same line count as the old one.
     pub fn replace_lines(&mut self, lines: VecDeque<String>) {
+        let dimensions = self
+            .viewport
+            .as_ref()
+            .map(|viewport| (viewport.width, viewport.height));
         self.lines = lines;
         self.revision = self.revision.wrapping_add(1);
+        self.viewport = None;
+        if let Some((width, height)) = dimensions {
+            self.set_viewport(width, height);
+        } else {
+            self.scroll = self.scroll.min(self.max_scroll());
+        }
     }
 
     /// Line indices (0-based) containing the active search query, matched
@@ -756,9 +926,10 @@ impl Scrollable {
         if matches.is_empty() {
             return;
         }
-        let pos = matches.iter().position(|&i| i >= self.scroll).unwrap_or(0);
+        let current_line = self.source_line_at_scroll();
+        let pos = matches.iter().position(|&i| i >= current_line).unwrap_or(0);
         self.match_idx = pos;
-        self.scroll = matches[pos];
+        self.scroll_to_line(matches[pos]);
     }
 
     /// Step to the next (`forward`) or previous match, wrapping around, and
@@ -775,7 +946,7 @@ impl Scrollable {
         } else {
             (cur + n - 1) % n
         };
-        self.scroll = matches[self.match_idx];
+        self.scroll_to_line(matches[self.match_idx]);
     }
 }
 
@@ -867,6 +1038,10 @@ impl LogIndex {
 /// the top-level `App` struct.
 pub struct LogsView {
     pub view: Scrollable,
+    /// Bytes held in `view.lines`. Maintained by `push_log_lines` — the only
+    /// writer — so the byte ceiling costs an add per line instead of a walk of
+    /// the whole buffer on every push.
+    pub(crate) retained_bytes: usize,
     pub follow: bool,
     pub filter: String,
     /// Compiled form of [`Self::filter`] (substring / regex / inverse). Rebuilt
@@ -904,6 +1079,7 @@ impl Default for LogsView {
     fn default() -> Self {
         Self {
             view: Scrollable::empty(),
+            retained_bytes: 0,
             follow: true,
             filter: String::new(),
             matcher: crate::logfilter::LogMatcher::default(),
@@ -922,6 +1098,13 @@ impl Default for LogsView {
 }
 
 impl LogsView {
+    /// Drop the buffered lines and the byte count together, so the ceiling
+    /// never accounts for lines that are no longer there.
+    pub fn clear_buffer(&mut self) {
+        self.view.clear_lines();
+        self.retained_bytes = 0;
+    }
+
     /// Replace the filter text and recompile its matcher (substring / regex /
     /// inverse) in one place, so the cached matcher never drifts.
     pub fn set_filter(&mut self, filter: String) {
@@ -1022,12 +1205,65 @@ impl SortKey {
         use std::cmp::Ordering;
         match (self, other) {
             (SortKey::Num(a), SortKey::Num(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-            (SortKey::Text(a), SortKey::Text(b)) => a.cmp(b),
+            (SortKey::Text(a), SortKey::Text(b)) => natural_cmp(a, b),
             // Mixed kinds shouldn't occur within one column; keep it stable.
             (SortKey::Num(_), SortKey::Text(_)) => Ordering::Less,
             (SortKey::Text(_), SortKey::Num(_)) => Ordering::Greater,
         }
     }
+}
+
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let (mut ai, mut bi) = (0, 0);
+
+    while ai < a.len() && bi < b.len() {
+        if a[ai].is_ascii_digit() && b[bi].is_ascii_digit() {
+            let a_end = digit_run_end(a, ai);
+            let b_end = digit_run_end(b, bi);
+            let a_sig = significant_digits(&a[ai..a_end]);
+            let b_sig = significant_digits(&b[bi..b_end]);
+            let ord = a_sig.len().cmp(&b_sig.len()).then_with(|| a_sig.cmp(b_sig));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            ai = a_end;
+            bi = b_end;
+        } else {
+            let ord = a[ai].cmp(&b[bi]);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            ai += 1;
+            bi += 1;
+        }
+    }
+
+    match (ai == a.len(), bi == b.len()) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (true, true) => a.len().cmp(&b.len()).then_with(|| a.cmp(b)),
+        (false, false) => unreachable!(),
+    }
+}
+
+fn digit_run_end(bytes: &[u8], start: usize) -> usize {
+    let mut end = start;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    end
+}
+
+fn significant_digits(digits: &[u8]) -> &[u8] {
+    let first = digits
+        .iter()
+        .position(|digit| *digit != b'0')
+        .unwrap_or(digits.len());
+    &digits[first..]
 }
 
 /// Maximum previous object revisions retained for the session diff.
@@ -1040,7 +1276,7 @@ const PREV_REVISIONS_MAX: usize = 256;
 /// drilling away and back keeps the baseline.
 #[derive(Default)]
 pub(super) struct PrevRevisions {
-    map: HashMap<(String, String), Arc<DynamicObject>>,
+    map: crate::store::FastMap<(String, String), Arc<DynamicObject>>,
     order: VecDeque<(String, String)>,
 }
 
@@ -1057,10 +1293,8 @@ impl PrevRevisions {
         }
     }
 
-    pub(super) fn get(&self, kind: &str, key: &str) -> Option<&DynamicObject> {
-        self.map
-            .get(&(kind.to_string(), key.to_string()))
-            .map(Arc::as_ref)
+    pub(super) fn shared(&self, kind: &str, key: &str) -> Option<Arc<DynamicObject>> {
+        self.map.get(&(kind.to_string(), key.to_string())).cloned()
     }
 }
 
@@ -1071,6 +1305,93 @@ struct FilterCache {
     parsed: crate::filter::ParsedFilter,
 }
 
+/// Highlight positions per row name for the active fuzzy needle.
+///
+/// The filter pass already ran the matcher over every row; without this the
+/// renderer ran it again for every *visible* row on every redraw, which is
+/// the same fuzzy scoring work repeated at frame rate for a result that only
+/// changes when the needle or the name does.
+#[derive(Default)]
+struct HighlightCache {
+    /// The needle these entries were matched against. Anything else empties
+    /// the map — a new needle invalidates every entry at once.
+    needle: String,
+    /// Match positions per name. `None` — the name did not match — is a real
+    /// answer and is cached too, so a filter that excludes most rows does not
+    /// re-run the matcher over them every frame.
+    rows: crate::store::FastMap<Box<str>, Option<Rc<[usize]>>>,
+}
+
+/// The display header list, valid for the view spec and column toggles it was
+/// built from.
+///
+/// `display_headers` is asked for the header list from a dozen places — the
+/// renderer, sorting, mouse hit-testing, the copy picker, bookmarks — several
+/// times per frame, and each call used to build a fresh `Vec<String>` of owned
+/// headers only to read one entry out of it.
+struct HeaderCache {
+    /// `(namespace column, node capacity columns, metrics columns)` — the
+    /// toggles that add columns around the spec's own.
+    shape: (bool, bool, bool),
+    /// Bumped whenever the view spec is rebuilt.
+    spec_rev: u64,
+    headers: Rc<[String]>,
+}
+
+/// Memoized picker lists.
+///
+/// Every one of these is fuzzy-scored and sorted from scratch on each draw,
+/// and again on each keystroke by the input handlers that ask it for a length,
+/// a selection or a lookup — several full rebuilds per frame while a picker is
+/// open.
+///
+/// Each memo is keyed on the inputs themselves rather than on a revision
+/// counter someone has to remember to bump: comparing them is a handful of
+/// string compares against no allocation, and a new writer to `ns_list` or the
+/// favourites cannot leave a stale list on screen.
+#[derive(Default)]
+struct PickerMemos {
+    namespaces: Option<NamespaceMemo>,
+    contexts: Option<ContextMemo>,
+    sort_entries: Option<SortEntryMemo>,
+    copy_entries: Option<CopyEntryMemo>,
+}
+
+struct NamespaceMemo {
+    filter: String,
+    context: String,
+    ns_list: Vec<String>,
+    favorites: Vec<String>,
+    recents: Vec<String>,
+    value: Rc<Vec<String>>,
+}
+
+struct ContextMemo {
+    filter: String,
+    ctx_list: Vec<String>,
+    value: Rc<Vec<String>>,
+}
+
+struct SortEntryMemo {
+    filter: String,
+    /// The header list this was built from. Held as the same handle
+    /// `display_headers` returns, so a hit is a pointer comparison.
+    headers: Rc<[String]>,
+    value: Rc<Vec<String>>,
+}
+
+struct CopyEntryMemo {
+    filter: String,
+    fields: Vec<(String, String)>,
+    value: Rc<Vec<(String, String)>>,
+}
+
+/// Names are only inserted when they are drawn, so this holds a screenful in
+/// practice. The bound is here for the pathological case — a session left on
+/// one filter while rows churn through it — and clearing costs one redraw's
+/// worth of rematching.
+const HIGHLIGHT_CACHE_LIMIT: usize = 4096;
+
 /// Lazily-rebuilt cache of the display-ordered, filtered row keys. Recomputing
 /// the sort + fuzzy filter on every `rows()` call (per frame, per keystroke) is
 /// wasteful on large clusters; we rebuild only when the store or filter changes.
@@ -1078,14 +1399,20 @@ struct FilterCache {
 struct RowsCache {
     dirty: bool,
     keys: Vec<RowKey>,
-    cells: HashMap<RowKey, CellCacheEntry>,
+    cells: crate::store::FastMap<RowKey, CellCacheEntry>,
+    column_widths: Option<TableWidthCache>,
     /// Computed primary sort keys, valid per (sort header, resourceVersion) —
     /// a rebuild touches every object, but only changed rows re-extract.
-    sort_keys: HashMap<RowKey, SortKeyEntry>,
+    sort_keys: crate::store::FastMap<RowKey, SortKeyEntry>,
     /// Helm view only: the latest-revision dedup, paired with the store
     /// version it was computed from. A rebuild staled by a filter keystroke or
     /// a sort toggle leaves the store untouched, so the dedup still holds.
-    helm_latest: Option<(u64, HashSet<RowKey>)>,
+    helm_latest: Option<(u64, crate::store::FastSet<RowKey>)>,
+}
+
+struct TableWidthCache {
+    headers: Rc<[String]>,
+    needed: Vec<u16>,
 }
 
 struct CellCacheEntry {
@@ -1232,6 +1559,9 @@ pub struct App {
     gen_flag: Arc<AtomicU64>,
     pub tasks: Vec<JoinHandle<()>>,
     pub tx: Sender<Msg>,
+    /// Ordered off-thread persistence for small UI state files. `None` keeps
+    /// unit tests and degraded startup on the synchronous fallback.
+    pub state_writer: Option<crate::state_writer::StateWriter>,
     stack: Vec<Frame>,
     /// Scope of the running watch, so its rows can be stashed under the right
     /// key when the user navigates away.
@@ -1260,15 +1590,26 @@ pub struct App {
     /// `None` for the natural namespace/name order.
     pub sort_column: Option<usize>,
     pub sort_desc: bool,
-    /// Horizontal column scroll: how many columns after the anchored
-    /// NAMESPACE/NAME prefix are hidden off the left edge (←/→ in the
-    /// table). Clamped by `draw_table`, since the header set can change
-    /// underneath it; reset when the view spec is rebuilt.
+    /// Horizontal offset in terminal cells after NAMESPACE/NAME.
+    /// The renderer clamps this when the viewport or columns change.
     pub col_offset: usize,
+    pub col_scroll_max: usize,
     pub filter: String,
+    pub faults_only: bool,
     /// Parsed form of `filter`, refreshed lazily when the string changes so
     /// neither row matching nor rendering reparses it per frame.
     filter_cache: RefCell<FilterCache>,
+    /// Fuzzy highlight positions per visible row name, valid for the needle
+    /// they were matched against.
+    highlight_cache: RefCell<HighlightCache>,
+    /// Memoized `display_headers()`, rebuilt when the spec or the column
+    /// toggles change.
+    header_cache: RefCell<Option<HeaderCache>>,
+    /// Memoized picker lists, each valid for the inputs it was built from.
+    picker_memos: RefCell<PickerMemos>,
+    /// Bumped on every view-spec rebuild, so caches derived from the spec can
+    /// tell that it moved.
+    spec_rev: u64,
     /// Server-side selectors (`-l`/`-f` filter terms) the running watch was
     /// started with. Compared against the parsed filter to know when a
     /// restart is needed and to mark the filter as server-side in the UI.
@@ -1350,6 +1691,9 @@ pub struct App {
     pub user_aliases: HashMap<String, String>,
     /// User-defined shell-out plugins.
     pub plugins: Vec<crate::config::Plugin>,
+    pub(super) plugin_task: Option<crate::plugins::Task>,
+    pub(super) plugin_run: u64,
+    pub(super) plugin_claim: Option<StatusClaim>,
     /// Saved navigation commands (`[[bookmarks]]`), re-applied on context
     /// switch and `:reload`.
     pub bookmarks: Vec<crate::config::Bookmark>,
@@ -1411,6 +1755,10 @@ pub struct App {
     pub watch_errors: u64,
     /// The most recent error message, for `:info` diagnostics.
     pub last_error: Option<String>,
+    /// The most recent failure to persist a small UI-state file (namespace,
+    /// sort, fleet marks). Kept apart from [`Self::last_error`], which `:info`
+    /// reports under watch health — a disk problem is not a watch problem.
+    pub last_state_write_error: Option<String>,
     /// Whether the Metrics API has ever returned data this session.
     pub metrics_seen: bool,
     /// The metrics poll's most recent failure (`None` while it works), for
@@ -1524,11 +1872,26 @@ pub struct App {
     /// a notify must survive `bump_generation` (view switches) and fire from
     /// anywhere until toggled off.
     pub(super) notify_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
+    /// Invalidates notification events queued by watches from an old cluster
+    /// without tying them to the generation changed by ordinary navigation.
+    pub(super) notify_epoch: u64,
     /// Notifications waiting for the main loop to deliver (bell, desktop
     /// escape sequence, notifier subprocess). Drained once per frame and
     /// joined, so a burst arriving in one batch is one delivery — sinks
     /// rate-limit rapid-fire notifications.
     pub(super) pending_notify: Vec<String>,
+    /// Notifications the queue could not hold, reported as a count with the
+    /// next delivery rather than silently dropped.
+    pub(super) dropped_notify: usize,
+    /// Notifier subprocesses still running, so a slow notifier cannot pile up
+    /// behind a burst.
+    pub(super) notifier_procs: Vec<tokio::process::Child>,
+    /// One notifier delivery retained while all process slots are occupied.
+    /// Later deliveries merge into its count rather than disappearing.
+    pub(super) pending_notifier: Option<String>,
+    pub(super) merged_notifier: usize,
+    /// Shared cap for YAML/diff/Helm/Secret preparation jobs.
+    pub(super) document_workers: Arc<tokio::sync::Semaphore>,
     /// Previous object revisions for the session diff (`:diff` fallback).
     pub(super) prev_revisions: PrevRevisions,
     /// The `(plural, row_key)` the timeline view is showing, and its cursor.
@@ -1557,7 +1920,7 @@ pub struct App {
     /// return so the cursor lands back on the same object.
     return_selection: Option<String>,
     pub should_quit: bool,
-    matcher: SkimMatcherV2,
+    matcher: crate::fuzzy::Fuzzy,
     rows_cache: RefCell<RowsCache>,
     /// Scratch buffer for the fuzzy filter's "namespace name" haystack, reused
     /// across rows so the filter pass doesn't allocate a `String` per object.
@@ -1604,6 +1967,7 @@ impl App {
             gen_flag: Arc::new(AtomicU64::new(0)),
             tasks: Vec::new(),
             tx,
+            state_writer: None,
             stack: Vec::new(),
             watch_key: None,
             view_cache: HashMap::new(),
@@ -1617,11 +1981,17 @@ impl App {
             sort_column: None,
             sort_desc: false,
             col_offset: 0,
+            col_scroll_max: 0,
             filter: String::new(),
+            faults_only: false,
             filter_cache: RefCell::new(FilterCache {
                 raw: String::new(),
                 parsed: crate::filter::parse(""),
             }),
+            highlight_cache: RefCell::new(HighlightCache::default()),
+            header_cache: RefCell::new(None),
+            picker_memos: RefCell::new(PickerMemos::default()),
+            spec_rev: 0,
             applied_filter_labels: None,
             applied_filter_fields: None,
             command: String::new(),
@@ -1660,6 +2030,9 @@ impl App {
             all_contexts: Vec::new(),
             user_aliases: HashMap::new(),
             plugins: Vec::new(),
+            plugin_task: None,
+            plugin_run: 0,
+            plugin_claim: None,
             bookmarks: Vec::new(),
             pending_bookmark: None,
             workspaces: Vec::new(),
@@ -1686,6 +2059,7 @@ impl App {
             journal: crate::journal::Journal::default(),
             watch_errors: 0,
             last_error: None,
+            last_state_write_error: None,
             metrics_seen: false,
             metrics_error: None,
             rbac_allowed: None,
@@ -1737,7 +2111,13 @@ impl App {
             timeline: crate::timeline::Timeline::default(),
             table_hit: RefCell::new(None),
             notify_tasks: HashMap::new(),
+            notify_epoch: 0,
             pending_notify: Vec::new(),
+            dropped_notify: 0,
+            notifier_procs: Vec::new(),
+            pending_notifier: None,
+            merged_notifier: 0,
+            document_workers: Arc::new(tokio::sync::Semaphore::new(DOCUMENT_WORKER_CONCURRENCY)),
             prev_revisions: PrevRevisions::default(),
             timeline_target: None,
             timeline_state: ListState::default(),
@@ -1755,13 +2135,14 @@ impl App {
             return_mode: Mode::Table,
             return_selection: None,
             should_quit: false,
-            matcher: SkimMatcherV2::default(),
+            matcher: crate::fuzzy::Fuzzy::new(),
             hay_buf: RefCell::new(String::new()),
             rows_cache: RefCell::new(RowsCache {
                 dirty: true,
                 keys: Vec::new(),
-                cells: HashMap::new(),
-                sort_keys: HashMap::new(),
+                cells: crate::store::FastMap::default(),
+                column_widths: None,
+                sort_keys: crate::store::FastMap::default(),
                 helm_latest: None,
             }),
             log_provider: None,
@@ -1809,7 +2190,7 @@ mod explain;
 mod find;
 mod fleet;
 mod gitops;
-mod guardrails;
+pub(crate) mod guardrails;
 mod helpers;
 mod input;
 mod journal;
@@ -1820,6 +2201,7 @@ mod navigation;
 mod notify;
 mod overlays;
 mod pickers;
+mod plugins;
 mod rightsize;
 mod rows;
 mod snapshot;
@@ -1828,7 +2210,17 @@ mod workspaces;
 
 use helpers::*;
 pub use notify::notification_sequence;
+// Reachable from `benchsupport` so `benches/` can drive the real code paths.
+#[cfg(feature = "bench")]
+pub(crate) use details::diff_document;
+#[cfg(feature = "bench")]
+pub(crate) use helpers::{EventDoc, ingest_lines, xray_flatten};
 pub use pickers::DEFAULT_SORT_LABEL;
 
 #[cfg(test)]
 mod tests;
+
+/// Built-ins retain ownership of their command names when loading packages.
+pub(crate) fn plugin_command_reserved(name: &str) -> bool {
+    name == "plugin-cancel" || PALETTE_COMMANDS.iter().any(|c| c.names.contains(&name))
+}

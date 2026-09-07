@@ -66,11 +66,25 @@ struct Args {
     #[arg(long)]
     snapshot: bool,
 
+    /// Validate a plugin package without executing it or connecting to a cluster.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["check", "snapshot", "info", "validate_plugin_report"])]
+    validate_plugin: Option<PathBuf>,
+
+    /// Validate and render a versioned plugin JSON report without a cluster.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["check", "snapshot", "info"])]
+    validate_plugin_report: Option<PathBuf>,
+
     /// Print version/build, config sources, directories, and the current
     /// kubeconfig context, then exit (no cluster connection). For live
     /// discovery/metrics/watch status, use `:info` inside the TUI.
     #[arg(long)]
     info: bool,
+
+    /// Run a core plugin's adapter: read a plugin request on stdin, write its
+    /// report on stdout. sofka spawns itself with this; it is not a user-facing
+    /// entry point, which is why it is hidden from `--help`.
+    #[arg(long, value_name = "NAME", hide = true)]
+    plugin_adapter: Option<String>,
 }
 
 /// Heap profiling build (`--features dhat-heap`). dhat replaces the global
@@ -102,6 +116,32 @@ fn main() -> Result<()> {
 }
 
 async fn run_main(args: Args) -> Result<()> {
+    // Before anything else: an adapter run owns stdout for its report and must
+    // never load config, connect, or touch the terminal.
+    if let Some(name) = &args.plugin_adapter {
+        return match name.as_str() {
+            "sanitize" => sofka::sanitize::run().await,
+            other => Err(anyhow::anyhow!("unknown core plugin adapter '{other}'")),
+        };
+    }
+    if let Some(dir) = &args.validate_plugin {
+        let plugin = sofka::plugins::read_package(dir).map_err(anyhow::Error::msg)?;
+        sofka::plugins::available(&plugin).map_err(anyhow::Error::msg)?;
+        println!("valid plugin: {}", plugin.name);
+        return Ok(());
+    }
+    if let Some(path) = &args.validate_plugin_report {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take((sofka::plugins::MAX_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        for line in sofka::plugins::render_report(&bytes).map_err(anyhow::Error::msg)? {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+
     let (loader, mut config_warnings) = config::ConfigLoader::load();
 
     // `--info`: print static diagnostics (no cluster connection) and exit.
@@ -199,6 +239,13 @@ async fn run_main(args: Args) -> Result<()> {
     let (tx, mut rx) = mpsc::channel(EVENT_CHANNEL_CAP);
     let panic_tx = tx.clone();
     let mut app = App::new(cluster, tx);
+    match sofka::state_writer::StateWriter::new(app.tx.clone()) {
+        Ok(writer) => app.state_writer = Some(writer),
+        Err(e) => {
+            eprintln!("warning: {e}; state writes will run synchronously");
+            config_warnings.push(e);
+        }
+    }
     // Fleet marks (`space` in `:ctx`) persist under the state dir, overlaying
     // the `[fleet] contexts` config list across restarts.
     let fleet_marks_path = fleet::FleetMarks::default_path();
@@ -698,13 +745,19 @@ async fn run(
                 while let Ok(m) = rx.try_recv() {
                     app.handle_msg(m);
                 }
-                if let Some(text) = app.take_notification() {
-                    app.run_notify_command(&text);
-                    ring_notification(&text, &app.notify_cfg);
-                }
                 dirty = true;
             }
             _ = frame.tick(), if dirty => {
+                // Delivery rides the frame clock, not the drain: a rollout can
+                // wake the drain many times between two frames, and delivering
+                // there launched a notifier process per wake-up. One frame is
+                // also the interval the merged text is written for.
+                if let Some(text) = app.take_notification() {
+                    app.run_notify_command(&text);
+                    ring_notification(&text, &app.notify_cfg);
+                } else {
+                    app.retry_notify_command();
+                }
                 terminal.draw(|f| ui::draw(f, app))?;
                 dirty = false;
             }

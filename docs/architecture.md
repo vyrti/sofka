@@ -40,6 +40,17 @@ network.
 See [why it's faster](vs-k9s.md#why-its-faster) for the performance-relevant
 choices in there.
 
+## Plugin packages
+
+`plugins.rs` loads package manifests and validates input values.
+It also controls adapter processes and reads JSON reports.
+`app/plugins.rs` connects this code to commands, guardrails, and document views.
+
+Adapters receive a resource snapshot through standard input.
+The shared runner serializes that snapshot outside the UI thread.
+Tool arguments and tool result formats belong in the adapter.
+See [Create a plugin package](plugin-authoring.md).
+
 ## Development
 
 ```sh

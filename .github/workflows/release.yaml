@@ -126,8 +126,12 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Generate checksums
+        working-directory: dist
+        run: shasum -a 256 -- *.tar.gz > SHA256SUMS
+
       - name: Upload release assets
-        run: gh release upload "$RELEASE_TAG" dist/*.tar.gz --clobber
+        run: gh release upload "$RELEASE_TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
 
   # Kick the tap's bump workflow so `brew install nklmilojevic/sofka/sofka`
   # picks up the new version immediately instead of waiting for the tap's

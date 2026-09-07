@@ -138,6 +138,11 @@ pub struct NotifyConfig {
     /// Notifier subprocess (argv). Empty = none configured (herdr panes
     /// auto-detect). `$MESSAGE` substitutes the notification text.
     pub command: Vec<String>,
+    /// How many objects may be watched for notifications at once. Each `:notify`
+    /// target keeps its own watch open for the whole session, independently of
+    /// the table's, so this bounds what a session can accumulate. `0` removes
+    /// the cap.
+    pub max_watches: usize,
 }
 
 impl Default for NotifyConfig {
@@ -146,6 +151,7 @@ impl Default for NotifyConfig {
             bell: true,
             desktop: "osc777".into(),
             command: Vec::new(),
+            max_watches: 25,
         }
     }
 }
@@ -381,6 +387,19 @@ pub struct LogsConfig {
     /// Maximum lines retained in the follow buffer before the oldest are
     /// dropped (keeps a chatty pod from growing memory without bound).
     pub buffer: usize,
+    /// Maximum bytes retained in the follow buffer, enforced alongside
+    /// `buffer`. A line count alone does not bound memory: one structured-log
+    /// record can be megabytes. `0` disables the byte ceiling.
+    pub buffer_bytes: usize,
+    /// Maximum bytes kept from any one log line; the rest is dropped and the
+    /// line is marked so the loss is visible rather than silent. `0` keeps
+    /// lines whole however long they are.
+    pub line_bytes: usize,
+    /// Maximum concurrent streams an aggregate log view (a label selector, or
+    /// a whole workload) opens. Each is a live connection and a task, so a
+    /// broad selector on a large cluster would otherwise open thousands. The
+    /// view says how much of the match it is covering. `0` removes the cap.
+    pub max_streams: usize,
     /// Optional lookback (`30m`, `4h`, `2d`): stream only logs newer than this.
     /// When set it replaces `tail` (Kubernetes accepts one or the other).
     pub since: Option<String>,
@@ -394,6 +413,11 @@ impl Default for LogsConfig {
         Self {
             tail: 300,
             buffer: 5000,
+            // 5000 lines of ordinary logs is a few megabytes; this bounds the
+            // pathological buffer without touching the ordinary one.
+            buffer_bytes: 64 * 1024 * 1024,
+            line_bytes: 16 * 1024,
+            max_streams: 50,
             since: None,
             fullscreen: false,
         }
@@ -785,8 +809,32 @@ pub struct Skin {
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Plugin {
+    /// Inline configuration ignores unknown fields. Package validation rejects them.
+    #[serde(flatten)]
+    pub(crate) unknown_fields: std::collections::BTreeMap<String, toml::Value>,
     /// Key chord that triggers the plugin (see [`crate::keys::KeyChord`]).
+    #[serde(default)]
     pub key: String,
+    /// Optional command-palette name, independent of the executable.
+    pub palette: Option<String>,
+    #[serde(default)]
+    pub requires: Vec<String>,
+    pub install: Option<String>,
+    #[serde(default)]
+    pub inputs: std::collections::BTreeMap<String, crate::plugins::Input>,
+    /// `context` runs once without requiring a selected row; default `selection`.
+    pub target: Option<String>,
+    /// Declare traffic generation even when no Kubernetes objects are mutated.
+    #[serde(default)]
+    pub network_load: bool,
+    /// Remote port (or an input placeholder) to forward for the selected pod/service.
+    pub port_forward: Option<String>,
+    #[serde(skip)]
+    pub package_dir: Option<PathBuf>,
+    /// Set for a package sofka ships, whose adapter is this binary. Such a
+    /// plugin speaks the request/report protocol without a package directory.
+    #[serde(skip)]
+    pub bundled: bool,
     pub name: String,
     pub command: String,
     #[serde(default)]
@@ -1059,14 +1107,16 @@ pub fn bookmark_warnings(bookmarks: &[Bookmark]) -> Vec<String> {
 pub fn plugin_warnings(plugins: &[Plugin]) -> Vec<String> {
     let mut warns = Vec::new();
     for p in plugins {
-        if let Err(e) = crate::keys::KeyChord::parse(&p.key) {
+        if !(p.key.is_empty() && p.palette.is_some())
+            && let Err(e) = crate::keys::KeyChord::parse(&p.key)
+        {
             warns.push(format!("plugin {:?}: invalid key — {e}", p.name));
         }
         if let Some(o) = &p.output
-            && !matches!(o.as_str(), "terminal" | "popup" | "background")
+            && !matches!(o.as_str(), "terminal" | "popup" | "background" | "report")
         {
             warns.push(format!(
-                "plugin {:?}: unknown output {o:?} (expected terminal/popup/background) — using terminal",
+                "plugin {:?}: unknown output {o:?} (expected terminal/popup/background/report) — using terminal",
                 p.name
             ));
         }
@@ -1206,13 +1256,30 @@ impl ConfigLoader {
 
         // A type mismatch introduced by an override drops back to the base
         // config (validated at load time) rather than losing everything.
-        let config = merged.try_into().unwrap_or_else(|e| {
+        let mut config: Config = merged.try_into().unwrap_or_else(|e| {
             warnings.push(format!("ignoring cluster overrides: {e}"));
             self.base
                 .clone()
                 .and_then(|b| b.try_into().ok())
                 .unwrap_or_default()
         });
+        if let Some(dir) = &self.dir {
+            crate::plugins::load_packages(&dir.join("plugins"), &mut config.plugins, &mut warnings);
+        }
+        // Last, so an inline entry or a user package of the same name wins and
+        // a user can replace a shipped plugin without editing sofka.
+        for bundled in crate::plugins::bundled() {
+            match bundled {
+                Ok(p) => {
+                    if !config.plugins.iter().any(|old| {
+                        old.name == p.name || (p.palette.is_some() && old.palette == p.palette)
+                    }) {
+                        config.plugins.push(p);
+                    }
+                }
+                Err(e) => warnings.push(e),
+            }
+        }
         let skin_override = overlay
             .get("skin")
             .and_then(|s| s.get("name"))

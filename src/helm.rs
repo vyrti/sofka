@@ -15,11 +15,25 @@
 use std::io::Read;
 
 use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use k8s_openapi::jiff::Timestamp;
 use kube::core::DynamicObject;
 use serde::Deserialize;
 use serde_json::Value;
+
+/// The base64 engine for release payloads.
+///
+/// Helm double-encodes the payload, so one decode runs base64 twice over the
+/// whole body — the only place base64 is on a hot path here rather than reading
+/// a short annotation. The SIMD engine detects the instruction set once, on
+/// first use, and produces byte-identical output to the scalar one for the same
+/// alphabet; it exists only for the architectures sofka ships binaries for, so
+/// everything else keeps the scalar engine.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+static BASE64: std::sync::LazyLock<base64::engine::Simd> =
+    std::sync::LazyLock::new(|| base64::engine::Simd::standard(Default::default()));
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+static BASE64: std::sync::LazyLock<base64::engine::general_purpose::GeneralPurpose> =
+    std::sync::LazyLock::new(|| base64::engine::general_purpose::STANDARD);
 
 /// A decoded Helm release revision. The k8s namespace is deliberately not
 /// carried here — callers already have the storage Secret's own namespace,
@@ -136,9 +150,31 @@ fn release_json(secret: &DynamicObject) -> Option<Vec<u8>> {
     let helm_encoded = BASE64.decode(wire).ok()?;
     let gzipped = BASE64.decode(helm_encoded).ok()?;
     let mut gz = flate2::read::GzDecoder::new(&gzipped[..]);
-    let mut json = Vec::new();
+    let mut json = Vec::with_capacity(inflated_hint(&gzipped));
     gz.read_to_end(&mut json).ok()?;
     Some(json)
+}
+
+/// Capacity to give the gunzip buffer, from gzip's ISIZE trailer — the
+/// uncompressed length mod 2^32 in the last four bytes. A release manifest
+/// inflates several times over, so growing from empty re-allocates and copies
+/// the whole payload repeatedly.
+///
+/// ISIZE comes off the cluster and is not trusted: it is a hint a corrupt or
+/// hostile Secret could set to 4 GiB. Clamped to what this input could
+/// plausibly inflate to, so a wrong value costs a resize, never a reservation
+/// the payload cannot fill. Deflate's ceiling is about 1032:1; the absolute cap
+/// is well above any real release and keeps the product in range.
+fn inflated_hint(gzipped: &[u8]) -> usize {
+    /// Refuse to reserve more than this up front, however large ISIZE claims.
+    const MAX_HINT: usize = 64 << 20;
+
+    let Some(trailer) = gzipped.last_chunk::<4>() else {
+        return 0;
+    };
+    let isize_field = u32::from_le_bytes(*trailer) as usize;
+    let plausible = gzipped.len().saturating_mul(1032);
+    isize_field.min(plausible).min(MAX_HINT)
 }
 
 fn last_deployed_secs(raw: Option<&str>) -> Option<i64> {
@@ -264,6 +300,118 @@ mod tests {
         .unwrap();
 
         serde_json::from_value(data).unwrap()
+    }
+
+    /// The SIMD engine must decode byte-for-byte what the scalar one did,
+    /// including the padding and rejection behaviour of a malformed payload.
+    #[test]
+    fn simd_and_scalar_base64_agree() {
+        let scalar = base64::engine::general_purpose::STANDARD;
+        for len in [0usize, 1, 2, 3, 15, 16, 17, 63, 64, 65, 588, 4096] {
+            let raw: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let encoded = scalar.encode(&raw);
+            assert_eq!(BASE64.encode(&raw), encoded, "encode len {len}");
+            assert_eq!(BASE64.decode(&encoded).unwrap(), raw, "decode len {len}");
+        }
+        // Both reject the same malformed input.
+        for bad in ["!!!!", "aGVsbG8", "a", "====", "aGVs bG8="] {
+            assert_eq!(
+                BASE64.decode(bad).is_err(),
+                scalar.decode(bad).is_err(),
+                "malformed {bad:?}"
+            );
+        }
+    }
+
+    /// Escapes and multibyte text have to survive the decode intact.
+    #[test]
+    fn escaped_and_multibyte_payloads_decode_intact() {
+        let secret = fixture_secret(
+            r#"{
+                "name": "myrelease",
+                "version": 1,
+                "info": {
+                    "status": "deployed",
+                    "description": "quote \" backslash \\ tab \t",
+                    "notes": "caf\u00e9 \u2014 done\nsecond line"
+                },
+                "chart": {"metadata": {"name": "c", "version": "1.0.0"}}
+            }"#,
+        );
+        let release = decode(&secret).unwrap();
+        assert_eq!(release.description, "quote \" backslash \\ tab \t");
+        assert_eq!(release.notes, "café — done\nsecond line");
+    }
+
+    /// A payload that is not JSON at all is unrenderable, not a panic.
+    #[test]
+    fn a_corrupt_payload_decodes_to_none() {
+        let secret = fixture_secret("{not json at all");
+        assert!(decode(&secret).is_none());
+        assert!(decode_summary(&secret).is_none());
+    }
+
+    /// `decode` and `decode_summary` read the same payload and must agree.
+    #[test]
+    fn decode_and_summary_agree_on_the_same_secret() {
+        let secret = fixture_secret(
+            r#"{
+                "name": "myrelease",
+                "version": 2,
+                "info": {"status": "deployed", "description": "Upgrade complete",
+                         "last_deployed": "2026-07-01T10:00:00Z"},
+                "chart": {"metadata": {"name": "nginx", "version": "1.2.3",
+                                       "appVersion": "1.25"}}
+            }"#,
+        );
+        let full = decode(&secret).unwrap();
+        let summary = decode_summary(&secret).unwrap();
+        assert_eq!(full.status, summary.status);
+        assert_eq!(full.chart_name, summary.chart_name);
+        assert_eq!(full.chart_version, summary.chart_version);
+        assert_eq!(full.app_version, summary.app_version);
+        assert_eq!(full.description, summary.description);
+        assert_eq!(full.last_deployed_secs, summary.last_deployed_secs);
+        // Re-decoding the same secret is stable.
+        assert_eq!(decode(&secret).unwrap().notes, full.notes);
+    }
+
+    #[test]
+    fn inflated_hint_reads_the_gzip_isize_trailer() {
+        let payload = "x".repeat(5000);
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(payload.as_bytes()).unwrap();
+        let gzipped = gz.finish().unwrap();
+
+        assert_eq!(inflated_hint(&gzipped), payload.len());
+    }
+
+    #[test]
+    fn inflated_hint_clamps_a_lying_trailer_to_what_deflate_could_produce() {
+        // A hostile Secret claiming 4 GiB - 1 from a handful of bytes.
+        let mut gzipped = vec![0u8; 16];
+        gzipped.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        assert_eq!(inflated_hint(&gzipped), gzipped.len() * 1032);
+    }
+
+    #[test]
+    fn inflated_hint_survives_a_truncated_stream() {
+        assert_eq!(inflated_hint(&[]), 0);
+        assert_eq!(inflated_hint(&[0x1f, 0x8b]), 0);
+    }
+
+    #[test]
+    fn a_release_that_inflates_past_the_hint_still_decodes() {
+        // Highly compressible: the true inflated size far exceeds any hint
+        // derived from the compressed bytes, so `read_to_end` must still grow.
+        let notes = "n".repeat(400_000);
+        let secret = fixture_secret(&format!(
+            r#"{{"name":"big","version":1,"info":{{"status":"deployed","notes":"{notes}"}}}}"#
+        ));
+
+        let release = decode(&secret).unwrap();
+        assert_eq!(release.notes.len(), notes.len());
     }
 
     #[test]

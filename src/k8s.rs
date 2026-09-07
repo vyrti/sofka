@@ -17,7 +17,39 @@ use kube::{Client, Config, ResourceExt};
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 
+use kube::runtime::utils::Backoff;
+
 use crate::store::{Msg, row_key};
+
+/// Fallback delay if a watcher backoff ever runs out of steps. `DefaultBackoff`
+/// is unbounded in attempts, so this is belt and braces rather than a real path.
+///
+/// Every watch in the process paces its retries the same way: client-go's
+/// strategy — 800ms doubling to 30s, jittered — reset only once the stream has
+/// actually made progress, never on the `Init`/`InitApply` replay that precedes
+/// each attempt.
+pub(crate) const WATCH_BACKOFF_CEILING: Duration = Duration::from_secs(30);
+
+pub(crate) fn build_client(config: Config) -> Result<Client, kube::Error> {
+    let layer =
+        tower::util::MapRequestLayer::new(|mut request: http::Request<kube::client::Body>| {
+            let watch = request.uri().query().is_some_and(|query| {
+                form_urlencoded::parse(query.as_bytes())
+                    .any(|(key, value)| key == "watch" && value == "true")
+            });
+            if watch {
+                // Watch responses can contain multiple gzip members, which the client cannot decode.
+                request.headers_mut().insert(
+                    http::header::ACCEPT_ENCODING,
+                    http::HeaderValue::from_static("identity"),
+                );
+            }
+            request
+        });
+    Ok(kube::client::ClientBuilder::try_from(config)?
+        .with_layer(&layer)
+        .build())
+}
 
 /// A resolvable Kubernetes resource type.
 #[derive(Clone)]
@@ -131,7 +163,7 @@ impl Cluster {
     ) -> Result<Self> {
         let cluster_url = config.cluster_url.to_string();
         let default_namespace = config.default_namespace.clone();
-        let client = Client::try_from(config).context("building kube client")?;
+        let client = build_client(config).context("building kube client")?;
         let version_client = client.clone();
 
         let cluster_name = cluster_name_for(&context).unwrap_or_default();
@@ -371,6 +403,13 @@ impl Cluster {
                 return;
             }
 
+            // `watcher` re-lists as fast as the stream is polled, so an error
+            // that does not clear itself would hammer the API server. Reset
+            // only on real progress: `Init` and the `InitApply`s behind it are
+            // replayed on every attempt, so resetting on those would keep a
+            // failing watch at the minimum delay forever.
+            let mut backoff = watcher::DefaultBackoff::default();
+
             while let Some(event) = stream.next().await {
                 if using_streaming
                     && initializing
@@ -382,6 +421,14 @@ impl Cluster {
                         .modify(|obj| obj.managed_fields_mut().clear())
                         .boxed();
                     continue;
+                }
+                if matches!(
+                    event,
+                    Ok(watcher::Event::Apply(_)
+                        | watcher::Event::Delete(_)
+                        | watcher::Event::InitDone)
+                ) {
+                    backoff.reset();
                 }
                 let msg = match event {
                     Ok(watcher::Event::Apply(obj)) | Ok(watcher::Event::InitApply(obj)) => {
@@ -416,10 +463,20 @@ impl Cluster {
                     // "too old resource version: Expired" error is routine —
                     // the sync dot already shows the re-list. No error flash.
                     Err(e) if watch_error_is_benign(&e) => continue,
-                    Err(e) => Msg::Error {
-                        generation,
-                        error: e.to_string(),
-                    },
+                    Err(e) => {
+                        if tx
+                            .send(Msg::Error {
+                                generation,
+                                error: e.to_string(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break; // UI gone
+                        }
+                        tokio::time::sleep(backoff.next().unwrap_or(WATCH_BACKOFF_CEILING)).await;
+                        continue;
+                    }
                 };
                 if tx.send(msg).await.is_err() {
                     break; // UI gone

@@ -1,0 +1,16 @@
+schema_version = 1
+
+[plugin]
+name = "Resource summary"
+palette = "resource-summary"
+command = "python3"
+args = ["adapter.py"]
+requires = ["python3"]
+install = "Install Python 3 to run this example."
+output = "report"
+mutating = false
+timeout = "10s"
+
+[plugin.inputs.detail]
+type = "boolean"
+default = "false"

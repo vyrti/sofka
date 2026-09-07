@@ -553,33 +553,80 @@ pub(super) fn osc52_sequence(text: &str) -> String {
     format!("\x1b]52;c;{encoded}\x07")
 }
 
+/// What a log stream shares with the view that opened it.
+pub(super) struct LogStreamCtx {
+    pub(super) generation: u64,
+    pub(super) flag: Arc<AtomicU64>,
+    /// Held only across a connection attempt: an aggregate view opens many
+    /// streams, and letting every one of them dial at once is a burst of API
+    /// load separate from how many end up staying open. Deliberately released
+    /// while waiting for a container to start, so a pod stuck in `Pending`
+    /// cannot hold a slot the other streams need. `None` for a single-pod
+    /// view, which has nothing to queue behind.
+    pub(super) setup: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+#[derive(Clone)]
+pub(super) struct LogRun {
+    pub(super) queue: LogQueue,
+    pub(super) timestamps: bool,
+}
+
 pub(super) async fn forward_log_stream(
     api: Api<Pod>,
     pod: String,
     lp: LogParams,
     prefix: String,
-    tx: Sender<Msg>,
-    generation: u64,
-    flag: Arc<AtomicU64>,
+    queue: LogQueue,
+    ctx: LogStreamCtx,
 ) {
     use futures_util::{AsyncBufReadExt, TryStreamExt};
     use tokio::time::MissedTickBehavior;
 
-    let stream = match api.log_stream(&pod, &lp).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            let _ = tx
-                .send(Msg::LogLines {
-                    generation,
-                    lines: vec![format!("[error] {e}")],
-                })
-                .await;
+    let LogStreamCtx {
+        generation,
+        flag,
+        setup,
+    } = ctx;
+
+    let stream = loop {
+        if flag.load(Ordering::SeqCst) != generation || queue.is_closed() {
             return;
+        }
+        let attempt = {
+            let _permit = match &setup {
+                Some(sem) => match sem.acquire().await {
+                    Ok(permit) => Some(permit),
+                    Err(_) => return, // semaphore closed: the view is gone
+                },
+                None => None,
+            };
+            api.log_stream(&pod, &lp).await
+        };
+        match attempt {
+            Ok(stream) => break stream,
+            Err(kube::Error::Api(e))
+                if lp.follow
+                    && !lp.previous
+                    && e.code == 400
+                    && e.message.contains("is waiting to start") =>
+            {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    _ = queue.closed() => return,
+                }
+            }
+            Err(e) => {
+                let _ = queue.send(vec![format!("[error] {e}")]).await;
+                return;
+            }
         }
     };
 
     let mut lines = stream.lines();
-    let mut batch = Vec::with_capacity(LOG_BATCH_LINES);
+    let Some(mut batch) = queue.batch().await else {
+        return;
+    };
     let mut flush = tokio::time::interval(Duration::from_millis(LOG_BATCH_MS));
     flush.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -592,22 +639,20 @@ pub(super) async fn forward_log_stream(
             next = lines.try_next() => {
                 match next {
                     Ok(Some(line)) => {
-                        batch.push(format!("{prefix}{line}"));
-                        if batch.len() >= LOG_BATCH_LINES
-                            && !send_log_batch(&tx, generation, &mut batch).await
-                        {
+                        batch.push(&prefix, line);
+                        if batch.is_full() && !batch.flush_and_renew(&queue).await {
                             break;
                         }
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        batch.push(format!("[error] {e}"));
+                        batch.push_raw(format!("[error] {e}"));
                         break;
                     }
                 }
             }
             _ = flush.tick(), if !batch.is_empty() => {
-                if !send_log_batch(&tx, generation, &mut batch).await {
+                if !batch.flush_and_renew(&queue).await {
                     break;
                 }
             }
@@ -615,63 +660,382 @@ pub(super) async fn forward_log_stream(
     }
 
     if flag.load(Ordering::SeqCst) == generation {
-        let _ = send_log_batch(&tx, generation, &mut batch).await;
+        let _ = batch.flush(&queue).await;
     }
 }
 
-pub(super) async fn send_log_batch(
-    tx: &Sender<Msg>,
-    generation: u64,
-    batch: &mut Vec<String>,
-) -> bool {
+pub(super) async fn send_log_batch(queue: &LogQueue, batch: &mut Vec<String>) -> bool {
     if batch.is_empty() {
         return true;
     }
-    let lines = std::mem::take(batch);
-    tx.send(Msg::LogLines { generation, lines }).await.is_ok()
+    queue.send(std::mem::take(batch)).await
 }
 
-pub(super) async fn send_event_snapshot(
-    tx: &Sender<Msg>,
+/// Sender shared by every producer in one logs view. A semaphore reservation
+/// travels inside each queued message, so channel depth can no longer multiply
+/// large batches into an unaccounted memory spike.
+#[derive(Clone)]
+pub(super) struct LogQueue {
+    tx: Sender<Msg>,
     generation: u64,
-    title: &str,
-    items: &HashMap<String, DynamicObject>,
-    events_v1: bool,
-) -> bool {
-    tx.send(Msg::Events {
-        generation,
-        title: title.to_string(),
-        lines: format_event_lines(items.values(), events_v1),
-    })
-    .await
-    .is_ok()
+    line_bytes: usize,
+    batch_bytes: usize,
+    batch_reservation: usize,
+    byte_budget: Option<Arc<tokio::sync::Semaphore>>,
 }
 
-pub(super) fn format_event_lines<'a, I>(events: I, events_v1: bool) -> Vec<String>
+impl LogQueue {
+    pub(super) fn new(
+        tx: Sender<Msg>,
+        generation: u64,
+        line_bytes: usize,
+        queue_bytes: usize,
+    ) -> Self {
+        let budget_bytes = queue_bytes.min(u32::MAX as usize);
+        let line_bytes = match (line_bytes, budget_bytes) {
+            (0, 0) => 0,
+            (0, queue) => queue,
+            (line, 0) => line,
+            (line, queue) => line.min(queue),
+        };
+        let batch_bytes = if budget_bytes == 0 {
+            LOG_BATCH_BYTES
+        } else {
+            LOG_BATCH_BYTES.min(budget_bytes)
+        };
+        let batch_reservation = batch_bytes
+            .saturating_add(line_bytes)
+            .saturating_add(256)
+            .min(budget_bytes)
+            .max(usize::from(budget_bytes > 0));
+        Self {
+            tx,
+            generation,
+            line_bytes,
+            batch_bytes,
+            batch_reservation,
+            byte_budget: (budget_bytes > 0)
+                .then(|| Arc::new(tokio::sync::Semaphore::new(budget_bytes))),
+        }
+    }
+
+    pub(super) async fn batch(&self) -> Option<LogBatch> {
+        let permit = match &self.byte_budget {
+            Some(budget) => Some(
+                Arc::clone(budget)
+                    .acquire_many_owned(self.batch_reservation as u32)
+                    .await
+                    .ok()?,
+            ),
+            None => None,
+        };
+        Some(LogBatch::with_permit(
+            self.line_bytes,
+            self.batch_bytes,
+            permit,
+        ))
+    }
+
+    pub(super) fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
+    pub(super) async fn closed(&self) {
+        self.tx.closed().await;
+    }
+
+    /// Send any number of input lines as bounded batches.
+    pub(super) async fn send(&self, lines: Vec<String>) -> bool {
+        let Some(mut batch) = self.batch().await else {
+            return false;
+        };
+        let mut lines = lines.into_iter().peekable();
+        while let Some(line) = lines.next() {
+            batch.push_raw(line);
+            if batch.is_full() {
+                if !batch.flush(self).await {
+                    return false;
+                }
+                if lines.peek().is_some() {
+                    let Some(next) = self.batch().await else {
+                        return false;
+                    };
+                    batch = next;
+                }
+            }
+        }
+        batch.flush(self).await
+    }
+
+    async fn send_batch(
+        &self,
+        lines: Vec<String>,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> bool {
+        self.tx
+            .send(Msg::LogLines {
+                generation: self.generation,
+                lines: crate::store::QueuedLogLines::new(lines, permit),
+            })
+            .await
+            .is_ok()
+    }
+}
+
+/// Drive `lines` through the ingest batching, flushing whenever a batch fills
+/// — the allocation shape of the stream loop, without the stream. Returns the
+/// batch count so the work cannot be optimized away.
+#[cfg(feature = "bench")]
+pub(crate) fn ingest_lines(prefix: &str, lines: impl IntoIterator<Item = String>) -> usize {
+    let mut batch = LogBatch::new(0, LOG_BATCH_BYTES);
+    let mut batches = 0usize;
+    for line in lines {
+        batch.push(prefix, line);
+        if batch.is_full() {
+            std::hint::black_box(batch.take());
+            batches += 1;
+        }
+    }
+    std::hint::black_box(batch.take());
+    batches + 1
+}
+
+/// The pending-line buffer both log ingest paths (kubelet streams and provider
+/// tails) fill between flushes. Owning the mechanics in one place keeps the
+/// prefixing and the hand-off consistent across the two.
+pub(super) struct LogBatch {
+    lines: Vec<String>,
+    bytes: usize,
+    line_bytes: usize,
+    batch_bytes: usize,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl LogBatch {
+    #[cfg(any(test, feature = "bench"))]
+    pub(super) fn new(line_bytes: usize, batch_bytes: usize) -> Self {
+        Self::with_permit(line_bytes, batch_bytes, None)
+    }
+
+    fn with_permit(
+        line_bytes: usize,
+        batch_bytes: usize,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Self {
+        Self {
+            lines: Vec::with_capacity(LOG_BATCH_LINES),
+            bytes: 0,
+            line_bytes,
+            batch_bytes,
+            permit,
+        }
+    }
+
+    /// Add one stream line under `prefix` (empty for a single-pod stream).
+    pub(super) fn push(&mut self, prefix: &str, line: String) {
+        // A single-pod stream has nothing to prepend, which is the common
+        // case: move the line the reader already allocated rather than
+        // copying it into an identical new one.
+        if prefix.is_empty() {
+            self.push_raw(line);
+            return;
+        }
+        let mut prefixed = String::with_capacity(prefix.len() + line.len());
+        prefixed.push_str(prefix);
+        prefixed.push_str(&line);
+        self.push_raw(prefixed);
+    }
+
+    /// Add one line that is already complete (an error notice, a provider
+    /// record that carried its own prefix).
+    pub(super) fn push_raw(&mut self, line: String) {
+        let line = bound_log_line(line, self.line_bytes);
+        self.bytes += line.len();
+        self.lines.push(line);
+    }
+
+    /// Append one provider record's display lines straight into the batch.
+    pub(super) fn render_entry(
+        &mut self,
+        entry: &crate::providers::LogEntry,
+        prefix: crate::providers::Prefix,
+        timestamps: bool,
+    ) {
+        let omitted = entry.render_while(prefix, timestamps, |line| {
+            if self.is_full() {
+                return false;
+            }
+            self.push_raw(line);
+            true
+        });
+        if omitted > 0 {
+            self.push_raw(format!(
+                "[truncated] {omitted} lines omitted from oversized provider record"
+            ));
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// Whether this batch has reached either limit and should be handed off.
+    pub(super) fn is_full(&self) -> bool {
+        self.lines.len() >= LOG_BATCH_LINES || self.bytes >= self.batch_bytes
+    }
+
+    /// Hand the pending lines off, leaving an empty batch behind. The
+    /// replacement starts at the batch size, so a steady stream does not
+    /// re-grow the same `Vec` from nothing between every flush.
+    pub(super) fn take(&mut self) -> Vec<String> {
+        self.bytes = 0;
+        std::mem::replace(&mut self.lines, Vec::with_capacity(LOG_BATCH_LINES))
+    }
+
+    /// Send the pending lines. `false` once the UI is gone.
+    pub(super) async fn flush(&mut self, queue: &LogQueue) -> bool {
+        if self.lines.is_empty() {
+            return true;
+        }
+        let lines = self.take();
+        let permit = self.permit.take();
+        queue.send_batch(lines, permit).await
+    }
+
+    /// Flush this reservation into the channel and obtain another before
+    /// reading more source data. The same semaphore therefore accounts for
+    /// both in-flight producer batches and queued messages.
+    pub(super) async fn flush_and_renew(&mut self, queue: &LogQueue) -> bool {
+        if !self.flush(queue).await {
+            return false;
+        }
+        let Some(next) = queue.batch().await else {
+            return false;
+        };
+        *self = next;
+        true
+    }
+}
+
+/// Normalize and cap a line before it can occupy a producer batch or channel
+/// slot. The UI repeats this defensively for synthetic/test messages.
+pub(super) fn bound_log_line(line: String, cap: usize) -> String {
+    let line = clean_log_line(line);
+    match cap {
+        0 => line,
+        cap if line.len() > cap => truncate_log_line(line, cap),
+        _ => line,
+    }
+}
+
+fn clean_log_line(line: String) -> String {
+    if !line.contains('\r') && !line.contains('\t') {
+        return line;
+    }
+    line.chars()
+        .filter_map(|c| match c {
+            '\r' => None,
+            '\t' => Some(' '),
+            c => Some(c),
+        })
+        .collect()
+}
+
+#[cold]
+#[inline(never)]
+fn truncate_log_line(mut line: String, cap: usize) -> String {
+    let mut end = cap;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let dropped = line.len() - end;
+    line.truncate(end);
+    line.push_str(&format!("…[{dropped} bytes truncated]"));
+    line
+}
+
+/// The events document, maintained incrementally.
+///
+/// A watch delivers one event at a time, and the whole document is republished
+/// each time it changes. Re-deriving every row from its `DynamicObject` on each
+/// publish made that quadratic over an initial list, so each row is rendered
+/// once when its event arrives and a publish only re-sorts the rendered rows.
+pub(crate) struct EventDoc {
+    /// Row key → (sort key, rendered row).
+    rows: crate::store::FastMap<String, (String, String)>,
+    events_v1: bool,
+}
+
+impl EventDoc {
+    pub(crate) fn new(events_v1: bool) -> Self {
+        Self {
+            rows: crate::store::FastMap::default(),
+            events_v1,
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.rows.clear();
+    }
+
+    pub(crate) fn apply(&mut self, event: &DynamicObject) {
+        let seen = event_time(event, self.events_v1);
+        let line = event_line(event, self.events_v1, &seen);
+        self.rows.insert(row_key(event), (seen, line));
+    }
+
+    pub(crate) fn remove(&mut self, event: &DynamicObject) {
+        self.rows.remove(&row_key(event));
+    }
+
+    /// The document as the view shows it: header, then rows newest first.
+    pub(crate) fn render(&self) -> Vec<String> {
+        let mut rows: Vec<&(String, String)> = self.rows.values().collect();
+        // Unstable: the comparator orders on both tuple fields, i.e. the whole
+        // element, so a tie means the two rows are indistinguishable.
+        rows.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut lines = Vec::with_capacity(rows.len().max(1) + 1);
+        lines.push(EVENT_HEADER.to_string());
+        if rows.is_empty() {
+            lines.push("(no events)".into());
+        } else {
+            lines.extend(rows.into_iter().map(|(_, line)| line.clone()));
+        }
+        lines
+    }
+
+    /// Publish the document. `false` once the UI is gone.
+    pub(super) async fn publish(&self, tx: &Sender<Msg>, generation: u64, title: &str) -> bool {
+        tx.send(Msg::Events {
+            generation,
+            title: title.to_string(),
+            lines: self.render(),
+        })
+        .await
+        .is_ok()
+    }
+}
+
+const EVENT_HEADER: &str = concat!(
+    "LAST SEEN            ",
+    "TYPE     ",
+    "REASON                   ",
+    "COUNT ",
+    "MESSAGE"
+);
+
+/// One-shot render of a fixed set of events (the diagnostic bundle), through
+/// the same accumulator the live view uses.
+pub(crate) fn format_event_lines<'a, I>(events: I, events_v1: bool) -> Vec<String>
 where
     I: IntoIterator<Item = &'a DynamicObject>,
 {
-    let mut rows: Vec<(String, String)> = events
-        .into_iter()
-        .map(|event| {
-            let seen = event_time(event, events_v1);
-            (seen.clone(), event_line(event, events_v1, &seen))
-        })
-        .collect();
-    // Unstable: the comparator orders on both tuple fields, i.e. the whole
-    // element, so a tie means the two rows are indistinguishable.
-    rows.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-
-    let mut lines = vec![format!(
-        "{:<20} {:<8} {:<24} {:>5} {}",
-        "LAST SEEN", "TYPE", "REASON", "COUNT", "MESSAGE"
-    )];
-    if rows.is_empty() {
-        lines.push("(no events)".into());
-    } else {
-        lines.extend(rows.into_iter().map(|(_, line)| line));
+    let mut doc = EventDoc::new(events_v1);
+    for event in events {
+        doc.apply(event);
     }
-    lines
+    doc.render()
 }
 
 pub(super) fn event_line(event: &DynamicObject, events_v1: bool, seen: &str) -> String {
@@ -757,11 +1121,51 @@ pub(super) fn ivalue(v: &Value, path: &[&str]) -> Option<i64> {
 }
 
 /// Recursively flatten an object and its owned children into xray rows.
+/// Deepest owner chain the tree walks. Kubernetes ownership is shallow —
+/// cronjob → job → pod is the longest built-in chain — so anything beyond this
+/// is a cycle in the owner references, and the walk stops there instead of
+/// recursing until the stack runs out.
+const XRAY_MAX_DEPTH: usize = 8;
+
+/// Which pool entries each owner uid claims, by position. Positions, not
+/// objects: the pool outlives the walk, so the tree is built from borrows
+/// instead of one deep clone per owner reference.
+type OwnerIndex<'a> = crate::store::FastMap<&'a str, Vec<u32>>;
+
+/// Build the owner index over `pool` and flatten the whole tree — the CPU half
+/// of one xray refresh, split out from the polling task so it can be tested and
+/// benchmarked without a cluster.
+pub(crate) fn xray_flatten(
+    root_kind: &str,
+    roots: &[DynamicObject],
+    pool: &[(String, DynamicObject)],
+) -> Vec<XrayItem> {
+    let mut children: OwnerIndex<'_> = OwnerIndex::default();
+    for (i, (_, o)) in pool.iter().enumerate() {
+        if let Some(owners) = &o.metadata.owner_references {
+            for owner in owners {
+                children
+                    .entry(owner.uid.as_str())
+                    .or_default()
+                    .push(i as u32);
+            }
+        }
+    }
+    // Each root contributes its own row and a populated pool contributes most
+    // of the rest, so this is the right order of magnitude on the first push.
+    let mut items = Vec::with_capacity(roots.len() + pool.len());
+    for root in roots {
+        emit_xray(root_kind, root, 0, pool, &children, &mut items);
+    }
+    items
+}
+
 pub(super) fn emit_xray(
     kind: &str,
     obj: &DynamicObject,
     depth: usize,
-    children: &std::collections::HashMap<String, Vec<(String, DynamicObject)>>,
+    pool: &[(String, DynamicObject)],
+    children: &OwnerIndex<'_>,
     items: &mut Vec<XrayItem>,
 ) {
     let name = obj.metadata.name.clone().unwrap_or_default();
@@ -775,11 +1179,13 @@ pub(super) fn emit_xray(
         container: None,
     });
 
-    if let Some(uid) = &obj.metadata.uid
-        && let Some(kids) = children.get(uid)
+    if depth < XRAY_MAX_DEPTH
+        && let Some(uid) = &obj.metadata.uid
+        && let Some(kids) = children.get(uid.as_str())
     {
-        for (clabel, cobj) in kids {
-            emit_xray(clabel, cobj, depth + 1, children, items);
+        for &i in kids {
+            let (clabel, cobj) = &pool[i as usize];
+            emit_xray(clabel, cobj, depth + 1, pool, children, items);
         }
     }
 
@@ -882,6 +1288,77 @@ pub(super) async fn list_or_warn(
             Vec::new()
         }
     }
+}
+
+/// How many dashboard lists may be in flight at once. The dashboards exist to
+/// describe cluster health, so they fan out enough to stop paying for each
+/// round-trip in series without themselves becoming a burst of API load.
+const DASHBOARD_LIST_CONCURRENCY: usize = 4;
+
+/// Whether two discovered kinds are the same resource.
+pub(super) fn same_api_resource(a: &ApiResource, b: &ApiResource) -> bool {
+    a.group == b.group && a.version == b.version && a.kind == b.kind
+}
+
+/// Split the xray pool into the kinds that duplicate the root kind and the
+/// kinds that need a list of their own.
+///
+/// A kind can be both (a replicaset root is listed with replicasets in its
+/// pool). The duplicates come back as bare labels because their objects are
+/// already in the root list — asking the API server for the same inventory a
+/// second time is the part worth avoiding.
+pub(super) fn split_pool_kinds(
+    pool: Vec<(String, ApiResource, bool)>,
+    root: &ApiResource,
+) -> (Vec<String>, Vec<(String, ApiResource, bool)>) {
+    let mut aliases = Vec::new();
+    let mut rest = Vec::new();
+    for kind in pool {
+        if same_api_resource(&kind.1, root) {
+            aliases.push(kind.0);
+        } else {
+            rest.push(kind);
+        }
+    }
+    (aliases, rest)
+}
+
+/// List every resolved kind with bounded concurrency, in the order given.
+/// Unresolved kinds yield an empty list, exactly as skipping them did.
+pub(super) async fn gather_lists<const N: usize>(
+    client: &Client,
+    kinds: &[Option<(ApiResource, bool)>; N],
+    ns: &str,
+) -> [(Vec<DynamicObject>, Option<String>); N] {
+    let mut out = gather_list_vec(client, kinds, ns).await.into_iter();
+    std::array::from_fn(|_| out.next().expect("one result per kind"))
+}
+
+/// [`gather_lists`] for a run-time-sized request list.
+pub(super) async fn gather_list_vec(
+    client: &Client,
+    kinds: &[Option<(ApiResource, bool)>],
+    ns: &str,
+) -> Vec<(Vec<DynamicObject>, Option<String>)> {
+    let pending: Vec<_> = kinds
+        .iter()
+        .map(|kind| {
+            let (kind, client, ns) = (kind.clone(), client.clone(), ns.to_string());
+            async move {
+                let Some((ar, namespaced)) = kind else {
+                    return (Vec::new(), None);
+                };
+                let mut warn = None;
+                let items = list_or_warn(&client, &ar, namespaced, &ns, &mut warn).await;
+                (items, warn)
+            }
+        })
+        .collect();
+    // `buffered` yields in input order, so this is the order of `kinds`.
+    futures_util::stream::iter(pending)
+        .buffered(DASHBOARD_LIST_CONCURRENCY)
+        .collect()
+        .await
 }
 
 /// Prepend an "evidence incomplete" warning to a findings list when one of

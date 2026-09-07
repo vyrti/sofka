@@ -11,6 +11,7 @@
 //! `pod_summary` walks that array and a fixture without it would measure an
 //! empty loop.
 
+use k8s_openapi::api::core::v1::Service;
 use kube::core::DynamicObject;
 use serde_json::json;
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -316,4 +317,335 @@ pub fn log_lines_wide(n: usize) -> Vec<String> {
 /// Sender factory for benches that need to construct messages directly.
 pub fn channel() -> (Sender<Msg>, Receiver<Msg>) {
     mpsc::channel(4096)
+}
+
+/// Service-discovery input with many usable candidates. Reverse namespaces
+/// ensure the minimum is not an accidental first-item fast path.
+pub fn services(n: usize) -> Vec<Service> {
+    (0..n)
+        .map(|i| {
+            serde_json::from_value(json!({
+                "metadata": {
+                    "name": format!("backend-{i:04}"),
+                    "namespace": format!("ns-{:04}", n - i),
+                },
+                "spec": {
+                    "ports": [
+                        {"name": "metrics", "port": 8080},
+                        {"port": if i.is_multiple_of(2) { 9428 } else { 9090 }},
+                    ]
+                }
+            }))
+            .expect("bench Service fixture is valid")
+        })
+        .collect()
+}
+
+/// Production one-pass VictoriaLogs candidate selection.
+pub fn pick_log_service(services: &[Service]) -> Option<(String, String, i32)> {
+    crate::providers::bench_pick_log_service(services)
+}
+
+/// Production one-pass Prometheus/VictoriaMetrics candidate selection.
+pub fn pick_metrics_service(services: &[Service]) -> Option<(String, String, i32)> {
+    crate::providers::bench_pick_metrics_service(services)
+}
+
+/// The allocation-heavy provider-selection implementation before this
+/// follow-up: materialize every usable candidate, then call `min_by_key`.
+pub fn pick_log_service_collected(services: &[Service]) -> Option<(String, String, i32)> {
+    let candidates: Vec<(&Service, i32)> = services
+        .iter()
+        .filter_map(|service| {
+            let ports = service.spec.as_ref()?.ports.as_ref()?;
+            let port = ports
+                .iter()
+                .find(|port| port.name.as_deref() == Some("http"))
+                .or_else(|| ports.iter().find(|port| port.port == 9428))
+                .or_else(|| ports.first())?;
+            Some((service, port.port))
+        })
+        .collect();
+    finish_collected(candidates)
+}
+
+/// Metrics-provider form of the former collected implementation.
+pub fn pick_metrics_service_collected(services: &[Service]) -> Option<(String, String, i32)> {
+    let candidates: Vec<(&Service, i32)> = services
+        .iter()
+        .filter_map(|service| {
+            let ports = service.spec.as_ref()?.ports.as_ref()?;
+            let port = ports
+                .iter()
+                .find(|port| port.name.as_deref() == Some("http"))
+                .or_else(|| {
+                    ports
+                        .iter()
+                        .find(|port| matches!(port.port, 9090 | 8428 | 8429))
+                })
+                .or_else(|| ports.first())?;
+            Some((service, port.port))
+        })
+        .collect();
+    finish_collected(candidates)
+}
+
+fn finish_collected(candidates: Vec<(&Service, i32)>) -> Option<(String, String, i32)> {
+    let (service, port) = candidates.iter().min_by_key(|(service, _)| {
+        (
+            service.metadata.namespace.as_deref().unwrap_or_default(),
+            service.metadata.name.as_deref().unwrap_or_default(),
+        )
+    })?;
+    Some((
+        service.metadata.namespace.clone().unwrap_or_default(),
+        service.metadata.name.clone().unwrap_or_default(),
+        *port,
+    ))
+}
+
+/// A `deployment -> replicaset -> pod` ownership tree, the shape the xray view
+/// indexes: `roots` deployments, one replicaset each, `pods_per_root` pods
+/// under that replicaset. Returned as the two lists `spawn_xray` gathers.
+pub fn xray_tree(
+    roots: usize,
+    pods_per_root: usize,
+) -> (Vec<DynamicObject>, Vec<(String, DynamicObject)>) {
+    let mut deployments = Vec::with_capacity(roots);
+    let mut pool = Vec::with_capacity(roots * (pods_per_root + 1));
+    for d in 0..roots {
+        let duid = format!("dep-{d:012}");
+        let ruid = format!("rs-{d:012}");
+        deployments.push(
+            serde_json::from_value(json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {
+                    "name": format!("svc-{d:04}"),
+                    "namespace": format!("ns-{}", d % 24),
+                    "uid": duid,
+                    "creationTimestamp": "2026-08-30T08:00:00Z",
+                },
+                "spec": { "replicas": pods_per_root },
+                "status": { "readyReplicas": pods_per_root },
+            }))
+            .expect("bench deployment fixture is valid"),
+        );
+        pool.push((
+            "replicaset".to_string(),
+            serde_json::from_value(json!({
+                "apiVersion": "apps/v1",
+                "kind": "ReplicaSet",
+                "metadata": {
+                    "name": format!("svc-{d:04}-7d9f8b6c5d"),
+                    "namespace": format!("ns-{}", d % 24),
+                    "uid": ruid,
+                    "creationTimestamp": "2026-08-30T08:00:00Z",
+                    "ownerReferences": [{
+                        "apiVersion": "apps/v1",
+                        "kind": "Deployment",
+                        "name": format!("svc-{d:04}"),
+                        "uid": duid,
+                    }],
+                },
+                "spec": { "replicas": pods_per_root },
+                "status": { "readyReplicas": pods_per_root },
+            }))
+            .expect("bench replicaset fixture is valid"),
+        ));
+        for p in 0..pods_per_root {
+            let mut pod = pod(d * pods_per_root + p);
+            pod.metadata.namespace = Some(format!("ns-{}", d % 24));
+            pod.metadata.owner_references = Some(vec![
+                serde_json::from_value(json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "ReplicaSet",
+                    "name": format!("svc-{d:04}-7d9f8b6c5d"),
+                    "uid": ruid,
+                }))
+                .expect("bench owner reference is valid"),
+            ]);
+            pool.push(("pod".to_string(), pod));
+        }
+    }
+    (deployments, pool)
+}
+
+/// The production owner index + tree flatten for one xray refresh.
+pub fn xray_flatten(
+    root_kind: &str,
+    roots: &[DynamicObject],
+    pool: &[(String, DynamicObject)],
+) -> Vec<crate::store::XrayItem> {
+    crate::app::xray_flatten(root_kind, roots, pool)
+}
+
+/// `n` core/v1 Events for one object, spread over distinct timestamps and
+/// reasons so sorting and formatting see realistic input.
+pub fn events(n: usize) -> Vec<DynamicObject> {
+    (0..n)
+        .map(|i| {
+            let reason = ["Scheduled", "Pulled", "Created", "Started", "BackOff"][i % 5];
+            let typ = if i.is_multiple_of(9) {
+                "Warning"
+            } else {
+                "Normal"
+            };
+            serde_json::from_value(json!({
+                "apiVersion": "v1",
+                "kind": "Event",
+                "metadata": {
+                    "name": format!("workload.{i:08x}"),
+                    "namespace": "ns-0",
+                    "uid": format!("ev-{i:012}"),
+                    "creationTimestamp": "2026-08-30T08:00:00Z",
+                },
+                "type": typ,
+                "reason": reason,
+                "count": (i % 17) + 1,
+                "lastTimestamp": format!("2026-08-30T{:02}:{:02}:{:02}Z", i % 24, i % 60, i % 60),
+                "message": format!(
+                    "Successfully assigned ns-0/workload-{i:05} to node-{:03}; \
+                     reconcile completed in {}ms",
+                    i % 79,
+                    i % 900
+                ),
+                "involvedObject": {
+                    "kind": "Pod",
+                    "name": format!("workload-{i:05}"),
+                    "namespace": "ns-0",
+                    "uid": "00000000-0000-0000-0000-000000000001",
+                },
+            }))
+            .expect("bench event fixture is valid")
+        })
+        .collect()
+}
+
+/// An events document holding `events`, ready to publish.
+pub struct EventDocFixture(crate::app::EventDoc);
+
+pub fn event_doc(events: &[DynamicObject]) -> EventDocFixture {
+    let mut doc = crate::app::EventDoc::new(false);
+    for e in events {
+        doc.apply(e);
+    }
+    EventDocFixture(doc)
+}
+
+/// One publish of an accumulated document — what the view rebuilds whenever
+/// the events document changes.
+pub fn event_doc_render(doc: &EventDocFixture) -> usize {
+    doc.0.render().len()
+}
+
+/// What an N-event initial list costs end to end: ingest every event, then
+/// publish the document the view finally draws.
+pub fn event_doc_initial(events: &[DynamicObject]) -> usize {
+    event_doc_render(&event_doc(events))
+}
+
+/// A wide object: `entries` status conditions plus a label/annotation block the
+/// size a real CRD carries. Stands in for the big documents the YAML/describe
+/// views build on a keypress.
+pub fn fat_object(entries: usize) -> DynamicObject {
+    let conditions: Vec<_> = (0..entries)
+        .map(|i| {
+            json!({
+                "type": format!("Condition{i}"),
+                "status": if i.is_multiple_of(3) { "False" } else { "True" },
+                "lastTransitionTime": "2026-08-30T08:00:00Z",
+                "reason": format!("Reason{i}"),
+                "message": format!(
+                    "controller {i} reconciled the resource and reported a \
+                     detailed status message about revision {}",
+                    1000 + i
+                ),
+            })
+        })
+        .collect();
+    let labels: serde_json::Map<String, serde_json::Value> = (0..entries / 4)
+        .map(|i| {
+            (
+                format!("example.com/label-{i}"),
+                json!(format!("value-{i}")),
+            )
+        })
+        .collect();
+    serde_json::from_value(json!({
+        "apiVersion": "example.com/v1",
+        "kind": "Widget",
+        "metadata": {
+            "name": "fat-widget",
+            "namespace": "ns-0",
+            "uid": "00000000-0000-0000-0000-000000000042",
+            "resourceVersion": "987654",
+            "creationTimestamp": "2026-08-30T08:00:00Z",
+            "labels": labels,
+            "annotations": { "example.com/notes": "x".repeat(4096) },
+        },
+        "spec": { "replicas": 3, "template": { "conditions": conditions.clone() } },
+        "status": { "conditions": conditions },
+    }))
+    .expect("bench fat object fixture is valid")
+}
+
+/// `n` log lines of `bytes` each — the pathological case a byte budget exists
+/// for: one structured record dumped whole onto a single line.
+pub fn log_lines_long(n: usize, bytes: usize) -> Vec<String> {
+    (0..n)
+        .map(|i| {
+            let mut s = format!("{i:06} ");
+            s.push_str(&"payload=".repeat(bytes / 8));
+            s.truncate(bytes.max(s.find(' ').unwrap_or(0) + 1));
+            s
+        })
+        .collect()
+}
+
+/// Run `lines` through the ingest batching both log paths share, flushing a
+/// full batch the way the stream loop does. Returns the number of batches.
+pub fn ingest_lines(prefix: &str, lines: impl IntoIterator<Item = String>) -> usize {
+    crate::app::ingest_lines(prefix, lines)
+}
+
+/// An app whose follow buffer is already at its retention limit, so the next
+/// push has to trim.
+pub fn logs_app_at_capacity(buffer: usize) -> App {
+    let (mut app, _rx) = app();
+    app.logs_cfg.buffer = buffer;
+    app.logs.follow = true;
+    app.logs.view.lines.extend(log_lines(buffer));
+    app
+}
+
+/// Lines currently retained in the follow buffer.
+pub fn log_line_count(app: &App) -> usize {
+    app.logs.view.lines.len()
+}
+
+/// One `d` keypress on a changed object: clean both revisions and walk the
+/// unified diff. Runs on the UI thread, so this is keypress latency.
+pub fn diff_document(previous: &DynamicObject, live: &DynamicObject) -> usize {
+    let baseline = serde_yaml::to_string(previous).expect("fixture yaml");
+    crate::app::diff_document(&baseline, live.clone()).len()
+}
+
+/// A changed revision of `fat_object`: same shape, different status.
+pub fn fat_object_changed(entries: usize) -> DynamicObject {
+    let mut o = fat_object(entries);
+    if let Some(conds) = o
+        .data
+        .pointer_mut("/status/conditions")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for (i, c) in conds.iter_mut().enumerate() {
+            if i.is_multiple_of(4) {
+                c["status"] = json!("Unknown");
+                c["message"] = json!(format!("controller {i} is re-reconciling"));
+            }
+        }
+    }
+    o.metadata.resource_version = Some("987999".into());
+    o
 }

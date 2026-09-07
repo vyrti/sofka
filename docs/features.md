@@ -10,18 +10,33 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   aliases (`po`, `dp`, `svc`, `no`, `cm`, `sts`, `ds`, `ks`, `hr`, …) and correct
   precedence - core `pods` wins over `pods.metrics.k8s.io`.
 - **Live watch** of any kind through `kube::runtime::watcher`, streamed into an
-  in-memory store.
+  in-memory store. Watch requests use uncompressed responses to avoid gzip
+  stream errors. List requests retain gzip compression.
 - **Curated columns** for common kinds (pods, deployments, replicasets,
   statefulsets, daemonsets, services, nodes, namespaces, configmaps, secrets,
   jobs, cronjobs, PVC/PV, ingresses, endpoints, CustomResourceDefinitions), with
-  a NAME/AGE fallback for everything else.
+  a NAME/AGE fallback for everything else. STATUS columns use a fixed width of
+  26 characters so status changes do not move adjacent columns. A configured
+  column width takes priority. Column widths use the full filtered list so
+  vertical scrolling does not move the columns.
+- **Horizontal scrolling** - Left and Right move the table by five text positions.
+  NAME and NAMESPACE stay fixed. Other columns keep their widths while you
+  scroll. Arrows in the title show where more content is available. When all
+  columns fit, Left and Right do nothing.
 - **Custom views** - define columns for any resource in the config file. An
   unknown custom resource picks up its CRD `additionalPrinterColumns`
-  automatically. `w` toggles wide-only columns (kubectl `-o wide`). See
+  automatically. `w` toggles wide-only columns (kubectl `-o wide`), including
+  node labels. See
   [Views and thresholds](views.md).
 - **Drill-down navigation** with a breadcrumb stack: workload/service → pods,
   cronjob → its jobs, node → its pods, pod → containers, namespace → re-scope,
   CRD → its custom resources. `esc` goes back.
+- **Resource cycling** (`Tab` / `Shift-Tab`) - browse pods → services →
+  deployments → statefulsets → daemonsets → secrets → configmaps → ingresses →
+  PVCs, wrapping in either direction without configuration. Keeps the current
+  namespace (including all namespaces), skips kinds absent from API discovery,
+  and follows the active workspace's views when one is open. `[` / `]` remain
+  view history.
 - **Command palette** (`:`) - fuzzy search over the full resource catalog, your
   saved bookmarks and workspaces, and the built-in commands (`ctx`, `helm`,
   `pulse`, `xray`, `explain`, `timeline`, `gitops`, `can-i`, `journal`, `debug`,
@@ -33,6 +48,14 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   inverse match, `-l`/`-f` label and field selectors (evaluated server-side on
   ⏎), and typed column comparisons (`status=CrashLoopBackOff`, `cpu>500m`,
   `memory>1Gi`, `restarts>=5`, `age<2h`). Space-separated terms AND together.
+- **Toggle faults** (`Ctrl+Z`, pods only) shows pending, failed, unknown,
+  terminating, and running pods that are not ready. Completed pods are hidden.
+  The table title shows `[faults]` while the filter is on. It works with the
+  text filter and current namespace or drill scope. Press `Ctrl+Z` again to
+  turn it off. The setting stays on for pod views during the session and does
+  not filter other resource types. Configured `Ctrl+Z` bookmark, workspace,
+  and matching plugin actions take precedence. Live updates keep the selected
+  pod selected. If it leaves the list or its UID changes, selection is cleared.
 - **Global fuzzy find** (`:find <text>`) - search object names across the common
   kinds (workloads, pods, services, config, ingresses, jobs, storage, nodes,
   namespaces, Flux objects) in every namespace at once, concurrently. Results
@@ -149,7 +172,8 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   [Debug containers and pods](debugging.md#debug-containers-and-pods).
 - **Logs** (`l`) - per-container on a pod, or aggregated across all matching
   pods on a workload/service, with filtering, previous-container logs, and
-  configurable tail/buffer/lookback. sofka parses ANSI color from the source app
+  configurable tail/buffer/lookback. If a container is waiting to start, sofka
+  retries until its logs are available. sofka parses ANSI color from the source app
   and maps it onto the active skin instead of printing literal escapes. See
   [Log controls](debugging.md#log-controls).
 - **VictoriaLogs integration** (`L` / `:vlogs`) - log history from a
@@ -210,3 +234,35 @@ The full list. For how sofka compares to k9s, see [vs k9s](vs-k9s.md).
   state/snapshot/bundle directories. The connected Kubernetes revision also
   stays visible in the main header.
   Identifiers and counts only, never credentials, tokens, or Secret values.
+
+## Bundled plugins
+
+- **`:sanitize`** deletes the pods a namespace has finished with - completed
+  jobs, failed and evicted pods, and optionally the wedged ones. It ships with
+  sofka and needs no runtime on `PATH`; the adapter is the sofka binary.
+  `states` selects `terminal` (the default), `stuck`, or `all`, named after the
+  STATUS values the pods view shows. `dry_run=true` reports without deleting.
+  It confirms before running, is blocked in read-only mode, and matches
+  guardrails as `plugin:sanitize`. It never deletes a pod that is terminating,
+  still has a running container, or was replaced since the scan.
+  The scope is the current namespace - **all namespaces when the view is**.
+  `-l`/`-f` filter terms narrow the scan server-side; a filter it cannot
+  reproduce exactly makes it refuse rather than delete more than the table
+  shows.
+  See [Sanitize pods](../plugins/sanitize/README.md).
+
+## External plugin packages
+
+- **Package discovery** reads `plugins/*/plugin.toml` from the sofka configuration directory.
+  Packages reload with `:reload`.
+- **Named commands** and key chords start adapters without changes to sofka's source code.
+- **Validated inputs** supply named arguments with types, defaults, choices, and limits.
+- **JSON reports** show text sections and tables in a searchable document.
+- **Shared execution** limits output and concurrency.
+  It cancels processes on timeout, navigation, or `:plugin-cancel`.
+- **Safety controls** apply read-only mode, confirmation, and guardrails to plugins.
+  Load-test plugins require a network-load declaration.
+- **Managed port-forwards** supply a local endpoint for a selected pod or service.
+- **Local checks** validate package manifests and reports without a cluster.
+
+See [Create a plugin package](plugin-authoring.md).

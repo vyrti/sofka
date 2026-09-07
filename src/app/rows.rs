@@ -11,6 +11,7 @@ impl App {
         cache.dirty = true;
         cache.keys.clear();
         cache.cells.clear();
+        cache.column_widths = None;
         cache.sort_keys.clear();
         cache.helm_latest = None;
     }
@@ -28,8 +29,10 @@ impl App {
     pub(super) fn invalidate_row_contents(&self, key: &str) {
         let mut cache = self.rows_cache.borrow_mut();
         cache.cells.remove(key);
+        cache.column_widths = None;
         cache.sort_keys.remove(key);
         if !self.filter.is_empty()
+            || self.faults_filter_active()
             || self.sort_column.is_some()
             || self.owner.is_some()
             || self.kind_plural == "helm"
@@ -62,12 +65,20 @@ impl App {
         o: &DynamicObject,
         key: &RowKey,
         parsed: &crate::filter::ParsedFilter,
-        cells: &mut HashMap<RowKey, CellCacheEntry>,
+        cells: &mut crate::store::FastMap<RowKey, CellCacheEntry>,
+        now: i64,
     ) -> bool {
+        if self.faults_filter_active() && !pod_has_faults(o) {
+            return false;
+        }
         if self.filter.is_empty() {
             return true;
         }
-        self.eval_filter(o, key, parsed, cells)
+        self.eval_filter(o, key, parsed, cells, now)
+    }
+
+    pub fn faults_filter_active(&self) -> bool {
+        self.faults_only && self.kind_plural == "pods"
     }
 
     fn eval_filter(
@@ -75,15 +86,18 @@ impl App {
         o: &DynamicObject,
         key: &RowKey,
         parsed: &crate::filter::ParsedFilter,
-        cells: &mut HashMap<RowKey, CellCacheEntry>,
+        cells: &mut crate::store::FastMap<RowKey, CellCacheEntry>,
+        now: i64,
     ) -> bool {
         use crate::filter::{ParsedFilter, Term};
         match parsed {
-            ParsedFilter::Fuzzy(pat) => pat.is_empty() || self.fuzzy_match_row(o, pat, key, cells),
+            ParsedFilter::Fuzzy(pat) => {
+                pat.is_empty() || self.fuzzy_match_row(o, pat, key, cells, now)
+            }
             ParsedFilter::Structured(s) => s.terms.iter().all(|t| match t {
-                Term::Fuzzy(pat) => self.fuzzy_match_row(o, pat, key, cells),
-                Term::NotFuzzy(pat) => !self.fuzzy_match_row(o, pat, key, cells),
-                Term::Cmp(cmp) => self.eval_cmp(o, cmp),
+                Term::Fuzzy(pat) => self.fuzzy_match_row(o, pat, key, cells, now),
+                Term::NotFuzzy(pat) => !self.fuzzy_match_row(o, pat, key, cells, now),
+                Term::Cmp(cmp) => self.eval_cmp(o, cmp, now),
             }),
         }
     }
@@ -106,7 +120,8 @@ impl App {
         o: &DynamicObject,
         pat: &str,
         key: &RowKey,
-        cells: &mut HashMap<RowKey, CellCacheEntry>,
+        cells: &mut crate::store::FastMap<RowKey, CellCacheEntry>,
+        now: i64,
     ) -> bool {
         let pat_mask = subseq_mask(pat);
         {
@@ -114,13 +129,11 @@ impl App {
             // `String` for every object on every keystroke.
             let mut hay = self.hay_buf.borrow_mut();
             self.write_fuzzy_hay(o, &mut hay);
-            if subseq_mask(&hay) & pat_mask == pat_mask
-                && self.matcher.fuzzy_match(&hay, pat).is_some()
-            {
+            if subseq_mask(&hay) & pat_mask == pat_mask && self.matcher.score(&hay, pat).is_some() {
                 return true;
             }
         }
-        let entry = self.cell_entry(key, o, cells);
+        let entry = self.cell_entry(key, o, cells, now);
         // No cell can contain every pattern character, so none can match.
         if entry.row_mask & pat_mask != pat_mask {
             return false;
@@ -129,7 +142,7 @@ impl App {
             .cells
             .iter()
             .zip(&entry.cell_masks)
-            .any(|(c, &m)| m & pat_mask == pat_mask && self.matcher.fuzzy_match(c, pat).is_some())
+            .any(|(c, &m)| m & pat_mask == pat_mask && self.matcher.score(c, pat).is_some())
     }
 
     /// The cached cells for `key`, rendering them if absent or stale.
@@ -137,14 +150,15 @@ impl App {
         &self,
         key: &RowKey,
         o: &DynamicObject,
-        cells: &'c mut HashMap<RowKey, CellCacheEntry>,
+        cells: &'c mut crate::store::FastMap<RowKey, CellCacheEntry>,
+        now: i64,
     ) -> &'c CellCacheEntry {
         let resource_version = o.metadata.resource_version.clone();
         let stale = cells
             .get(key)
             .is_none_or(|e| e.plural != self.kind_plural || e.resource_version != resource_version);
         if stale {
-            let (rendered, status_idx) = self.spec.cells(o);
+            let (rendered, status_idx) = self.spec.cells(o, now);
             let cell_masks: Vec<u64> = rendered.iter().map(|c| subseq_mask(c)).collect();
             let row_mask = cell_masks.iter().fold(0u64, |a, m| a | m);
             cells.insert(
@@ -182,16 +196,16 @@ impl App {
     /// read the live metrics snapshot, `age` the creation timestamp; any
     /// other key names a displayed column (numeric values compare by the
     /// cell's leading number, text case-insensitively).
-    fn eval_cmp(&self, o: &DynamicObject, cmp: &crate::filter::Cmp) -> bool {
+    fn eval_cmp(&self, o: &DynamicObject, cmp: &crate::filter::Cmp, now: i64) -> bool {
         use crate::filter::CmpValue;
         match &cmp.value {
             CmpValue::Cpu(want) => cmp.op.eval(self.metrics_for(o).0.cmp(want)),
             CmpValue::Mem(want) => cmp.op.eval(self.metrics_for(o).1.cmp(want)),
-            CmpValue::Duration(want) => match crate::columns::age_secs(o) {
+            CmpValue::Duration(want) => match crate::columns::age_secs(o, now) {
                 Some(age) => cmp.op.eval(age.cmp(want)),
                 None => false,
             },
-            CmpValue::Num(want) => match self.column_cell(o, &cmp.key) {
+            CmpValue::Num(want) => match self.column_cell(o, &cmp.key, now) {
                 Some(cell) => cmp
                     .op
                     .eval(crate::columns::parse_leading_num(&cell).total_cmp(want)),
@@ -200,7 +214,7 @@ impl App {
             // `want` was folded once at parse time. ASCII cells compare through
             // an allocation-free byte iterator; non-ASCII cells use
             // whole-string lowercasing for context-sensitive Unicode mappings.
-            CmpValue::Str(want) => match self.column_cell(o, &cmp.key) {
+            CmpValue::Str(want) => match self.column_cell(o, &cmp.key, now) {
                 Some(cell) => cmp.op.eval(crate::filter::cmp_folded_lower(&cell, want)),
                 None => false,
             },
@@ -211,14 +225,14 @@ impl App {
     /// header), plus NAMESPACE and a `/status/phase` fallback for kinds
     /// without a STATUS column. Extracts only the named column — this runs
     /// per object per rebuild when a structured filter is active.
-    fn column_cell<'o>(&self, o: &'o DynamicObject, key: &str) -> Option<Cow<'o, str>> {
+    fn column_cell<'o>(&self, o: &'o DynamicObject, key: &str, now: i64) -> Option<Cow<'o, str>> {
         if key.eq_ignore_ascii_case("namespace") || key.eq_ignore_ascii_case("ns") {
             // Borrowed: the namespace is already a `String` on the object, and
             // this runs per object per rebuild.
             return Some(o.metadata.namespace.as_deref().unwrap_or("").into());
         }
         if let Some(i) = self.spec.header_index(key) {
-            return self.spec.cell_at(o, i).map(Cow::Owned);
+            return self.spec.cell_at(o, i, now);
         }
         if key.eq_ignore_ascii_case("status") {
             let phase = phase(o);
@@ -251,13 +265,36 @@ impl App {
     /// active filter or no fuzzy term (every visible row already passed
     /// the filter pass, so this is purely a rendering aid, not a second
     /// filter decision).
-    pub fn filter_match_indices(&self, name: &str) -> Option<Vec<usize>> {
+    ///
+    /// Memoized per name for the current needle: the renderer asks this for
+    /// every visible row on every redraw, and re-running the fuzzy matcher to
+    /// get an answer that cannot have changed is the single most expensive
+    /// thing a filtered frame used to do.
+    pub fn filter_match_indices(&self, name: &str) -> Option<Rc<[usize]>> {
         if self.filter.is_empty() {
             return None;
         }
         let parsed = self.parsed_filter();
         let needle = parsed.fuzzy_needle()?;
-        self.matcher.fuzzy_indices(name, needle).map(|(_, idx)| idx)
+
+        let mut cache = self.highlight_cache.borrow_mut();
+        if cache.needle != needle {
+            cache.needle.clear();
+            cache.needle.push_str(needle);
+            cache.rows.clear();
+        }
+        if let Some(hit) = cache.rows.get(name) {
+            return hit.clone();
+        }
+        if cache.rows.len() >= HIGHLIGHT_CACHE_LIMIT {
+            cache.rows.clear();
+        }
+        let idx = self
+            .matcher
+            .indices(name, needle)
+            .map(|idx| Rc::from(idx.as_slice()));
+        cache.rows.insert(Box::from(name), idx.clone());
+        idx
     }
 
     pub(super) fn ensure_rows_cache(&self) {
@@ -265,6 +302,7 @@ impl App {
         if !cache.dirty {
             return;
         }
+        cache.column_widths = None;
 
         let headers = self.display_headers();
         let sort_header = self
@@ -294,6 +332,11 @@ impl App {
         // Parsed once, not once per object: the filter check used to re-borrow
         // the filter cache and re-compare the raw filter string for every row.
         let parsed = self.parsed_filter();
+        // One clock reading for the whole rebuild. Every AGE cell, DURATION
+        // cell and `age >` comparison in this pass is measured against the
+        // same instant, so a rebuild that crosses a second boundary cannot
+        // sort two rows against two different "now"s.
+        let now = crate::columns::now_secs();
         // Disjoint field borrows so the filter can warm the cell cache while
         // the sort-key cache is also held.
         let RowsCache {
@@ -319,7 +362,7 @@ impl App {
             {
                 continue;
             }
-            if !self.matches_filter_cached(o, k, &parsed, cells) {
+            if !self.matches_filter_cached(o, k, &parsed, cells, now) {
                 continue;
             }
             // One watch event marks the whole ordering dirty, so the
@@ -329,7 +372,7 @@ impl App {
             // their cells.
             let primary = match sort_header {
                 None => SortKey::Text(empty_sort.clone()),
-                Some(h) if volatile_sort => self.column_sort_key(o, h),
+                Some(h) if volatile_sort => self.column_sort_key(o, h, now),
                 Some(h) => {
                     let rv = o.metadata.resource_version.as_deref();
                     match sort_keys.get(k) {
@@ -337,7 +380,7 @@ impl App {
                             e.key.clone()
                         }
                         _ => {
-                            let key = self.column_sort_key(o, h);
+                            let key = self.column_sort_key(o, h, now);
                             sort_keys.insert(
                                 k.clone(),
                                 SortKeyEntry {
@@ -367,7 +410,7 @@ impl App {
                 ord = ord.reverse();
             }
             // Ties always fall back to namespace/name ascending.
-            ord.then_with(|| a.1.cmp(&b.1))
+            ord.then_with(|| natural_cmp(a.1.0, b.1.0).then_with(|| natural_cmp(a.1.1, b.1.1)))
         });
         cache.keys = entries.into_iter().map(|(_, _, k)| k.clone()).collect();
         cache.dirty = false;
@@ -415,8 +458,9 @@ impl App {
     /// Store keys of the highest-revision secret per (namespace, release) —
     /// label-based (no gunzip/decode needed), used to dedup the aggregated
     /// Helm release list down to one row per release, like `helm list`.
-    fn helm_latest_revision_keys(&self) -> HashSet<RowKey> {
-        let mut latest: HashMap<(String, String), (i64, RowKey)> = HashMap::new();
+    fn helm_latest_revision_keys(&self) -> crate::store::FastSet<RowKey> {
+        let mut latest: crate::store::FastMap<(String, String), (i64, RowKey)> =
+            crate::store::FastMap::default();
         for (k, o) in self.store.iter() {
             let Some(name) = crate::helm::release_name(o) else {
                 continue;
@@ -467,8 +511,56 @@ impl App {
             .collect()
     }
 
+    /// Measure the full filtered list once per data or view change.
+    /// Scrolling reuses these widths and renders only the rows on screen.
+    pub(crate) fn table_column_widths(&self) -> Vec<u16> {
+        use unicode_width::UnicodeWidthStr;
+
+        self.ensure_rows_cache();
+        let headers = self.display_headers();
+        let mut cache = self.rows_cache.borrow_mut();
+        if let Some(widths) = &cache.column_widths
+            && Rc::ptr_eq(&widths.headers, &headers)
+        {
+            return widths.needed.clone();
+        }
+
+        let width = |s: &str| u16::try_from(s.width()).unwrap_or(u16::MAX);
+        let mut needed: Vec<u16> = headers.iter().map(|h| width(h)).collect();
+        let show_ns = self.show_namespace_column();
+        let ns_off = usize::from(show_ns);
+        let now = crate::columns::now_secs();
+        let RowsCache { keys, cells, .. } = &mut *cache;
+        for key in keys.iter() {
+            let Some(obj) = self.store.get(key.as_ref()) else {
+                continue;
+            };
+            if show_ns {
+                needed[0] =
+                    needed[0].max(width(obj.metadata.namespace.as_deref().unwrap_or_default()));
+            }
+            let entry = self.cell_entry(key, obj, cells, now);
+            for (i, cell) in entry.cells.iter().enumerate() {
+                let cell_width =
+                    if let Some(value) = self.spec.volatile(obj, &self.kind_plural, i, now) {
+                        // Reserve space for elapsed times as the clock advances.
+                        width(&value).max(7)
+                    } else {
+                        width(cell)
+                    };
+                needed[i + ns_off] = needed[i + ns_off].max(cell_width);
+            }
+        }
+        cache.column_widths = Some(TableWidthCache {
+            headers,
+            needed: needed.clone(),
+        });
+        needed
+    }
+
     pub(crate) fn ensure_table_cell_cache(&self, rows: &[&DynamicObject]) {
         let mut cache = self.rows_cache.borrow_mut();
+        let now = crate::columns::now_secs();
         for obj in rows {
             // Shares `cell_entry` with the filter pass, so a row rendered for
             // filtering is already warm for the renderer (and vice versa) and
@@ -479,7 +571,7 @@ impl App {
                 .key(&key)
                 .cloned()
                 .unwrap_or_else(|| Rc::from(key));
-            self.cell_entry(&key, obj, &mut cache.cells);
+            self.cell_entry(&key, obj, &mut cache.cells, now);
         }
     }
 
@@ -493,23 +585,46 @@ impl App {
     /// NAMESPACE prepended when listing across namespaces and CPU/MEM appended
     /// for pods/nodes. Kept in one place so sorting and rendering agree on the
     /// column layout.
-    pub fn display_headers(&self) -> Vec<String> {
+    /// Memoized against the view spec and the column toggles: this is asked
+    /// for from a dozen places, several times per frame, and each answer used
+    /// to be a freshly built list of owned header strings.
+    pub fn display_headers(&self) -> Rc<[String]> {
+        let shape = (
+            self.show_namespace_column(),
+            self.node_capacity_columns(),
+            self.metrics_columns(),
+        );
+        if let Some(c) = self.header_cache.borrow().as_ref()
+            && c.shape == shape
+            && c.spec_rev == self.spec_rev
+        {
+            return Rc::clone(&c.headers);
+        }
+
+        let (ns, caps, metrics) = shape;
         let mut h = self.spec.headers();
-        if self.show_namespace_column() {
+        if ns {
             h.insert(0, "NAMESPACE".into());
         }
-        if self.node_capacity_columns() {
+        if caps {
             h.push("PODS".into());
         }
-        if self.metrics_columns() {
+        if metrics {
             h.push("CPU".into());
             h.push("MEM".into());
         }
-        if self.node_capacity_columns() {
+        if caps {
             h.push("%CPU".into());
             h.push("%MEM".into());
         }
-        h
+
+        let headers: Rc<[String]> = Rc::from(h);
+        *self.header_cache.borrow_mut() = Some(HeaderCache {
+            shape,
+            spec_rev: self.spec_rev,
+            headers: Rc::clone(&headers),
+        });
+        headers
     }
 
     /// Nodes get usage as a percentage of `status.allocatable` next to the
@@ -552,6 +667,7 @@ impl App {
             self.wide,
         );
         self.spec = spec;
+        self.spec_rev = self.spec_rev.wrapping_add(1);
         if let Some(h) = sort_header {
             self.sort_column = self.display_headers().iter().position(|x| *x == h);
             if self.sort_column.is_none() {
@@ -560,6 +676,7 @@ impl App {
         }
         self.clear_rows_cache();
         self.col_offset = 0;
+        self.col_scroll_max = 0;
     }
 
     /// The user-configured view matching the current kind, if any. Synthetic
@@ -603,19 +720,12 @@ impl App {
         self.flash_err = false;
     }
 
-    /// Scroll the table columns horizontally (←/→): the NAMESPACE/NAME
-    /// prefix stays anchored while the columns after it shift. Clamped so
-    /// the last column can always be reached and at least one scrollable
-    /// column stays visible.
+    /// Move the table by five terminal cells. Keep the name columns fixed.
     pub(super) fn scroll_columns(&mut self, delta: isize) {
-        let anchored = usize::from(self.show_namespace_column()) + 1;
-        let scrollable = self.display_headers().len().saturating_sub(anchored);
-        let max = scrollable.saturating_sub(1);
         self.col_offset = self
             .col_offset
-            .min(max)
-            .saturating_add_signed(delta)
-            .min(max);
+            .saturating_add_signed(delta * 5)
+            .min(self.col_scroll_max);
     }
 
     pub fn show_namespace_column(&self) -> bool {
@@ -659,12 +769,12 @@ impl App {
     }
 
     /// Comparable value of `header`'s cell for object `o`.
-    pub(super) fn column_sort_key(&self, o: &DynamicObject, header: &str) -> SortKey {
+    pub(super) fn column_sort_key(&self, o: &DynamicObject, header: &str, now: i64) -> SortKey {
         // User/printer columns sort by their declared type (quantity, number,
         // time…), and win over the curated special cases so an overlay that
         // redefines a header sorts by its own values.
         if self.spec.is_user_column(header)
-            && let Some(v) = self.spec.sort_value(o, header)
+            && let Some(v) = self.spec.sort_value(o, header, now)
         {
             return SortKey::from(v);
         }
@@ -678,7 +788,7 @@ impl App {
                     .into(),
             ),
             // Unknown timestamps sort last (oldest-unknown) in ascending order.
-            "AGE" => SortKey::Num(crate::columns::age_secs(o).unwrap_or(i64::MAX) as f64),
+            "AGE" => SortKey::Num(crate::columns::age_secs(o, now).unwrap_or(i64::MAX) as f64),
             "CPU" => SortKey::Num(self.metrics_for(o).0 as f64),
             "MEM" => SortKey::Num(self.metrics_for(o).1 as f64),
             // Unknown counts (poll hasn't landed) sort below every real count.
@@ -717,14 +827,14 @@ impl App {
                     .unwrap_or(f64::INFINITY),
             ),
             "DURATION" if self.kind_plural == "jobs" => {
-                SortKey::Num(crate::columns::job_duration_secs(o).unwrap_or(i64::MAX) as f64)
+                SortKey::Num(crate::columns::job_duration_secs(o, now).unwrap_or(i64::MAX) as f64)
             }
             // Helm revisions are plain integers; flux REVISION cells (shas,
             // `main@sha1:…`) stay text.
             "REVISION" if matches!(self.kind_plural.as_str(), "helm" | "helmhistory") => {
                 SortKey::Num(crate::helm::revision(o).unwrap_or(0) as f64)
             }
-            _ => match self.spec.sort_value(o, header) {
+            _ => match self.spec.sort_value(o, header, now) {
                 Some(v) => SortKey::from(v),
                 None => SortKey::Text(Rc::from("")),
             },
@@ -754,10 +864,14 @@ impl App {
             None if self.sort_memory.clear(&kind) => {}
             None => return, // nothing was remembered; skip the disk write
         }
-        if let Some(path) = self.sort_memory_path.clone()
-            && let Err(e) = self.sort_memory.save(&path)
-        {
-            self.flash_warn(&format!("failed to save sort state: {e}"));
+        if let Some(path) = self.sort_memory_path.clone() {
+            let result = match &self.state_writer {
+                Some(writer) => writer.save_sort(self.sort_memory.clone(), path),
+                None => self.sort_memory.save(&path),
+            };
+            if let Err(e) = result {
+                self.flash_warn(&format!("failed to save sort state: {e}"));
+            }
         }
     }
 
@@ -813,6 +927,16 @@ impl App {
         self.selected_ref().cloned()
     }
 
+    /// The selected store value without cloning its potentially large JSON
+    /// payload. Background document jobs keep this snapshot alive with an
+    /// `Arc` while later watch updates replace the store entry independently.
+    pub(super) fn selected_shared(&self) -> Option<Arc<DynamicObject>> {
+        let idx = self.table_state.selected()?;
+        self.ensure_rows_cache();
+        let key = self.rows_cache.borrow().keys.get(idx)?.clone();
+        self.store.shared(&key)
+    }
+
     /// `(header, value)` pairs for the selected row, mirroring the table's
     /// displayed columns (NAMESPACE prefix, view-spec cells with volatile
     /// overrides, PODS/CPU/MEM suffixes) — but with the full cell values,
@@ -826,11 +950,12 @@ impl App {
         if self.show_namespace_column() {
             values.push(obj.metadata.namespace.clone().unwrap_or_default());
         }
-        let (cells, _) = self.spec.cells(obj);
+        let now = crate::columns::now_secs();
+        let (cells, _) = self.spec.cells(obj, now);
         for (i, cell) in cells.into_iter().enumerate() {
             values.push(
                 self.spec
-                    .volatile(obj, &self.kind_plural, i)
+                    .volatile(obj, &self.kind_plural, i, now)
                     .unwrap_or(cell),
             );
         }
@@ -852,7 +977,8 @@ impl App {
             }
         }
         self.display_headers()
-            .into_iter()
+            .iter()
+            .cloned()
             .zip(values)
             .filter(|(_, v)| !v.is_empty())
             .collect()
@@ -939,4 +1065,82 @@ impl App {
         let page = self.table_page_rows.max(1) as i32;
         self.move_selection(pages.saturating_mul(page));
     }
+}
+
+fn pod_has_faults(o: &DynamicObject) -> bool {
+    if o.metadata.deletion_timestamp.is_some() {
+        return true;
+    }
+    let d = &o.data;
+    match d.pointer("/status/phase").and_then(Value::as_str) {
+        Some("Succeeded") => return false,
+        Some("Running") => {}
+        _ => return true,
+    }
+    let condition_ready = |kind: &str| {
+        d.pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .is_some_and(|conditions| {
+                conditions.iter().any(|c| {
+                    c.get("type").and_then(Value::as_str) == Some(kind)
+                        && c.get("status").and_then(Value::as_str) == Some("True")
+                })
+            })
+    };
+    if !condition_ready("Ready") {
+        return true;
+    }
+    if d.pointer("/spec/readinessGates")
+        .and_then(Value::as_array)
+        .is_some_and(|gates| {
+            gates.iter().any(|gate| {
+                gate.get("conditionType")
+                    .and_then(Value::as_str)
+                    .is_none_or(|kind| !condition_ready(kind))
+            })
+        })
+    {
+        return true;
+    }
+    let Some(statuses) = d
+        .pointer("/status/containerStatuses")
+        .and_then(Value::as_array)
+    else {
+        return true;
+    };
+    if statuses.is_empty()
+        || statuses.iter().any(|c| {
+            c.get("ready").and_then(Value::as_bool) != Some(true)
+                || c.pointer("/state/running").is_none()
+        })
+        || d.pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .is_some_and(|containers| containers.len() != statuses.len())
+    {
+        return true;
+    }
+    d.pointer("/spec/initContainers")
+        .and_then(Value::as_array)
+        .is_some_and(|containers| {
+            containers.iter().any(|container| {
+                let status = d
+                    .pointer("/status/initContainerStatuses")
+                    .and_then(Value::as_array)
+                    .and_then(|statuses| {
+                        statuses
+                            .iter()
+                            .find(|s| s.get("name") == container.get("name"))
+                    });
+                status.is_none_or(|s| {
+                    if container.get("restartPolicy").and_then(Value::as_str) == Some("Always") {
+                        s.get("ready").and_then(Value::as_bool) != Some(true)
+                            || s.pointer("/state/running").is_none()
+                    } else {
+                        s.pointer("/state/terminated/exitCode")
+                            .and_then(Value::as_i64)
+                            != Some(0)
+                    }
+                })
+            })
+        })
 }
